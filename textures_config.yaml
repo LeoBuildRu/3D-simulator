@@ -1,0 +1,56 @@
+asphalt_8k:
+  diffuse: "textures/asphalt_8k/worn_asphalt_diff_8k.jpg"
+  displacement: "textures/asphalt_8k/worn_asphalt_disp_8k.jpg"
+  normal: "textures/asphalt_8k/worn_asphalt_nor_dx_8k.jpg"
+  roughness: "textures/asphalt_8k/worn_asphalt_rough_8k.jpg"
+  textureRepeatX: 1.2
+  textureRepeatY: 4.2
+  strength: 0.06
+
+concrete_8k:
+  diffuse: "textures/concrete_8k/concrete_debris_diff_8k.jpg"
+  displacement: "textures/concrete_8k/concrete_debris_disp_8k.jpg"
+  normal: "textures/concrete_8k/concrete_debris_nor_dx_8k.jpg"
+  roughness: "textures/concrete_8k/concrete_debris_rough_8k.jpg"
+  textureRepeatX: 1.3
+  textureRepeatY: 2.4
+  strength: 0.16
+
+ground_8k:
+  diffuse: "textures/ground_8k/brown_mud_dry_diff_8k.jpg"
+  displacement: "textures/ground_8k/brown_mud_dry_disp_8k.jpg"
+  normal: "textures/ground_8k/brown_mud_dry_nor_dx_8k.jpg"
+  roughness: "textures/ground_8k/brown_mud_dry_rough_8k.jpg"
+  textureRepeatX: 1.2
+  textureRepeatY: 2.7
+  strength: 0.12
+
+sand_8k:
+  albedo: "textures/sand_8k/dune_albedo.jpg"
+  height: "textures/sand_8k/dune_height.jpg"
+  normal: "textures/sand_8k/dune_normal.jpg"
+  textureRepeatX: 1.0
+  textureRepeatY: 2.0
+  strength: 0.08
+
+stones_8k:
+  diffuse: "textures/stones_8k/rocks_ground_01_diff_4k.jpg"
+  displacement: "textures/stones_8k/rocks_ground_01_disp_4k.jpg"
+  normal: "textures/stones_8k/rocks_ground_01_nor_dx_4k.jpg"
+  roughness: "textures/stones_8k/rocks_ground_01_rough_4k.jpg"
+  textureRepeatX: 1.35
+  textureRepeatY: 2.8
+  strength: 0.14
+
+groundPerlin_8k:
+  diffuse: "textures/groundPerlin_8k/aerial_beach_03_diff_8k.jpg"
+  textureRepeatU: 160.0
+  textureRepeatV: 160.0
+
+Rock_texture_1:
+  diffuse: "textures/Rock_texture_1/rocks_ground_01_diff_8k.jpg"
+  displacement: "textures/Rock_texture_1/rocks_ground_01_disp_8k.jpg"
+  normal: "textures/Rock_texture_1/rocks_ground_01_nor_dx_8k.jpg"
+  textureRepeatX: 1.0
+  textureRepeatY: 1.0
+  strength: 0.35
