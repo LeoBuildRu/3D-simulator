@@ -1,0 +1,34 @@
+Scania:
+  cuzov: "models/Scania-Cuzov.gltf"
+  napolnitel: "models/Scania-Napolnitel.gltf"
+  other: "models/Scania-Other.gltf"
+  max_volume: 24
+  ground_plane: 2.6
+
+Kerax:
+  cuzov: "models/Kerax-Cuzov.gltf"
+  napolnitel: "models/Kerax-Napolnitel.gltf"
+  other: "models/Kerax-Other.gltf"
+  max_volume: 25
+  ground_plane: 2.0
+
+Kamaz:
+  cuzov: "models/Kamaz-Cuzov.gltf"
+  napolnitel: "models/Kamaz-Napolnitel.gltf"
+  other: "models/Kamaz-Other.gltf"
+  max_volume: 10
+  ground_plane: 2.25
+
+HooperType1:
+  cuzov: "models/Hooper1-Cuzov.gltf"
+  napolnitel: "models/Hooper1-Napolnitel.gltf"
+  other: "models/Hooper1-Other.gltf"
+  max_volume: 48
+  ground_plane: 2.5
+
+HooperType2:
+  cuzov: "models/Hooper2-Cuzov.gltf"
+  napolnitel: "models/Hooper2-Napolnitel.gltf"
+  other: "models/Hooper2-Other.gltf"
+  max_volume: 88
+  ground_plane: 2.8
