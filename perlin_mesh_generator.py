@@ -129,7 +129,7 @@ class PerlinMeshGenerator:
                 else:
                     value = (math.sin(x / 10.0) * 0.5 + math.cos(y / 10.0) * 0.5 + 1.0) / 2.0
                 
-                height_scale = size_z * 0.66
+                height_scale = size_z * 0.42
                 world_z = base_z + value * height_scale
                 
                 vertex.addData3f(world_x, world_y, world_z)
@@ -518,7 +518,7 @@ class PerlinMeshGenerator:
 
         perlin_base_np.removeNode()
         
-        perlin_detailed_np = self.generate_perlin_mesh(grid_size=1024)
+        perlin_detailed_np = self.generate_perlin_mesh(grid_size=128)
         perlin_detailed_np.setPos(0, 0, best_z)
 
         perlin_model_trimesh = self.panda_app.panda_to_trimesh(perlin_detailed_np)

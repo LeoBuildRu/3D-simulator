@@ -1,190 +1,398 @@
-# renderer_utils.py
 import os
 import time
 import math
 import re
 import glob
 import json
-import tempfile
 import datetime
 import random
-from PIL import Image
-from panda3d.core import PNMImage, Filename, PerspectiveLens
+from panda3d.core import *
 
 class RendererUtils:
     def __init__(self, panda_app):
         self.panda_app = panda_app
-    
-    def apply_barrel_distortion(self, img, k1, k2, crop_to_content=False):
-        if k1 == 0.0 and k2 == 0.0:
-            if crop_to_content:
-                width = img.get_x_size()
-                height = img.get_y_size()
-                num_channels = img.get_num_channels()
-                
-                if num_channels == 1:
-                    mode = 'L'
-                    pil_img = Image.new(mode, (width, height))
-                    pil_pixels = pil_img.load()
-                    for y in range(height):
-                        for x in range(width):
-                            val = int(img.get_gray(x, y) * 255)
-                            pil_pixels[x, y] = val
-                elif num_channels >= 3:
-                    mode = 'RGB' if num_channels == 3 else 'RGBA'
-                    pil_img = Image.new(mode, (width, height))
-                    pil_pixels = pil_img.load()
-                    for y in range(height):
-                        for x in range(width):
-                            r = int(img.get_red(x, y) * 255)
-                            g = int(img.get_green(x, y) * 255)
-                            b = int(img.get_blue(x, y) * 255)
-                            if num_channels == 3:
-                                pil_pixels[x, y] = (r, g, b)
-                            else: 
-                                a = int(img.get_alpha(x, y) * 255) if img.has_alpha() else 255
-                                pil_pixels[x, y] = (r, g, b, a)
-                
-                left, top, right, bottom = 270, 155, 1850, 925
-                bbox = (left, top, right, bottom)
-                cropped_pil_img = pil_img.crop(bbox)
-                
-                target_width = 1920 
-                target_height = 1080 
-                aspect_ratio = cropped_pil_img.width / cropped_pil_img.height
-                target_ratio = target_width / target_height
 
-                if aspect_ratio > target_ratio:
-                    new_height = int(cropped_pil_img.width / target_ratio)
-                    resized = cropped_pil_img.resize((target_width, new_height), Image.LANCZOS)
-                    padding = (new_height - target_height) // 2
-                    final_img = resized.crop((0, padding, target_width, padding + target_height))
-                else:
-                    new_width = int(cropped_pil_img.height * target_ratio)
-                    resized = cropped_pil_img.resize((new_width, target_height), Image.LANCZOS)
-                    padding = (new_width - target_width) // 2
-                    final_img = resized.crop((padding, 0, padding + target_width, target_height))
-                
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmpfile:
-                    tmp_filename = tmpfile.name
-                try:
-                    final_img.save(tmp_filename, 'PNG')
-                    temp_pnm = PNMImage()
-                    if temp_pnm.read(Filename.from_os_specific(tmp_filename)):
-                        os.unlink(tmp_filename)
-                        return temp_pnm
-                finally:
-                    if os.path.exists(tmp_filename):
-                        os.unlink(tmp_filename)       
-            
-            return img
-
-        width = img.get_x_size()
-        height = img.get_y_size()
-        num_channels = img.get_num_channels()
-        distorted_img = PNMImage(width, height, num_channels)
-        cx = width / 2.0
-        cy = height / 2.0
-        max_r = math.sqrt((width/2)**2 + (height/2)**2)
-
+    def barrel_distortion(self, img, k1=0.15, k2=0.35):
+        tex = Texture()
+        tex.load(img)
+        
+        distortion_map = PNMImage(img.getXSize(), img.getYSize())
+        
+        width = img.getXSize()
+        height = img.getYSize()
+        center_x = width / 2.0
+        center_y = height / 2.0
+        
+        max_dist = min(center_x, center_y)
+        
         for y in range(height):
             for x in range(width):
-                dx = x - cx
-                dy = y - cy
-                r = math.sqrt(dx*dx + dy*dy)
-                if r > 0:
-                    r_norm = r / max_r
-                    r_distorted_norm = r_norm * (1 + k1 * r_norm**2 + k2 * r_norm**4)
-                    r_distorted = r_distorted_norm * max_r
-                    scale_factor = r_distorted / r
+                norm_x = (x - center_x) / max_dist
+                norm_y = (y - center_y) / max_dist
+                
+                r = math.sqrt(norm_x * norm_x + norm_y * norm_y)
+                
+                distortion = 1.0 + k1 * r * r + k2 * r * r * r * r
+                
+                new_x = norm_x * distortion
+                new_y = norm_y * distortion
+                
+                src_x = int(center_x + new_x * max_dist)
+                src_y = int(center_y + new_y * max_dist)
+                
+                if 0 <= src_x < width and 0 <= src_y < height:
+                    color = img.getXel(src_x, src_y)
+                    distortion_map.setXel(x, y, color)
                 else:
-                    scale_factor = 1.0
-                src_x = cx + dx * scale_factor
-                src_y = cy + dy * scale_factor
-                if 0 <= src_x < width-1 and 0 <= src_y < height-1:
-                    x1 = int(src_x)
-                    y1 = int(src_y)
-                    x2 = x1 + 1
-                    y2 = y1 + 1
-                    dx_interp = src_x - x1
-                    dy_interp = src_y - y1
-                    c11 = [img.get_channel(x1, y1, c) for c in range(num_channels)]
-                    c12 = [img.get_channel(x1, y2, c) for c in range(num_channels)]
-                    c21 = [img.get_channel(x2, y1, c) for c in range(num_channels)]
-                    c22 = [img.get_channel(x2, y2, c) for c in range(num_channels)]
-                    c_top = [c11[c] * (1 - dx_interp) + c21[c] * dx_interp for c in range(num_channels)]
-                    c_bottom = [c12[c] * (1 - dx_interp) + c22[c] * dx_interp for c in range(num_channels)]
-                    c_final = [c_top[c] * (1 - dy_interp) + c_bottom[c] * dy_interp for c in range(num_channels)]
-                    for c in range(num_channels):
-                        distorted_img.set_channel(x, y, c, c_final[c])
+                    distortion_map.setXel(x, y, 0, 0, 0)
+        
+        return distortion_map
+    
+    def crop_image(self, img, left=270, top=155, right=1850, bottom=925):
+        width = img.getXSize()
+        height = img.getYSize()
+        
+        if left < 0 or top < 0 or right > width or bottom > height:
+            print(f"Предупреждение: координаты обрезки выходят за пределы изображения")
+            print(f"Размер изображения: {width}x{height}")
+            print(f"Запрошенные координаты: left={left}, top={top}, right={right}, bottom={bottom}")
+            
+            left = max(0, left)
+            top = max(0, top)
+            right = min(width, right)
+            bottom = min(height, bottom)
+        
+        if left >= right or top >= bottom:
+            print(f"Ошибка: некорректные координаты обрезки")
+            print(f"left={left}, top={top}, right={right}, bottom={bottom}")
+            return PNMImage(img)
+        
+        crop_width = right - left
+        crop_height = bottom - top
+        
+        cropped_img = PNMImage(crop_width, crop_height, img.getNumChannels(), img.getMaxval())
+        
+        for y in range(crop_height):
+            src_y = top + y
+            for x in range(crop_width):
+                src_x = left + x
+                color = img.getXel(src_x, src_y)
+                cropped_img.setXel(x, y, color)
+        
+        return cropped_img
+    
+    def stretch_to_1920x1080(self, img):
+        target_width = 1920
+        target_height = 1080
+        
+        current_width = img.getXSize()
+        current_height = img.getYSize()
+        
+        if current_width == target_width and current_height == target_height:
+            return PNMImage(img)  
+        
+        stretched_img = PNMImage(target_width, target_height, img.getNumChannels(), img.getMaxval())
+        
+        scale_x = target_width / current_width
+        scale_y = target_height / current_height
+        
+        for y in range(target_height):
+            for x in range(target_width):
+                src_x = x / scale_x
+                src_y = y / scale_y
+                
+                x0 = int(math.floor(src_x))
+                x1 = min(x0 + 1, current_width - 1)
+                y0 = int(math.floor(src_y))
+                y1 = min(y0 + 1, current_height - 1)
+                
+                dx = src_x - x0
+                dy = src_y - y0
+                
+                c00 = img.getXel(x0, y0)
+                c10 = img.getXel(x1, y0)
+                c01 = img.getXel(x0, y1)
+                c11 = img.getXel(x1, y1)
+                
+                c0 = [c00[i] * (1 - dx) + c10[i] * dx for i in range(3)]
+                c1 = [c01[i] * (1 - dx) + c11[i] * dx for i in range(3)]
+                
+                color = [c0[i] * (1 - dy) + c1[i] * dy for i in range(3)]
+                
+                stretched_img.setXel(x, y, color[0], color[1], color[2])
+        
+        return stretched_img
+    
+    def _process_render_image(self, img, camera_fov_x=None, camera_fov_y=None, output_dir="renders", 
+                              filename_prefix="render", metadata=None):
+        orig_width = img.getXSize()
+        orig_height = img.getYSize()
+        
+        fx = fy = cx = cy = None
+        lens = self.panda_app.cam.node().getLens() if hasattr(self.panda_app, 'cam') else None
+        
+        if camera_fov_x is not None and camera_fov_y is not None:
+            fx = (orig_width / 2.0) / math.tan(math.radians(camera_fov_x / 2.0))
+            fy = (orig_height / 2.0) / math.tan(math.radians(camera_fov_y / 2.0))
+            cx = orig_width / 2.0
+            cy = orig_height / 2.0
+        
+        # Определяем 3D точки для преобразования
+        top_points_3d = [
+            (-1.03, -2.22, 2.4),   # bottom_left_top
+            (-1.03, 2.4, 2.4),     # top_left_top
+            (1.045, 2.4, 2.4),     # top_right_top
+            (1.045, -2.22, 2.4)    # bottom_right_top
+        ]
+        
+        top_points_2d = []
+        distances_to_camera = []  # Для хранения расстояний до камеры
+        
+        # Преобразуем 3D точки в 2D пиксельные координаты (до всех преобразований)
+        if lens:
+            for i, point_3d in enumerate(top_points_3d):
+                # Создаем точку в координатах Panda3D
+                point = LPoint3f(point_3d[0], point_3d[1], point_3d[2])
+                
+                # Преобразуем мировые координаты в координаты камеры
+                point_in_camera_space = self.panda_app.camera.getRelativePoint(
+                    self.panda_app.render, 
+                    point
+                )
+                
+                # Вычисляем расстояние от камеры до точки (в мировых координатах)
+                # Получаем позицию камеры в мировых координатах
+                camera_pos = self.panda_app.camera.getPos(self.panda_app.render)
+                
+                # Вычисляем расстояние между камерой и точкой
+                distance = math.sqrt(
+                    (point_3d[0] - camera_pos.x) ** 2 +
+                    (point_3d[1] - camera_pos.y) ** 2 +
+                    (point_3d[2] - camera_pos.z) ** 2
+                )
+                
+                distances_to_camera.append(float(distance))
+                
+                # Создаем точки для результата
+                result_point = LPoint3f()
+                
+                # Пытаемся спроецировать точку
+                success = lens.project(point_in_camera_space, result_point)
+                
+                if success:
+                    # Преобразуем NDC в пиксельные координаты
+                    pixel_x = (result_point.x * 0.5 + 0.5) * orig_width
+                    pixel_y = (0.5 - result_point.y * 0.5) * orig_height  # Инвертируем Y
+                    
+                    # Проверяем, находится ли точка в пределах экрана
+                    if (0 <= pixel_x < orig_width and 0 <= pixel_y < orig_height and 
+                        point_in_camera_space.y > 0 and 0 <= result_point.z <= 1):
+                        top_points_2d.append({
+                            "x": float(pixel_x),
+                            "y": float(pixel_y)
+                        })
+                    else:
+                        top_points_2d.append(None)
                 else:
-                    src_x_clamped = max(0, min(width-1, src_x))
-                    src_y_clamped = max(0, min(height-1, src_y))
-                    x1 = int(src_x_clamped)
-                    y1 = int(src_y_clamped)
-                    x2 = min(width-1, x1 + 1)
-                    y2 = min(height-1, y1 + 1)
-                    dx_interp = src_x_clamped - x1
-                    dy_interp = src_y_clamped - y1
-                    c11 = [img.get_channel(x1, y1, c) for c in range(num_channels)]
-                    c12 = [img.get_channel(x1, y2, c) for c in range(num_channels)]
-                    c21 = [img.get_channel(x2, y1, c) for c in range(num_channels)]
-                    c22 = [img.get_channel(x2, y2, c) for c in range(num_channels)]
-                    c_top = [c11[c] * (1 - dx_interp) + c21[c] * dx_interp for c in range(num_channels)]
-                    c_bottom = [c12[c] * (1 - dx_interp) + c22[c] * dx_interp for c in range(num_channels)]
-                    c_final = [c_top[c] * (1 - dy_interp) + c_bottom[c] * dy_interp for c in range(num_channels)]
-                    outside_dist = max(0, 
-                                    abs(src_x - cx) - width/2 + 1, 
-                                    abs(src_y - cy) - height/2 + 1)
-                    fade_factor = max(0, min(1, 1 - (outside_dist / 15.0)**2))
-                    for c in range(num_channels):
-                        distorted_img.set_channel(x, y, c, c_final[c] * fade_factor)
+                    top_points_2d.append(None)
+        else:
+            top_points_2d = [None] * len(top_points_3d)
+            distances_to_camera = [None] * len(top_points_3d)
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{filename_prefix}_{timestamp}.png"
+        output_path = os.path.join(output_dir, filename)
 
-        if crop_to_content:
-            if num_channels == 1:
-                mode = 'L'
-                pil_img = Image.new(mode, (width, height))
-                pil_pixels = pil_img.load()
-                for y in range(height):
-                    for x in range(width):
-                        val = int(distorted_img.get_gray(x, y) * 255)
-                        pil_pixels[x, y] = val
-            elif num_channels >= 3:
-                mode = 'RGB' if num_channels == 3 else 'RGBA'
-                pil_img = Image.new(mode, (width, height))
-                pil_pixels = pil_img.load()
-                for y in range(height):
-                    for x in range(width):
-                        r = int(distorted_img.get_red(x, y) * 255)
-                        g = int(distorted_img.get_green(x, y) * 255)
-                        b = int(distorted_img.get_blue(x, y) * 255)
-                        if num_channels == 3:
-                            pil_pixels[x, y] = (r, g, b)
-                        else: 
-                            a = int(distorted_img.get_alpha(x, y) * 255) if distorted_img.has_alpha() else 255
-                            pil_pixels[x, y] = (r, g, b, a)
+        # Параметры преобразований
+        k1 = 0.30
+        k2 = 0.35
+        crop_left = 423
+        crop_top = 238
+        crop_right = 1498
+        crop_bottom = 840
+        final_width = 1920
+        final_height = 1080
+        
+        # Создаем копии изображения для каждого этапа преобразования
+        img_distorted = self.barrel_distortion(img, k1=k1, k2=k2)
+        img_cropped = self.crop_image(img_distorted, left=crop_left, top=crop_top, right=crop_right, bottom=crop_bottom)
+        img_final = self.stretch_to_1920x1080(img_cropped)
+        
+        # Преобразуем 2D точки с учетом всех примененных трансформаций
+        transformed_points_2d = []
+        
+        if top_points_2d:
+            for i, point_2d in enumerate(top_points_2d):
+                if point_2d is None:
+                    transformed_points_2d.append(None)
+                    continue
+                    
+                x = point_2d["x"]
+                y = point_2d["y"]
+                
+                # Итерационный метод для нахождения правильных координат после barrel distortion
+                x_dist = x
+                y_dist = y
+                
+                center_x = orig_width / 2.0
+                center_y = orig_height / 2.0
+                max_dist = min(center_x, center_y)
+                
+                # Итерационный метод для решения обратной задачи
+                for iteration in range(10):
+                    norm_x_dist = (x_dist - center_x) / max_dist
+                    norm_y_dist = (y_dist - center_y) / max_dist
+                    
+                    r = math.sqrt(norm_x_dist * norm_x_dist + norm_y_dist * norm_y_dist)
+                    distortion = 1.0 + k1 * r * r + k2 * r * r * r * r
+                    
+                    # Прямое преобразование (точка в искаженном изображении)
+                    norm_x_distorted = norm_x_dist * distortion
+                    norm_y_distorted = norm_y_dist * distortion
+                    
+                    x_calc = center_x + norm_x_distorted * max_dist
+                    y_calc = center_y + norm_y_distorted * max_dist
+                    
+                    # Вычисляем ошибку
+                    error_x = x_calc - x
+                    error_y = y_calc - y
+                    
+                    # Корректируем предположение
+                    x_dist -= error_x * 0.5
+                    y_dist -= error_y * 0.5
+                    
+                    if abs(error_x) < 0.1 and abs(error_y) < 0.1:
+                        break
+                
+                # 2. Применяем crop (вычитаем смещение)
+                x_cropped = x_dist - crop_left
+                y_cropped = y_dist - crop_top
+                
+                # Проверяем, попадает ли точка в область crop
+                crop_width = crop_right - crop_left
+                crop_height = crop_bottom - crop_top
+                
+                if (0 <= x_cropped < crop_width and 0 <= y_cropped < crop_height):
+                    
+                    # 3. Применяем stretch (масштабирование до 1920x1080)
+                    scale_x = final_width / crop_width
+                    scale_y = final_height / crop_height
+                    
+                    x_final = x_cropped * scale_x
+                    y_final = y_cropped * scale_y
+                    
+                    transformed_points_2d.append({
+                        "x": float(x_final),
+                        "y": float(y_final)
+                    })
+                else:
+                    transformed_points_2d.append(None)
+        
+        # === ДОБАВЛЕНИЕ ЦВЕТНЫХ КРУГОВ ===
+        try:
+            from PIL import Image, ImageDraw
+            import io
+            from panda3d.core import StringStream
             
-            left, top, right, bottom = 270, 155, 1650, 925
-            bbox = (left, top, right, bottom)
-            cropped_pil_img = pil_img.crop(bbox)
+            # Конвертируем PNMImage в PIL Image
+            stream = StringStream()
+            img_final.write(stream, "png")
+            pil_img = Image.open(io.BytesIO(stream.getData()))
+            draw = ImageDraw.Draw(pil_img)
             
-            target_width = 1920 
-            target_height = 1080
-            resized_pil_img = cropped_pil_img.resize((target_width, target_height), Image.LANCZOS)
+            colors = [
+                (255, 0, 0, 200),    # красный для bottom_left_top
+                (0, 255, 0, 200),    # зеленый для top_left_top
+                (0, 0, 255, 200),    # синий для top_right_top
+                (255, 255, 0, 200),  # желтый для bottom_right_top
+            ]
             
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmpfile:
-                tmp_filename = tmpfile.name
-            try:
-                resized_pil_img.save(tmp_filename, 'PNG')
-                temp_pnm = PNMImage()
-                if temp_pnm.read(Filename.from_os_specific(tmp_filename)):
-                    os.unlink(tmp_filename)
-                    return temp_pnm
-            finally:
-                if os.path.exists(tmp_filename):
-                    os.unlink(tmp_filename)
-                        
-        return distorted_img
+            # Рисуем круги для каждой точки, которая не None
+            for i, point_2d in enumerate(transformed_points_2d):
+                if point_2d is not None:
+                    x = int(point_2d["x"])
+                    y = int(point_2d["y"])
+                    color = colors[i % len(colors)]
+                    
+                    # Рисуем круг с радиусом 10 пикселей
+                    draw.ellipse([(x-10, y-10), (x+10, y+10)], fill=color, outline=(255, 255, 255, 255))
+            
+            # Конвертируем обратно в PNMImage
+            output = io.BytesIO()
+            pil_img.save(output, format="PNG")
+            output.seek(0)
+            new_img = PNMImage()
+            new_img.read(StringStream(output.read()), "png")
+            
+            # Заменяем исходное изображение на новое
+            img_final = new_img
+            
+        except ImportError:
+            print("Warning: Pillow not installed. Skipping circle drawing.")
+        except Exception as e:
+            print(f"Warning: Error while drawing circles: {e}")
+        
+        # Сохраняем финальное изображение
+        img_final.write(Filename.from_os_specific(output_path))
+        
+        # Формируем render_metadata только с необходимыми данными
+        render_metadata = {}
+        
+        # Параметры barrel distortion
+        render_metadata["barrel_distortion"] = {
+            "k1": k1,
+            "k2": k2
+        }
+        
+        # Параметры камеры
+        if camera_fov_x is not None and camera_fov_y is not None:
+            render_metadata["camera_params"] = {
+                "fov_x": camera_fov_x,
+                "fov_y": camera_fov_y,
+                "fx": fx,
+                "fy": fy,
+                "cx": cx,
+                "cy": cy
+            }
+        
+        # 3D точки
+        render_metadata["points_3d"] = top_points_3d
+        
+        # 2D точки после преобразований
+        render_metadata["points_2d"] = []
+        for i, point_2d in enumerate(transformed_points_2d):
+            if point_2d is not None:
+                render_metadata["points_2d"].append({
+                    "x": point_2d["x"],
+                    "y": point_2d["y"]
+                })
+            else:
+                render_metadata["points_2d"].append(None)
+        
+        # Расстояния от камеры до 3D точек
+        render_metadata["distances_to_camera"] = distances_to_camera
+        
+        # Добавляем Target_Volume
+        if hasattr(self.panda_app, 'Target_Volume'):
+            render_metadata["target_volume"] = self.panda_app.Target_Volume
+        else:
+            render_metadata["target_volume"] = None
+        
+        # Добавляем current_texture_set['diffuse']
+        if (hasattr(self.panda_app, 'current_texture_set') and 
+            self.panda_app.current_texture_set and 
+            'diffuse' in self.panda_app.current_texture_set):
+            render_metadata["texture_diffuse"] = self.panda_app.current_texture_set['diffuse']
+        else:
+            render_metadata["texture_diffuse"] = None
+        
+        json_path = output_path.replace(".png", ".json")
+        with open(json_path, 'w') as f:
+            json.dump(render_metadata, f, indent=2)
+        
+        return output_path
     
     def create_video_from_frames(self, output_dir="renders/datasets_metric_/", video_name="camera_rotation.mp4", fps=20):
         search_pattern = os.path.join(output_dir, "render_*_frame_*.png")
@@ -220,115 +428,6 @@ class RendererUtils:
         finally:
             if os.path.exists(list_file):
                 os.remove(list_file)
-
-    def _process_render_image(self, img, camera_fov_x=None, camera_fov_y=None, output_dir="renders", 
-                              filename_prefix="render", metadata=None):
-        k1 = 0.15
-        k2 = 0.35
-        
-        left = 270
-        top = 155
-        right = 1650
-        bottom = 925
-        crop_width = right - left
-        crop_height = bottom - top
-        
-        target_width = 1920
-        target_height = 1080
-        
-        distorted_img = self.apply_barrel_distortion(
-            img, 
-            k1=k1, 
-            k2=k2, 
-            crop_to_content=False
-        )
-        
-        cropped_img = PNMImage(crop_width, crop_height, 3)
-        for y in range(crop_height):
-            for x in range(crop_width):
-                src_x = left + x
-                src_y = top + y
-                if (0 <= src_x < distorted_img.getXSize() and 
-                    0 <= src_y < distorted_img.getYSize()):
-                    r, g, b = distorted_img.getXel(src_x, src_y)
-                    cropped_img.setXel(x, y, r, g, b)
-        
-        pil_img = Image.new("RGB", (crop_width, crop_height))
-        pixels = pil_img.load()
-        for y in range(crop_height):
-            for x in range(crop_width):
-                r, g, b = cropped_img.getXel(x, y)
-                pixels[x, y] = (int(r * 255), int(g * 255), int(b * 255))
-        
-        resized_pil_img = pil_img.resize((target_width, target_height), Image.LANCZOS)
-        
-        final_img = PNMImage(target_width, target_height, 3)
-        for y in range(target_height):
-            for x in range(target_width):
-                r, g, b = resized_pil_img.getpixel((x, y))
-                final_img.setXel(x, y, r/255.0, g/255.0, b/255.0)
-        
-        orig_width = img.getXSize()
-        orig_height = img.getYSize()
-        scale_x = target_width / crop_width
-        scale_y = target_height / crop_height
-        
-        fx = fy = cx = cy = None
-        if camera_fov_x is not None and camera_fov_y is not None:
-            fx = (target_width / 2.0) / math.tan(math.radians(camera_fov_x / 2.0)) * scale_x
-            fy = (target_height / 2.0) / math.tan(math.radians(camera_fov_y / 2.0)) * scale_y
-            cx = target_width / 2.0
-            cy = target_height / 2.0
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"{filename_prefix}_{timestamp}.png"
-        output_path = os.path.join(output_dir, filename)
-        
-        final_img.write(Filename.from_os_specific(output_path))
-        
-        if metadata is None:
-            metadata = {}
-        
-        render_metadata = {
-            "image_path": output_path,
-            "distortion_params": {
-                "k1": k1,
-                "k2": k2
-            },
-            "crop_params": {
-                "left": left,
-                "top": top,
-                "right": right,
-                "bottom": bottom,
-                "crop_width": crop_width,
-                "crop_height": crop_height
-            },
-            "scale_params": {
-                "target_width": target_width,
-                "target_height": target_height,
-                "scale_x": scale_x,
-                "scale_y": scale_y
-            },
-            **metadata
-        }
-        
-        if camera_fov_x is not None and camera_fov_y is not None:
-            render_metadata["camera_params"] = {
-                "fov_x": camera_fov_x,
-                "fov_y": camera_fov_y,
-                "fx": fx,
-                "fy": fy,
-                "cx": cx,
-                "cy": cy
-            }
-        
-        json_path = output_path.replace(".png", ".json")
-        with open(json_path, 'w') as f:
-            json.dump(render_metadata, f, indent=2)
-        
-        return output_path
     
     def save_single_render(self):
         lens = self.panda_app.cam.node().getLens()
@@ -400,7 +499,6 @@ class RendererUtils:
                 self.panda_app.Target_Volume = volume
                 
                 self.panda_app.clear_scene()
-                
                 self.panda_app.load_gltf_model(self.panda_app.current_other_path)
                 self.panda_app.load_gltf_model(self.panda_app.current_cuzov_path)
                 self.panda_app.load_gltf_model(self.panda_app.current_napolnitel_path)
@@ -467,7 +565,7 @@ class RendererUtils:
                         }
                     }
                 )
-                
+        
         self.panda_app.Target_Volume = original_target_volume
         self.panda_app.camera.setPos(original_pos)
         self.panda_app.camera.setHpr(original_hpr)
