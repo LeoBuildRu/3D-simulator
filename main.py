@@ -900,7 +900,7 @@ class MyApp(ShowBase):
         ])
         aabb_mesh.apply_transform(aabb_transform)
         
-        result_mesh = full_plane_mesh.intersection(aabb_mesh, engine='blender')
+        result_mesh = full_plane_mesh.intersection(aabb_mesh, engine='auto')
         
         if result_mesh.is_empty:
             return False
