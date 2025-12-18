@@ -3,6 +3,7 @@ from panda_widget import Panda3DWidget
 from depth_map_renderer import DepthMapRenderer
 from perlin_mesh_generator import PerlinMeshGenerator
 from renderer_utils import RendererUtils
+from mesh_reconstruction import MeshReconstruction
 
 import sys
 import os
@@ -654,6 +655,8 @@ class MyApp(ShowBase):
 
         self.perlin_generator = PerlinMeshGenerator(self)
         self.renderer_utils = RendererUtils(self)
+
+        self.mesh_reconstruction = MeshReconstruction(self)
 
     def setup_window_for_parenting(self, parent_hwnd):
         if hasattr(self, 'win') and self.win:

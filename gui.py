@@ -446,6 +446,43 @@ class CameraControlGUI(QWidget):
         
         process_section.setLayout(process_layout)
         layout.addWidget(process_section)
+
+           # === Секция: 2D в 3D реконструкция ===
+        recon_section = QGroupBox("2D В 3D РЕКОНСТРУКЦИЯ")
+        recon_layout = QVBoxLayout()
+        recon_layout.setSpacing(8)
+
+        # Выбор JSON-файла
+        file_group = QWidget()
+        file_layout = QHBoxLayout(file_group)
+        file_layout.setContentsMargins(0, 0, 0, 0)
+
+        file_layout.addWidget(QLabel("Данные (.json):"))
+        self.recon_json_path = QLineEdit()
+        self.recon_json_path.setPlaceholderText("Выберите файл с 2D-данными")
+        self.recon_json_path.setReadOnly(True)
+        file_layout.addWidget(self.recon_json_path)
+
+        def pick_recon_config():
+            newConf = self.panda_app.mesh_reconstruction.browse_recon_json()
+            self.recon_json_path.setPlaceholderText(newConf)
+
+        browse_btn = QPushButton("📂")
+        browse_btn.setFixedWidth(45)
+        browse_btn.clicked.connect(pick_recon_config)
+        file_layout.addWidget(browse_btn)
+
+        recon_layout.addWidget(file_group)
+
+        # Кнопка запуска реконструкции
+        self.run_reconstruction_btn = self.create_accent_button(
+            "🔄 Запустить реконструкцию",
+            self.panda_app.mesh_reconstruction.run_2d_to_3d_reconstruction
+        )
+        recon_layout.addWidget(self.run_reconstruction_btn)
+
+        recon_section.setLayout(recon_layout)
+        layout.addWidget(recon_section)
         
         layout.addStretch()
 
