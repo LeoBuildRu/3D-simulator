@@ -4,6 +4,7 @@ from depth_map_renderer import DepthMapRenderer
 from perlin_mesh_generator import PerlinMeshGenerator
 from renderer_utils import RendererUtils
 from mesh_reconstruction import MeshReconstruction
+from height_map_mesh_generator import HeightMapMeshGenerator
 
 import sys
 import os
@@ -165,381 +166,6 @@ class MainWindowManager:
     def run(self):
         self.show()
         return self.qt_app.exec_()
-    
-class HeightMapMeshGenerator:
-    """Генератор меша из карты высот"""
-    
-    def __init__(self, app, image_path=None):
-        self.app = app
-        self.image_path = image_path or "height_example/No-visible-Depth.png"
-        self.height_map = None
-        self.height_scale = 2.0  # Масштаб высот (можно регулировать)
-        self.alpha_threshold = 0.1  # Порог для определения прозрачности фона
-        self.mesh_node = None
-        self.use_alpha_channel = True  # Использовать альфа-канал для определения фона
-        
-    def load_height_map(self):
-        """Загрузка карты высот с учетом прозрачности"""
-        try:
-            from PIL import Image
-            import numpy as np
-            
-            # Загружаем изображение с альфа-каналом
-            img = Image.open(self.image_path)
-            
-            # Если есть альфа-канал, используем его для определения фона
-            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-                img_rgba = img.convert('RGBA')
-                r, g, b, a = img_rgba.split()
-                
-                # Нормализуем альфа-канал для использования как маска
-                alpha = np.array(a, dtype=np.float32) / 255.0
-                
-                # Конвертируем в градации серого для высот
-                if img.mode != 'L':
-                    img_gray = img.convert('L')
-                    height_data = np.array(img_gray, dtype=np.float32) / 255.0
-                else:
-                    height_data = np.array(img, dtype=np.float32) / 255.0
-                
-                # Создаем маску: 1 = видимые пиксели, 0 = фон
-                mask = alpha > self.alpha_threshold
-                
-                # Применяем маску к высотным данным
-                self.height_map = height_data * mask
-                self.mask = mask  # Сохраняем маску для создания меша
-                
-                print(f"Height map loaded with alpha mask: {self.height_map.shape}")
-                print(f"Visible pixels: {np.sum(mask)} out of {mask.size}")
-                
-            else:
-                # Если нет альфа-канала, используем только яркость
-                img_gray = img.convert('L')
-                self.height_map = np.array(img_gray, dtype=np.float32) / 255.0
-                
-                # Определяем фон как очень темные пиксели
-                mask = self.height_map > 0.05
-                self.mask = mask
-                
-                print(f"Height map loaded without alpha: {self.height_map.shape}")
-                print(f"Bright pixels: {np.sum(mask)} out of {mask.size}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error loading height map: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def create_mesh_from_height_map(self):
-        """Создание меша только по области height_map, игнорируя фон"""
-        if self.height_map is None:
-            if not self.load_height_map():
-                return None
-        
-        import numpy as np
-        from panda3d.core import (
-            Geom, GeomNode, GeomVertexData, GeomVertexFormat,
-            GeomVertexWriter, GeomTriangles, GeomVertexReader
-        )
-        
-        h, w = self.height_map.shape
-        
-        # Находим все видимые пиксели
-        if not hasattr(self, 'mask'):
-            # Если маски нет, создаем ее на основе порога
-            self.mask = self.height_map > self.alpha_threshold
-        
-        # Получаем индексы всех видимых пикселей
-        y_indices, x_indices = np.where(self.mask)
-        
-        if len(y_indices) == 0:
-            print("No visible pixels in height map")
-            return None
-        
-        # Находим границы видимой области
-        min_y, max_y = np.min(y_indices), np.max(y_indices)
-        min_x, max_x = np.min(x_indices), np.max(x_indices)
-        
-        # Определяем, нужно ли упрощать сетку
-        visible_height = max_y - min_y + 1
-        visible_width = max_x - min_x + 1
-        
-        # Динамический выбор субсэмплинга
-        max_grid_size = 200  # Максимальный размер сетки
-        sub_sample = max(1, int(max(visible_height, visible_width) / max_grid_size))
-        sub_sample = min(sub_sample, 4)  # Не более 4
-        
-        print(f"Visible area: {visible_width}x{visible_height}, sub_sample: {sub_sample}")
-        
-        # Создаем форматы вершин
-        format = GeomVertexFormat.getV3n3t2()
-        vdata = GeomVertexData("height_map_mesh", format, Geom.UHStatic)
-        
-        vertex = GeomVertexWriter(vdata, "vertex")
-        normal = GeomVertexWriter(vdata, "normal")
-        texcoord = GeomVertexWriter(vdata, "texcoord")
-        
-        # Масштабируем координаты
-        scale_x = -2.0  # Масштаб по X
-        scale_y = 2.0   # Масштаб по Y
-        
-        # Создаем вершины только для видимых пикселей
-        vertices = []
-        vertex_indices = {}
-        valid_vertex_count = 0
-        
-        # Создаем массив для быстрого доступа к индексам вершин
-        vertex_grid = np.full((h, w), -1, dtype=int)
-        
-        # Первый проход: создаем вершины для видимых пикселей
-        for y in range(min_y, max_y + 1, sub_sample):
-            for x in range(min_x, max_x + 1, sub_sample):
-                if self.mask[y, x]:
-                    height = self.height_map[y, x]
-                    
-                    # Преобразуем координаты
-                    world_x = (x / w - 0.5) * scale_x
-                    world_y = (y / h - 0.5) * scale_y
-                    world_z = height * self.height_scale
-                    
-                    # Добавляем вершину
-                    vertex.addData3f(world_x, world_y, world_z)
-                    normal.addData3f(0, 0, 1)  # Временная нормаль
-                    texcoord.addData2f(x / w, y / h)
-                    
-                    vertex_grid[y, x] = valid_vertex_count
-                    vertices.append((x, y))
-                    valid_vertex_count += 1
-        
-        if valid_vertex_count == 0:
-            print("No valid vertices found in height map")
-            return None
-        
-        # Второй проход: создаем треугольники ТОЛЬКО между соседними видимыми пикселями
-        triangles = GeomTriangles(Geom.UHStatic)
-        
-        for y in range(min_y, max_y - sub_sample + 1, sub_sample):
-            for x in range(min_x, max_x - sub_sample + 1, sub_sample):
-                # Проверяем, все ли 4 точки квадрата видимы
-                p1_idx = vertex_grid[y, x]
-                p2_idx = vertex_grid[y, x + sub_sample] if x + sub_sample < w else -1
-                p3_idx = vertex_grid[y + sub_sample, x] if y + sub_sample < h else -1
-                p4_idx = vertex_grid[y + sub_sample, x + sub_sample] if y + sub_sample < h and x + sub_sample < w else -1
-                
-                # Создаем треугольники только если все 4 вершины существуют
-                if p1_idx >= 0 and p2_idx >= 0 and p3_idx >= 0 and p4_idx >= 0:
-                    # Два треугольника для квадрата
-                    triangles.addVertices(p1_idx, p2_idx, p3_idx)
-                    triangles.addVertices(p2_idx, p4_idx, p3_idx)
-        
-        triangles.closePrimitive()
-        
-        if triangles.getNumPrimitives() == 0:
-            print("Warning: No triangles created. Trying alternative triangulation...")
-            # Альтернативный подход: триангуляция только видимых точек
-            return self._create_mesh_from_points(y_indices, x_indices, h, w, scale_x, scale_y)
-        
-        # Создаем геометрию
-        geom = Geom(vdata)
-        geom.addPrimitive(triangles)
-        
-        node = GeomNode("height_map_mesh")
-        node.addGeom(geom)
-        
-        # Вычисляем нормали
-        self._calculate_normals(vdata, geom)
-        
-        print(f"Mesh created with {valid_vertex_count} vertices and {triangles.getNumPrimitives()} triangles")
-        return node
-    
-    def _create_mesh_from_points(self, y_indices, x_indices, h, w, scale_x, scale_y):
-        """Альтернативный метод создания меша из набора точек"""
-        import numpy as np
-        from panda3d.core import (
-            Geom, GeomNode, GeomVertexData, GeomVertexFormat,
-            GeomVertexWriter, GeomTriangles
-        )
-        
-        # Создаем форматы вершин
-        format = GeomVertexFormat.getV3n3t2()
-        vdata = GeomVertexData("height_map_mesh_points", format, Geom.UHStatic)
-        
-        vertex = GeomVertexWriter(vdata, "vertex")
-        normal = GeomVertexWriter(vdata, "normal")
-        texcoord = GeomVertexWriter(vdata, "texcoord")
-        
-        # Создаем вершины для всех видимых точек
-        vertices_dict = {}
-        for idx, (y, x) in enumerate(zip(y_indices, x_indices)):
-            height = self.height_map[y, x]
-            
-            # Преобразуем координаты
-            world_x = (x / w - 0.5) * scale_x
-            world_y = (y / h - 0.5) * scale_y
-            world_z = height * self.height_scale
-            
-            # Добавляем вершину
-            vertex.addData3f(world_x, world_y, world_z)
-            normal.addData3f(0, 0, 1)
-            texcoord.addData2f(x / w, y / h)
-            
-            vertices_dict[(x, y)] = idx
-        
-        # Простая триангуляция: соединяем соседние пиксели
-        triangles = GeomTriangles(Geom.UHStatic)
-        
-        # Создаем сетку, соединяя пиксели, которые рядом
-        for (x, y), idx in vertices_dict.items():
-            # Проверяем правого соседа
-            if (x + 1, y) in vertices_dict and (x, y + 1) in vertices_dict:
-                triangles.addVertices(idx, vertices_dict[(x + 1, y)], vertices_dict[(x, y + 1)])
-            
-            # Проверяем нижнего соседа
-            if (x + 1, y + 1) in vertices_dict and (x, y + 1) in vertices_dict:
-                triangles.addVertices(vertices_dict[(x + 1, y)], vertices_dict[(x + 1, y + 1)], vertices_dict[(x, y + 1)])
-        
-        triangles.closePrimitive()
-        
-        if triangles.getNumPrimitives() == 0:
-            print("Failed to create any triangles")
-            return None
-        
-        geom = Geom(vdata)
-        geom.addPrimitive(triangles)
-        
-        node = GeomNode("height_map_mesh_points")
-        node.addGeom(geom)
-        
-        self._calculate_normals(vdata, geom)
-        
-        print(f"Alternative mesh created with {len(vertices_dict)} vertices and {triangles.getNumPrimitives()} triangles")
-        return node
-    
-    def _calculate_normals(self, vdata, geom):
-        """Вычисление нормалей для меша"""
-        from panda3d.core import GeomVertexReader, GeomVertexWriter
-        import numpy as np
-        
-        # Создаем массив для нормалей
-        vertex_reader = GeomVertexReader(vdata, "vertex")
-        normal_writer = GeomVertexWriter(vdata, "normal")
-        
-        # Собираем все вершины
-        vertices = []
-        while not vertex_reader.isAtEnd():
-            pos = vertex_reader.getData3f()
-            vertices.append((pos.x, pos.y, pos.z))
-        
-        # Инициализируем нормали нулями
-        normals = [(0.0, 0.0, 0.0) for _ in range(len(vertices))]
-        
-        # Проходим по всем треугольникам
-        for i in range(geom.getNumPrimitives()):
-            prim = geom.getPrimitive(i)
-            if prim.getNumPrimitives() > 0:
-                for j in range(prim.getNumPrimitives()):
-                    start = prim.getPrimitiveStart(j)
-                    end = prim.getPrimitiveEnd(j)
-                    
-                    # Берем 3 вершины треугольника
-                    if end - start == 3:
-                        vi0 = prim.getVertex(start)
-                        vi1 = prim.getVertex(start + 1)
-                        vi2 = prim.getVertex(start + 2)
-                        
-                        v0 = np.array(vertices[vi0])
-                        v1 = np.array(vertices[vi1])
-                        v2 = np.array(vertices[vi2])
-                        
-                        # Вычисляем нормаль треугольника
-                        edge1 = v1 - v0
-                        edge2 = v2 - v0
-                        normal = np.cross(edge1, edge2)
-                        norm = np.linalg.norm(normal)
-                        
-                        if norm > 0:
-                            normal = normal / norm
-                            
-                            # Добавляем нормаль к каждой вершине
-                            for vi in [vi0, vi1, vi2]:
-                                curr = normals[vi]
-                                normals[vi] = (
-                                    curr[0] + normal[0],
-                                    curr[1] + normal[1],
-                                    curr[2] + normal[2]
-                                )
-        
-        # Нормализуем и записываем нормали
-        for i in range(len(normals)):
-            nx, ny, nz = normals[i]
-            norm = (nx*nx + ny*ny + nz*nz) ** 0.5
-            if norm > 0:
-                nx /= norm
-                ny /= norm
-                nz /= norm
-            
-            normal_writer.setData3f(-nx, -ny, -nz)
-    
-    def add_to_scene(self, position=(0, 0, 2)):
-        """Добавление меша на сцену"""
-        if self.mesh_node:
-            self.mesh_node.removeNode()
-        
-        node = self.create_mesh_from_height_map()
-        if node:
-            self.mesh_node = self.app.render.attachNewNode(node)
-            self.mesh_node.setPos(position[0], position[1], position[2])
-
-            self.mesh_node.setP(-90)  # Pitch = поворот по оси X
-            
-            # Настройка материала
-            from panda3d.core import Material
-            material = Material()
-            material.setDiffuse((0.8, 0.8, 0.8, 1.0))
-            material.setAmbient((0.3, 0.3, 0.3, 1.0))
-            material.setSpecular((0.5, 0.5, 0.5, 1.0))
-            material.setShininess(50.0)
-            self.mesh_node.setTwoSided(True)
-            self.mesh_node.setMaterial(material, 1)
-            
-            # Включение шейдеров
-            self.mesh_node.setShaderAuto()
-            
-            # Добавляем в список моделей
-            if not hasattr(self.app, 'loaded_models'):
-                self.app.loaded_models = []
-            if not hasattr(self.app, 'model_paths'):
-                self.app.model_paths = {}
-            
-            if self.mesh_node not in self.app.loaded_models:
-                self.app.loaded_models.append(self.mesh_node)
-                self.app.model_paths[id(self.mesh_node)] = "height_map_mesh"
-            
-            print(f"Height map mesh added at position {position}")
-            return self.mesh_node
-        
-        return None
-    
-    def remove_from_scene(self):
-        """Удаление меша со сцены"""
-        if self.mesh_node:
-            if self.mesh_node in self.app.loaded_models:
-                self.app.loaded_models.remove(self.mesh_node)
-            
-            model_id = id(self.mesh_node)
-            if model_id in self.app.model_paths:
-                del self.app.model_paths[model_id]
-            
-            self.mesh_node.removeNode()
-            self.mesh_node = None
-            print("Height map mesh removed")
-    
-    def set_threshold(self, threshold):
-        """Установка порога для определения фона"""
-        self.alpha_threshold = threshold
-        print(f"Alpha threshold set to {threshold}")
 
 class MyApp(ShowBase):
     def __init__(self):
@@ -1216,9 +842,59 @@ class MyApp(ShowBase):
     def setup_scene(self):
         self.quarry_model = None
         
-        # Создаем и добавляем меш из карты высот
+        # Инициализация генератора
         # self.height_map_generator = HeightMapMeshGenerator(self)
-        # self.height_map_mesh = self.height_map_generator.add_to_scene(position=(0, 0, 2))
+# 
+        # # Настройка параметров шума (значения по умолчанию как в примере)
+        # self.height_map_generator.set_noise_scale(4.0)
+        # self.height_map_generator.set_noise_strength(0.42)  # аналог height_scale
+        # self.height_map_generator.set_noise_octaves(12)
+        # self.height_map_generator.set_noise_persistence(0.01)
+        # self.height_map_generator.set_noise_lacunarity(1.0)
+        # self.height_map_generator.set_noise_seed(random.randint(0, 10000))
+# 
+        # # Настройка параметров унифицированного подхода
+        # self.height_map_generator.set_interpolation_method('rbf')  # Использовать RBF интерполяцию
+        # self.height_map_generator.set_rbf_smooth(0.1)  # Параметр сглаживания
+        # self.height_map_generator.set_use_smoothing(True)  # Включить общее сглаживание
+        # self.height_map_generator.set_smoothing_iterations(1)  # Уменьшить общее сглаживание
+# 
+        # # Настройка параметров адаптивного подъема
+        # self.height_map_generator.set_adaptive_lift_enabled(True)  # Включить адаптивный подъем
+        # self.height_map_generator.set_lift_parameters(
+        #     base_distance=0.5,    # Базовое расстояние влияния
+        #     min_distance=0.1,     # Минимальное расстояние
+        #     max_distance=3.0,     # Максимальное расстояние
+        #     intensity=1.0         # Интенсивность подъема
+        # )
+# 
+        # # Настройки для устранения волнообразности
+        # self.height_map_generator.set_lift_smoothing_enabled(True)  # Включить сглаживание поднятой области
+        # self.height_map_generator.set_lift_smoothing_sigma(2.5)  # Сигма для гауссового сглаживания
+        # self.height_map_generator.set_lift_blur_enabled(True)  # Включить размытие границ
+        # self.height_map_generator.set_lift_blur_radius(4)  # Радиус размытия границ
+# 
+        # # НАСТРОЙКИ ДЛЯ СГЛАЖИВАНИЯ ИСХОДНОГО МЕША
+        # self.height_map_generator.set_source_mesh_smoothing_enabled(True)  # Включить сглаживание исходного меша
+        # self.height_map_generator.set_source_mesh_smoothing_iterations(1)  # 1 итерация сглаживания
+        # self.height_map_generator.set_source_mesh_smoothing_sigma(2.0)  # Небольшое сглаживание для сохранения деталей
+        # self.height_map_generator.set_source_mesh_edge_preserving(True)  # Сохранять границы исходного меша
+# 
+        # # Настройка области для меша
+        # self.height_map_generator.set_extended_area(2.5, 5.0)  # Ширина и высота целевой области
+        # self.height_map_generator.set_grid_resolution(120)  # Более высокое разрешение сетки
+        # self.height_map_generator.set_base_height(0.0)  # Базовая высота
+# 
+        # # Создание унифицированного перлин-меша с адаптивным подъемом
+        # self.height_map_mesh = self.height_map_generator.add_extended_mesh_to_scene(
+        #     position=(0, 0, 1.3), 
+        #     source_scale_x=-2.0, 
+        #     source_scale_y=1.0, 
+        #     source_scale_z=2.5,
+        #     source_offset_x=0.0,  
+        #     source_offset_y=0.2, 
+        #     source_offset_z=-0.1   
+        # )
         
         self.create_perlin_noise_mesh()
         self.add_scene_points()
