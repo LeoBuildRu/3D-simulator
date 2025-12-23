@@ -8,6 +8,17 @@ from PIL import Image
 import trimesh
 from noise import pnoise2
 
+import trimesh.boolean
+
+print(f"Доступные движки булевых операций: {list(trimesh.boolean._engines.keys())}")
+
+# Проверяем конкретно Manifold
+try:
+    import manifold3d
+    print("Manifold доступен!")
+except ImportError:
+    print("Manifold не установлен. Установите: pip install manifold3d")
+
 from panda3d.core import (
     Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
     GeomTriangles, NodePath, Vec3, TextureStage, Texture,
@@ -280,7 +291,7 @@ class PerlinMeshGenerator:
         try:
             final_result_trimesh = trimesh.boolean.difference(
                 [self.last_target_model_trimesh, perlin_model_trimesh],
-                engine='blender'
+                engine='manifold'
             )
             
             if final_result_trimesh.is_empty:
@@ -427,7 +438,7 @@ class PerlinMeshGenerator:
             
             result_csg = trimesh.boolean.difference(
                 [target_model_trimesh, perlin_model_trimesh_],
-                engine='blender'
+                engine='manifold'
             )
             
             model_csg_plane_1 = self.panda_app.trimesh_to_panda(result_csg)
@@ -525,7 +536,7 @@ class PerlinMeshGenerator:
 
         final_result_trimesh = trimesh.boolean.difference(
             [target_model_trimesh, perlin_model_trimesh],
-            engine='blender'
+            engine='manifold'
         )
 
         self.panda_app.final_model = self.panda_app.trimesh_to_panda(final_result_trimesh)
@@ -863,7 +874,7 @@ class PerlinMeshGenerator:
         
         result_csg = trimesh.boolean.difference(
             [target_model_trimesh, perlin_model_trimesh_],
-            engine='blender'
+            engine='manifold'
         )
         
         model_csg_plane_1 = self.panda_app.trimesh_to_panda(result_csg)

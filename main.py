@@ -4,7 +4,6 @@ from depth_map_renderer import DepthMapRenderer
 from perlin_mesh_generator import PerlinMeshGenerator
 from renderer_utils import RendererUtils
 from mesh_reconstruction import MeshReconstruction
-from height_map_mesh_generator import HeightMapMeshGenerator
 
 import sys
 import os
@@ -842,60 +841,6 @@ class MyApp(ShowBase):
     def setup_scene(self):
         self.quarry_model = None
         
-        # Инициализация генератора
-        # self.height_map_generator = HeightMapMeshGenerator(self)
-# 
-        # # Настройка параметров шума (значения по умолчанию как в примере)
-        # self.height_map_generator.set_noise_scale(4.0)
-        # self.height_map_generator.set_noise_strength(0.42)  # аналог height_scale
-        # self.height_map_generator.set_noise_octaves(12)
-        # self.height_map_generator.set_noise_persistence(0.01)
-        # self.height_map_generator.set_noise_lacunarity(1.0)
-        # self.height_map_generator.set_noise_seed(random.randint(0, 10000))
-# 
-        # # Настройка параметров унифицированного подхода
-        # self.height_map_generator.set_interpolation_method('rbf')  # Использовать RBF интерполяцию
-        # self.height_map_generator.set_rbf_smooth(0.1)  # Параметр сглаживания
-        # self.height_map_generator.set_use_smoothing(True)  # Включить общее сглаживание
-        # self.height_map_generator.set_smoothing_iterations(1)  # Уменьшить общее сглаживание
-# 
-        # # Настройка параметров адаптивного подъема
-        # self.height_map_generator.set_adaptive_lift_enabled(True)  # Включить адаптивный подъем
-        # self.height_map_generator.set_lift_parameters(
-        #     base_distance=0.5,    # Базовое расстояние влияния
-        #     min_distance=0.1,     # Минимальное расстояние
-        #     max_distance=3.0,     # Максимальное расстояние
-        #     intensity=1.0         # Интенсивность подъема
-        # )
-# 
-        # # Настройки для устранения волнообразности
-        # self.height_map_generator.set_lift_smoothing_enabled(True)  # Включить сглаживание поднятой области
-        # self.height_map_generator.set_lift_smoothing_sigma(2.5)  # Сигма для гауссового сглаживания
-        # self.height_map_generator.set_lift_blur_enabled(True)  # Включить размытие границ
-        # self.height_map_generator.set_lift_blur_radius(4)  # Радиус размытия границ
-# 
-        # # НАСТРОЙКИ ДЛЯ СГЛАЖИВАНИЯ ИСХОДНОГО МЕША
-        # self.height_map_generator.set_source_mesh_smoothing_enabled(True)  # Включить сглаживание исходного меша
-        # self.height_map_generator.set_source_mesh_smoothing_iterations(1)  # 1 итерация сглаживания
-        # self.height_map_generator.set_source_mesh_smoothing_sigma(2.0)  # Небольшое сглаживание для сохранения деталей
-        # self.height_map_generator.set_source_mesh_edge_preserving(True)  # Сохранять границы исходного меша
-# 
-        # # Настройка области для меша
-        # self.height_map_generator.set_extended_area(2.5, 5.0)  # Ширина и высота целевой области
-        # self.height_map_generator.set_grid_resolution(120)  # Более высокое разрешение сетки
-        # self.height_map_generator.set_base_height(0.0)  # Базовая высота
-# 
-        # # Создание унифицированного перлин-меша с адаптивным подъемом
-        # self.height_map_mesh = self.height_map_generator.add_extended_mesh_to_scene(
-        #     position=(0, 0, 1.3), 
-        #     source_scale_x=-2.0, 
-        #     source_scale_y=1.0, 
-        #     source_scale_z=2.5,
-        #     source_offset_x=0.0,  
-        #     source_offset_y=0.2, 
-        #     source_offset_z=-0.1   
-        # )
-        
         self.create_perlin_noise_mesh()
         self.add_scene_points()
         self.taskMgr.do_method_later(0.5, self._set_initial_time, "set_initial_time")
@@ -935,6 +880,23 @@ class MyApp(ShowBase):
         self.camera.set_pos(0, -20, 5)
         self.camera.look_at(0, 0, 0)
         self.disable_mouse()
+
+    def get_camera_orientation(self):
+        """Получить ориентацию камеры в удобном формате"""
+        pos = self.camera.getPos()
+        quat = self.camera.getQuat()
+        hpr = quat.getHpr()
+        
+        return {
+            'position': (pos.x, pos.y, pos.z),
+            'quaternion': (quat.x, quat.y, quat.z, quat.w),
+            'hpr': (hpr.x, hpr.y, hpr.z),
+            'forward_vector': self.camera.getQuat().getForward()
+        }
+
+    def set_camera_look_at(self, target_point):
+        """Направить камеру на целевую точку"""
+        self.camera.lookAt(target_point)
 
     def animate_street_lights(self, task):
         frame_time = self.taskMgr.globalClock.get_frame_time()

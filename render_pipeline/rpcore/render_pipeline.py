@@ -350,26 +350,11 @@ class RenderPipeline(RPObject):
 
                 material = state.get_attrib(MaterialAttrib).get_material()
                 
-                if material is not None and hasattr(material, 'emission'):
-                    shading_model = material.emission.x
-
-                    # SHADING_MODEL_TRANSPARENT
-                    if shading_model == 3:
-                        if geom_count > 1:
-                            self.error("Transparent materials must be on their own geom!\n"
-                                    "If you are exporting from blender, split them into\n"
-                                    "seperate meshes, then re-export your scene. The\n"
-                                    "problematic mesh is: " + geom_np.get_name())
-                            continue
-                        self.set_effect(geom_np, "effects/default.yaml",
-                                        {"render_forward": True, "render_gbuffer": False}, 100)
-                        continue
-                
                 # ДОБАВЛЕНА ПРОВЕРКА: есть ли у материала base_color
                 if material is None or not hasattr(material, 'base_color'):
                     self.warn("Geom", geom_node, "has no valid material with base_color! Skipping shading model check.")
                     continue
-
+                    
                 # ДОБАВЛЕНА ПРОВЕРКА: доступен ли атрибут w у base_color
                 try:
                     shading_model = material.base_color.w
