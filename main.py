@@ -394,6 +394,10 @@ class MyApp(ShowBase):
     def log_camera_parameters(self):
         lens = self.cam.node().get_lens()
         camera_zoom_data = {}
+        focal_length_pixels = None
+        perspective_angle_x = None
+        perspective_angle_y = None
+        
         if isinstance(lens, OrthographicLens):
             film_size = lens.get_film_size()
             camera_zoom_data = {
@@ -412,6 +416,44 @@ class MyApp(ShowBase):
                     "y": float(fov.y)
                 }
             }
+            
+            # Расчет фокусного расстояния в пикселях
+            if self.win:
+                # Получаем размер окна в пикселях
+                width = self.win.getXSize()
+                height = self.win.getYSize()
+                
+                # Конвертируем FOV из градусов в радианы
+                fov_x_rad = math.radians(fov.x)
+                fov_y_rad = math.radians(fov.y)
+                
+                # Вычисляем фокусное расстояние по горизонтали и вертикали
+                focal_length_x = (width / 2.0) / math.tan(fov_x_rad / 2.0)
+                focal_length_y = (height / 2.0) / math.tan(fov_y_rad / 2.0)
+                
+                # Берем среднее значение для общего фокусного расстояния
+                focal_length_pixels = (focal_length_x + focal_length_y) / 2.0
+            else:
+                # Если окно недоступно, используем стандартные размеры
+                width, height = 1920, 1080
+                
+                fov_x_rad = math.radians(fov.x)
+                fov_y_rad = math.radians(fov.y)
+                
+                focal_length_x = (width / 2.0) / math.tan(fov_x_rad / 2.0)
+                focal_length_y = (height / 2.0) / math.tan(fov_y_rad / 2.0)
+                
+                focal_length_pixels = (focal_length_x + focal_length_y) / 2.0
+            
+            # Углы наклона камеры по X и Y (в градусах)
+            # В Panda3D:
+            # - pitch (P) - наклон вверх/вниз (вращение вокруг оси X)
+            # - heading (H) - поворот влево/вправо (вращение вокруг оси Z)
+            
+            # Получаем текущую ориентацию камеры
+            camera_hpr = self.camera.getHpr()
+            perspective_angle_x = float(camera_hpr.x)  # heading (вращение вокруг Z)
+            perspective_angle_y = float(camera_hpr.y)  # pitch (вращение вокруг X)
         
         camera_data = {
             "position": {
@@ -425,10 +467,23 @@ class MyApp(ShowBase):
                 "r": float(self.camera.get_r())
             },
             "view": self.current_view,
-            "zoom": camera_zoom_data
+            "zoom": camera_zoom_data,
+            "perspective_focal_length": float(focal_length_pixels) if focal_length_pixels is not None else None,
+            "perspective_angle_x": perspective_angle_x,
+            "perspective_angle_y": perspective_angle_y
         }
         
         camera_json = json.dumps(camera_data, indent=4)
+        
+        # Вместо вывода в консоль, отображаем диалог с информацией
+        # Для этого нужно иметь доступ к GUI
+        if hasattr(self, 'control_panel') and self.control_panel:
+            self.control_panel.show_camera_info_dialog(camera_json)
+        else:
+            # Fallback: выводим в консоль
+            print(camera_json)
+        
+        return camera_json
 
     def calculate_mesh_volume(self, model):
         if not model:
@@ -528,7 +583,7 @@ class MyApp(ShowBase):
         ])
         aabb_mesh.apply_transform(aabb_transform)
         
-        result_mesh = full_plane_mesh.intersection(aabb_mesh, engine='blender')
+        result_mesh = full_plane_mesh.intersection(aabb_mesh, engine='auto')
         
         if result_mesh.is_empty:
             return False

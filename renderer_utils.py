@@ -124,7 +124,7 @@ class RendererUtils:
         return stretched_img
     
     def _process_render_image(self, img, camera_fov_x=None, camera_fov_y=None, output_dir="renders", 
-                              filename_prefix="render", metadata=None):
+                         filename_prefix="render", metadata=None):
         orig_width = img.getXSize()
         orig_height = img.getYSize()
         
@@ -359,6 +359,17 @@ class RendererUtils:
         
         # 3D точки
         render_metadata["points_3d"] = top_points_3d
+        
+        # 2D точки до всех преобразований (оригинальные)
+        render_metadata["points_2d_original"] = []
+        for point_2d in top_points_2d:
+            if point_2d is not None:
+                render_metadata["points_2d_original"].append({
+                    "x": point_2d["x"],
+                    "y": point_2d["y"]
+                })
+            else:
+                render_metadata["points_2d_original"].append(None)
         
         # 2D точки после преобразований
         render_metadata["points_2d"] = []

@@ -18,6 +18,13 @@ class CameraControlGUI(QWidget):
         self.panda_app = panda_app
         self.panda_widget = Panda3DWidget()
         
+        # Фиксированные значения поворота камеры
+        self.fixed_camera_rotation = {
+            'h': 0,
+            'p': -90.0,
+            'r': 0.0
+        }
+        
         self.models_config = self.load_models_config()
         self.textures_config = self.load_textures_config()
         
@@ -903,7 +910,7 @@ class CameraControlGUI(QWidget):
         self.status_bar.setText("Готов к работе")
 
     def run_height_map_reconstruction(self):
-        """Запуск реконструкции через HeightMapMeshGenerator"""
+        """Запуск реконструкции через HeightMapMeshGenerator с учетом разницы поворотов"""
         try:
             # Если генератор еще не создан, создаем его
             if not hasattr(self.panda_app, 'height_map_generator'):
@@ -911,10 +918,44 @@ class CameraControlGUI(QWidget):
             
             generator = self.panda_app.height_map_generator
             
+            # Получаем текущие параметры камеры
+            camera_data = self.panda_app.log_camera_parameters()
+            
+            # Извлекаем текущий поворот камеры
+            try:
+                # Если camera_data уже является словарем
+                if isinstance(camera_data, dict):
+                    current_rotation = camera_data.get('rotation', {})
+                else:
+                    # Если это JSON строка
+                    import json
+                    camera_dict = json.loads(camera_data)
+                    current_rotation = camera_dict.get('rotation', {})
+            except:
+                # Fallback: запросим напрямую из камеры
+                cam_orientation = self.panda_app.get_camera_orientation()
+                current_rotation = {
+                    'h': cam_orientation['hpr'][0],
+                    'p': cam_orientation['hpr'][1],
+                    'r': cam_orientation['hpr'][2]
+                }
+            
+            # Вычисляем разницу между текущим и фиксированным поворотом
+            rotation_diff = {
+                'h': current_rotation.get('h', 0) - self.fixed_camera_rotation['h'],
+                'p': current_rotation.get('p', 0) - self.fixed_camera_rotation['p'],
+                'r': current_rotation.get('r', 0) - self.fixed_camera_rotation['r']
+            }
+            
+            # Отладочный вывод
+            print(f"Текущий поворот: {current_rotation}")
+            print(f"Фиксированный поворот: {self.fixed_camera_rotation}")
+            print(f"Разница поворотов: {rotation_diff}")
+            
             # Настройка параметров шума
-            generator.set_noise_scale(4.0)
+            generator.set_noise_scale(3.0)
             generator.set_noise_strength(0.42)
-            generator.set_noise_octaves(12)
+            generator.set_noise_octaves(4)
             generator.set_noise_persistence(0.01)
             generator.set_noise_lacunarity(1.0)
             generator.set_noise_seed(random.randint(0, 10000))
@@ -936,170 +977,52 @@ class CameraControlGUI(QWidget):
             
             # Настройки для устранения волнообразности
             generator.set_lift_smoothing_enabled(True)
-            generator.set_lift_smoothing_sigma(2.5)
+            generator.set_lift_smoothing_sigma(1.5)
             generator.set_lift_blur_enabled(True)
-            generator.set_lift_blur_radius(4)
+            generator.set_lift_blur_radius(2)
             
             # Настройки для сглаживания исходного меша
             generator.set_source_mesh_smoothing_enabled(True)
             generator.set_source_mesh_smoothing_iterations(1)
-            generator.set_source_mesh_smoothing_sigma(2.0)
+            generator.set_source_mesh_smoothing_sigma(0.1)
             generator.set_source_mesh_edge_preserving(True)
             
             # Настройка области для меша
             generator.set_extended_area(2.5, 5.0)
-            generator.set_grid_resolution(120)
+            generator.set_grid_resolution(60)
             generator.set_base_height(0.0)
             
-            # === ВЫЧИСЛЕНИЕ ОРИЕНТАЦИИ МЕША К КАМЕРЕ ===
-            # Получаем текущее положение и ориентацию камеры
-            camera_pos = self.panda_app.camera.getPos()
-            
-            # Получаем кватернион ориентации камеры
-            camera_quat = self.panda_app.camera.getQuat()
-            
-            # Конвертируем кватернион в углы Эйлера (HPR: heading, pitch, roll)
-            camera_hpr = camera_quat.getHpr()
-            
-            # Меш находится в позиции (0, 0, 1.3)
-            mesh_pos = (0, 0, 1.3)
-            
-            # ====================================================
-            # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Инвертируем направление
-            # Вместо того чтобы смотреть в ту же сторону, что и камера,
-            # меш должен смотреть НА камеру (противоположное направление)
-            # ====================================================
-            
-            # 1. Используем lookAt для вычисления правильной ориентации меша к камере
-            # Создаем временный узел для вычислений
-            temp_node = self.panda_app.render.attachNewNode("temp_calc_node")
-            temp_node.setPos(mesh_pos)
-            
-            # Указываем временному узлу смотреть НА камеру
-            temp_node.lookAt(camera_pos)
-            
-            # Получаем ориентацию, которая заставляет объект смотреть на камеру
-            temp_hpr = temp_node.getHpr()
-            
-            # Удаляем временный узел
-            temp_node.removeNode()
-            
-            # 2. Получаем текущее направление взгляда камеры
-            camera_forward = self.panda_app.camera.getQuat().getForward()
-            
-            # 3. Вычисляем вектор от меша к камере
-            direction_to_camera = camera_pos - self.panda_app.render.getRelativePoint(self.panda_app.render, mesh_pos)
-            
-            # Нормализуем вектор
-            direction_to_camera.normalize()
-            
-            # 4. Вычисляем углы вращения для меша, чтобы он смотрел на камеру
-            # Для этого используем вычисленную ориентацию через lookAt
-            target_rotation_z = temp_hpr.x  # Heading (вращение вокруг Z)
-            target_rotation_x = temp_hpr.y  # Pitch (вращение вокруг X)
-            target_rotation_y = temp_hpr.z  # Roll (вращение вокруг Y)
-            
-            # ====================================================
-            # ДОПОЛНИТЕЛЬНАЯ КОРРЕКТИРОВКА:
-            # Меш изначально ориентирован определенным образом.
-            # Исходя из предыдущего кода (source_rotation_z=180.0),
-            # видно, что для ориентации к камере нужно было повернуть на 180° по Z.
-            # Добавим это как базовую коррекцию.
-            # ====================================================
-            
-            # Проверяем расстояние до камеры
-            distance_to_camera = camera_pos.length()
-            
-            # Если камера далеко, делаем дополнительную корректировку
-            if distance_to_camera > 10:
-                # Для больших расстояний добавляем 180° по Z
-                target_rotation_z += 180
-            
-            # 5. Альтернативный подход: геометрический расчет
-            # Если предыдущий подход не работает, можно использовать векторный расчет
-            
-            # Вектор от камеры к мешу (обратный направлению от меша к камере)
-            camera_to_mesh = self.panda_app.render.getRelativePoint(self.panda_app.render, mesh_pos) - camera_pos
-            camera_to_mesh.normalize()
-            
-            # Вычисляем углы из вектора направления
-            # Для плоскости XZ (горизонтальное вращение)
-            horizontal_angle = math.atan2(camera_to_mesh.y, camera_to_mesh.x)
-            
-            # Для вертикального вращения
-            distance_horizontal = math.sqrt(camera_to_mesh.x**2 + camera_to_mesh.y**2)
-            vertical_angle = math.atan2(camera_to_mesh.z, distance_horizontal)
-            
-            # Конвертируем в градусы
-            horizontal_angle_deg = math.degrees(horizontal_angle)
-            vertical_angle_deg = math.degrees(vertical_angle)
-            
-            # 6. Выбираем оптимальный метод
-            # Метод 1: через lookAt (обычно более надежный)
-            use_method = "lookat"  # "lookat" или "vector"
-            
-            if use_method == "lookat":
-                # Используем вычисления через lookAt
-                final_rotation_z = target_rotation_z
-                final_rotation_x = target_rotation_x
-                final_rotation_y = target_rotation_y
-            else:
-                # Используем векторные вычисления
-                # Корректировка для начальной ориентации меша
-                final_rotation_z = horizontal_angle_deg - 90  # -90 для ориентации по оси Y
-                final_rotation_x = vertical_angle_deg
-                final_rotation_y = 0
-            
-            # ====================================================
-            # КОМПЕНСАЦИЯ ИСХОДНОЙ ОРИЕНТАЦИИ МЕША
-            # ====================================================
-            # На основе предыдущего кода (source_rotation_z=180.0) и тестирования,
-            # добавляем компенсацию для правильной ориентации
-            
-            # Если меш все еще смотрит не туда, попробуйте раскомментировать одну из этих строк:
-            # final_rotation_z += 180  # Инвертировать по Z
-            # final_rotation_x += 180  # Инвертировать по X
-            # final_rotation_y += 180  # Инвертировать по Y
-            
-            # ====================================================
-            
-            # Нормализуем углы в диапазон 0-360
-            final_rotation_z = final_rotation_z % 360
-            final_rotation_x = final_rotation_x % 360
-            final_rotation_y = final_rotation_y % 360
-            
-            # Логирование для отладки
-            self.set_status(f"Камера: pos=({camera_pos.x:.1f}, {camera_pos.y:.1f}, {camera_pos.z:.1f})")
-            self.set_status(f"Меш будет смотреть на камеру с вращением: Z={final_rotation_z:.1f}, X={final_rotation_x:.1f}, Y={final_rotation_y:.1f}")
-            
             # Создание унифицированного перлин-меша с адаптивным подъемом
+            # Применяем разницу поворотов к мешу
             height_map_mesh = generator.add_extended_mesh_to_scene(
-                position=(0, 0, 1.3),
-                source_scale_x=2.0,
-                source_scale_y=1.0,
-                source_scale_z=2.5,
+                position=(0, 0, 0.0),
+                source_scale_x=2.5,
+                source_scale_y=3.2,
+                source_scale_z=1.75,
                 source_offset_x=0.0,
-                source_offset_y=1.0,
-                source_offset_z=-1.0,
-                source_rotation_x=final_rotation_x,
-                source_rotation_y=final_rotation_y,
-                source_rotation_z=final_rotation_z
+                source_offset_y=0.0,
+                source_offset_z=0.0,
+                source_rotation_x=0,  # pitch -> rotation_x
+                source_rotation_y=0,  # roll -> rotation_y
+                source_rotation_z=rotation_diff['h']   # heading -> rotation_z
             )
             
             # Сохраняем ссылку на меш
             self.panda_app.height_map_mesh = height_map_mesh
             
-            self.set_status(f"✅ HeightMap меш создан и ориентирован на камеру!")
+            # Выводим информацию в статус
+            self.set_status(
+                f"✅ HeightMap меш создан с учетом разницы поворотов:\n"
+                f"ΔH={rotation_diff['h']:.1f}°, "
+                f"ΔP={rotation_diff['p']:.1f}°, "
+                f"ΔR={rotation_diff['r']:.1f}°"
+            )
             
-            # Дополнительно: проверяем видимость меша с позиции камеры
-            if height_map_mesh:
-                # Сохраняем текущую позицию камеры для отладки
-                self.panda_app.camera_pos_before_mesh = camera_pos
-                self.panda_app.mesh_pos_after = mesh_pos
-                
-                # Для отладки: можно временно переместить камеру, чтобы убедиться в ориентации
-                # self.panda_app.camera.setPos(10, 10, 10)
-                # self.panda_app.camera.lookAt(height_map_mesh)
+            # Выводим в консоль для отладки
+            print(f"Параметры, переданные в add_extended_mesh_to_scene:")
+            print(f"  source_rotation_x = {rotation_diff['p']}")
+            print(f"  source_rotation_y = {rotation_diff['r']}")
+            print(f"  source_rotation_z = {rotation_diff['h']}")
             
         except Exception as e:
             self.set_status(f"❌ Ошибка реконструкции: {str(e)}", True)

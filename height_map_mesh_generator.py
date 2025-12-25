@@ -10,6 +10,16 @@ import random
 from scipy.interpolate import Rbf, griddata
 from scipy.spatial import KDTree
 from scipy.ndimage import gaussian_filter  
+import sys
+import traceback
+
+def format_size(bytes_size):
+    """Форматирование размера в читаемом виде"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes_size < 1024.0:
+            return f"{bytes_size:.2f} {unit}"
+        bytes_size /= 1024.0
+    return f"{bytes_size:.2f} TB"
 
 class HeightMapMeshGenerator:
     def __init__(self, app, image_path=None):
@@ -21,7 +31,9 @@ class HeightMapMeshGenerator:
         self.alpha_threshold = 0.1
         self.mesh_node = None
         self.use_alpha_channel = True
-        self.mesh_rotation = -90  
+        self.mesh_rotation = 0 
+
+        self.extrapolation_enabled = False
 
         self.source_offset_x = 0.0
         self.source_offset_y = 0.0
@@ -64,15 +76,22 @@ class HeightMapMeshGenerator:
         self.source_mesh_smoothing_sigma = 0.5  
         self.source_mesh_edge_preserving = True  
         
+        print(f"[DEBUG] Инициализирован HeightMapMeshGenerator с изображением: {self.image_path}")
+        print(f"[DEBUG] Планируемое разрешение сетки: {self.grid_resolution}x{self.grid_resolution}")
+        
     def load_height_map(self):
         try:
+            print(f"[DEBUG] Начало загрузки height map: {self.image_path}")
             img = Image.open(self.image_path)
+            print(f"[DEBUG] Изображение загружено: {img.size}, mode: {img.mode}")
             
             if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                print(f"[DEBUG] Изображение содержит альфа-канал")
                 img_rgba = img.convert('RGBA')
                 r, g, b, a = img_rgba.split()
                 
                 alpha = np.array(a, dtype=np.float32) / 255.0
+                print(f"[DEBUG] Альфа-канал создан: {alpha.shape}, размер: {format_size(alpha.nbytes)}")
                 
                 if img.mode != 'L':
                     img_gray = img.convert('L')
@@ -84,17 +103,27 @@ class HeightMapMeshGenerator:
                 
                 self.height_map = height_data * mask
                 self.mask = mask  
+                print(f"[DEBUG] Height map создан: {self.height_map.shape}, размер: {format_size(self.height_map.nbytes)}")
+                print(f"[DEBUG] Mask создан: {self.mask.shape}, размер: {format_size(self.mask.nbytes)}")
+                print(f"[DEBUG] Пикселей в маске: {np.sum(mask)} из {mask.size}")
             else:
+                print(f"[DEBUG] Изображение без альфа-канала")
                 img_gray = img.convert('L')
                 self.height_map = np.array(img_gray, dtype=np.float32) / 255.0
                 
                 mask = self.height_map > 0.05
                 self.mask = mask
+                print(f"[DEBUG] Height map создан (без альфа): {self.height_map.shape}, размер: {format_size(self.height_map.nbytes)}")
+                print(f"[DEBUG] Mask создан: {self.mask.shape}, размер: {format_size(self.mask.nbytes)}")
+                print(f"[DEBUG] Пикселей в маске: {np.sum(mask)} из {mask.size}")
+            
+            # Закрываем изображение для освобождения памяти
+            img.close()
+            print(f"[DEBUG] Загрузка height map завершена успешно")
             return True
             
         except Exception as e:
-            print(f"Error loading height map: {e}")
-            import traceback
+            print(f"[ERROR] Ошибка загрузки height map: {e}")
             traceback.print_exc()
             return False
         
@@ -172,10 +201,12 @@ class HeightMapMeshGenerator:
         return value
     
     def _smooth_heightfield(self, heightfield, iterations=1):
+        print(f"[DEBUG] Начало сглаживания heightfield: {heightfield.shape}, итераций: {iterations}")
         smoothed = heightfield.copy()
         h, w = smoothed.shape
         
-        for _ in range(iterations):
+        for iteration in range(iterations):
+            print(f"[DEBUG] Итерация сглаживания {iteration + 1}/{iterations}")
             new_heights = smoothed.copy()
             for i in range(1, h-1):
                 for j in range(1, w-1):
@@ -187,10 +218,13 @@ class HeightMapMeshGenerator:
                     new_heights[i, j] = np.mean(neighbors)
             smoothed = new_heights
         
+        print(f"[DEBUG] Сглаживание heightfield завершено")
         return smoothed
     
     def _smooth_source_mesh(self, height_grid, source_mask, sigma=0.5, iterations=1, preserve_edges=True):
+        print(f"[DEBUG] Начало сглаживания исходного меша: {height_grid.shape}, sigma={sigma}, iterations={iterations}")
         if not np.any(source_mask):
+            print(f"[DEBUG] Исходный меш пуст, сглаживание не требуется")
             return height_grid
         
         smoothed_height = height_grid.copy()
@@ -198,6 +232,7 @@ class HeightMapMeshGenerator:
         protected_mask = source_mask.copy()
         
         if preserve_edges:
+            print(f"[DEBUG] Сохранение границ включено")
             edge_mask = self._create_edge_mask(source_mask)
             
             protection_radius = max(1, int(np.ceil(sigma)))
@@ -208,24 +243,21 @@ class HeightMapMeshGenerator:
             
             protected_mask = protected_mask & source_mask
             
-        try:
-            masked_height = height_grid.copy()
-            masked_height[~source_mask] = np.nan
-            
-            for _ in range(iterations):
-                gaussian_smoothed = self._gaussian_filter_with_nan(masked_height, sigma)
-                
-                replace_mask = source_mask & ~protected_mask
-                smoothed_height[replace_mask] = gaussian_smoothed[replace_mask]
-                
-                masked_height[replace_mask] = smoothed_height[replace_mask]
-            
-        except Exception as e:
-            smoothed_height = self._improved_simple_smoothing(
-                height_grid, source_mask, protected_mask, 
-                sigma, iterations, preserve_edges
-            )
+        masked_height = height_grid.copy()
+        masked_height[~source_mask] = np.nan
         
+        for iteration in range(iterations):
+            print(f"[DEBUG] Итерация сглаживания исходного меша {iteration + 1}/{iterations}")
+            gaussian_smoothed = self._gaussian_filter_with_nan(masked_height, sigma)
+            
+            replace_mask = source_mask & ~protected_mask
+            smoothed_height[replace_mask] = gaussian_smoothed[replace_mask]
+            
+            masked_height[replace_mask] = smoothed_height[replace_mask]
+            
+        
+        
+        print(f"[DEBUG] Сглаживание исходного меша завершено")
         return smoothed_height
     
     def _gaussian_filter_with_nan(self, data, sigma):
@@ -249,48 +281,6 @@ class HeightMapMeshGenerator:
         
         return result
 
-    def _improved_simple_smoothing(self, height_grid, source_mask, protected_mask, 
-                                sigma=0.5, iterations=1, preserve_edges=True):
-        smoothed_height = height_grid.copy()
-        
-        radius = max(1, int(np.ceil(2 * sigma)))
-        
-        weights = np.zeros((2*radius + 1, 2*radius + 1))
-        for i in range(-radius, radius + 1):
-            for j in range(-radius, radius + 1):
-                distance = np.sqrt(i*i + j*j)
-                weights[i+radius, j+radius] = np.exp(-distance*distance / (2 * sigma * sigma))
-        
-        for iteration in range(iterations):
-            new_heights = smoothed_height.copy()
-            
-            smooth_indices = np.where(source_mask & ~protected_mask)
-            
-            for idx in range(len(smooth_indices[0])):
-                i, j = smooth_indices[0][idx], smooth_indices[1][idx]
-                
-                total_weight = 0.0
-                weighted_sum = 0.0
-                
-                for di in range(-radius, radius + 1):
-                    for dj in range(-radius, radius + 1):
-                        ni, nj = i + di, j + dj
-                        
-                        if (0 <= ni < smoothed_height.shape[0] and 
-                            0 <= nj < smoothed_height.shape[1] and 
-                            source_mask[ni, nj]):
-                            
-                            weight = weights[di+radius, dj+radius]
-                            weighted_sum += weight * smoothed_height[ni, nj]
-                            total_weight += weight
-                
-                if total_weight > 0:
-                    new_heights[i, j] = weighted_sum / total_weight
-            
-            smoothed_height = new_heights
-        
-        return smoothed_height
-
     def _create_edge_mask(self, source_mask):
         from scipy.ndimage import binary_dilation, binary_erosion
         
@@ -302,7 +292,9 @@ class HeightMapMeshGenerator:
         return edge_mask
     
     def _smooth_lifted_area(self, height_grid, lifted_mask, sigma=2.0):
+        print(f"[DEBUG] Начало сглаживания поднятой области: sigma={sigma}")
         if not np.any(lifted_mask):
+            print(f"[DEBUG] Поднятая область пуста, сглаживание не требуется")
             return height_grid
         
         smoothed_height = height_grid.copy()
@@ -313,7 +305,9 @@ class HeightMapMeshGenerator:
             smoothed_height[lifted_mask] = gaussian_smoothed[lifted_mask]
             
         except Exception as e:
-            for _ in range(3):
+            print(f"[DEBUG] Ошибка при гауссовом сглаживании поднятой области: {e}, используем упрощенный метод")
+            for iteration in range(3):
+                print(f"[DEBUG] Упрощенное сглаживание, итерация {iteration + 1}/3")
                 new_heights = smoothed_height.copy()
                 for i in range(1, smoothed_height.shape[0]-1):
                     for j in range(1, smoothed_height.shape[1]-1):
@@ -327,23 +321,33 @@ class HeightMapMeshGenerator:
                             new_heights[i, j] = np.mean(neighbors)
                 smoothed_height = new_heights
         
+        print(f"[DEBUG] Сглаживание поднятой области завершено")
         return smoothed_height
     
     def _blur_lift_boundary(self, height_grid, source_mask, boundary_points, blur_radius=3):
+        print(f"[DEBUG] Начало размытия границ подъема: blur_radius={blur_radius}")
         if len(boundary_points) == 0 or blur_radius <= 0:
+            print(f"[DEBUG] Нет граничных точек или радиус размытия = 0")
             return height_grid
         
         boundary_points_array = np.array(boundary_points)
+        print(f"[DEBUG] Граничные точки: {len(boundary_points)} точек")
         
         blurred_height = height_grid.copy()
         
         try:
             boundary_tree = KDTree(boundary_points_array[:, :2])
+            print(f"[DEBUG] KDTree построен для {len(boundary_points_array)} точек")
         except Exception as e:
+            print(f"[DEBUG] Ошибка построения KDTree: {e}")
             return height_grid
         
         h, w = height_grid.shape
         boundary_influence_mask = np.zeros((h, w), dtype=bool)
+        
+        processed_points = 0
+        total_points = h * w - np.sum(source_mask)
+        print(f"[DEBUG] Обработка влияния границ: всего {total_points} точек для проверки")
         
         for i in range(h):
             for j in range(w):
@@ -357,8 +361,18 @@ class HeightMapMeshGenerator:
                 
                 if distances <= blur_radius:
                     boundary_influence_mask[i, j] = True
+                
+                processed_points += 1
+                if processed_points % 10000 == 0:
+                    print(f"[DEBUG] Обработано {processed_points}/{total_points} точек ({processed_points/total_points*100:.1f}%)")
+        
+        print(f"[DEBUG] Точки под влиянием границ: {np.sum(boundary_influence_mask)}")
         
         if np.any(boundary_influence_mask):
+            points_to_blur = np.sum(boundary_influence_mask)
+            print(f"[DEBUG] Начинаем размытие {points_to_blur} точек")
+            
+            blurred_points = 0
             for i in range(h):
                 for j in range(w):
                     if boundary_influence_mask[i, j]:
@@ -376,7 +390,12 @@ class HeightMapMeshGenerator:
                         
                         if weights:
                             blurred_height[i, j] = np.sum(neighbors) / np.sum(weights)
+                        
+                        blurred_points += 1
+                        if blurred_points % 1000 == 0:
+                            print(f"[DEBUG] Размыто {blurred_points}/{points_to_blur} точек ({blurred_points/points_to_blur*100:.1f}%)")
             
+        print(f"[DEBUG] Размытие границ подъема завершено")
         return blurred_height
     
     def _calculate_adaptive_distance_parameters(self, boundary_heights):
@@ -391,10 +410,13 @@ class HeightMapMeshGenerator:
         min_distance = max(self.min_distance, base_distance * 0.5)        
         max_distance = self.max_distance + min(height_range * 2.0, 4.0)   
         
+        print(f"[DEBUG] Адаптивные параметры расстояния: base={base_distance:.2f}, min={min_distance:.2f}, max={max_distance:.2f}")
         return base_distance, min_distance, max_distance
     
     def _apply_adaptive_vertex_lift(self, height_grid, source_mask, x_grid, y_grid, boundary_points):
+        print(f"[DEBUG] Начало адаптивного подъема вершин")
         if len(boundary_points) == 0:
+            print(f"[DEBUG] Нет граничных точек, подъем не требуется")
             return height_grid, np.zeros_like(source_mask, dtype=bool)
         
         self._current_x_grid = x_grid
@@ -408,8 +430,10 @@ class HeightMapMeshGenerator:
         try:
             boundary_tree = KDTree(boundary_points_array[:, :2])
             use_kdtree = True
+            print(f"[DEBUG] KDTree построен для адаптивного подъема")
         except Exception as e:
             use_kdtree = False
+            print(f"[DEBUG] Ошибка построения KDTree: {e}, используем линейный поиск")
         
         min_boundary_height = np.min(boundary_heights)
         max_boundary_height = np.max(boundary_heights)
@@ -424,6 +448,10 @@ class HeightMapMeshGenerator:
         min_lift = float('inf')
         max_lift = float('-inf')
         
+        total_vertices = np.sum(~source_mask)
+        print(f"[DEBUG] Всего вершин для проверки подъема: {total_vertices}")
+        
+        processed_vertices = 0
         for i in range(len(y_grid)):
             for j in range(len(x_grid)):
                 if source_mask[i, j]:
@@ -480,37 +508,50 @@ class HeightMapMeshGenerator:
                             min_lift = lift_amount
                         if lift_amount > max_lift:
                             max_lift = lift_amount
+                
+                processed_vertices += 1
+                if processed_vertices % 10000 == 0:
+                    print(f"[DEBUG] Обработано {processed_vertices}/{total_vertices} вершин ({processed_vertices/total_vertices*100:.1f}%)")
         
-        total_vertices = np.sum(~source_mask)
         if lifted_vertices_count > 0:
             avg_lift = total_lift_amount / lifted_vertices_count
+            print(f"[DEBUG] Адаптивный подъем завершен:")
+            print(f"[DEBUG]   Поднято вершин: {lifted_vertices_count} из {total_vertices}")
+            print(f"[DEBUG]   Средний подъем: {avg_lift:.4f}")
+            print(f"[DEBUG]   Минимальный подъем: {min_lift:.4f}")
+            print(f"[DEBUG]   Максимальный подъем: {max_lift:.4f}")
+        else:
+            print(f"[DEBUG] Адаптивный подъем: ни одна вершина не была поднята")
         
         return corrected_height, lifted_mask
     
-    def create_extended_mesh(self, world_position=(0, 0, 2), source_scale_x=None,
-                source_scale_y=None, source_scale_z=None, 
-                source_offset_x=0.0, source_offset_y=0.0, source_offset_z=0.0,
-                source_rotation_x=None, source_rotation_y=None, source_rotation_z=None):
-        return self.create_unified_perlin_mesh_with_lift(world_position, source_scale_x,
-                                                        source_scale_y, source_scale_z,
-                                                        source_offset_x, source_offset_y, source_offset_z,
-                                                        source_rotation_x, source_rotation_y, source_rotation_z)
-    
     def create_unified_perlin_mesh_with_lift(self, world_position=(0, 0, 2), source_scale_x=None,
                                             source_scale_y=None, source_scale_z=None,
-                                            source_offset_x=0.0, source_offset_y=0.0, source_offset_z=0.0, source_rotation_x=None, source_rotation_y=None, source_rotation_z=None):
+                                            source_offset_x=0.0, source_offset_y=0.0, source_offset_z=0.0, 
+                                            source_rotation_x=None, source_rotation_y=None, source_rotation_z=None):
+        print(f"[DEBUG] ====== НАЧАЛО СОЗДАНИЯ МЕША ======")
+        print(f"[DEBUG] Позиция в мире: {world_position}")
+        print(f"[DEBUG] Разрешение сетки: {self.grid_resolution}")
+        
         if self.height_map is None:
+            print(f"[DEBUG] Height map не загружен, начинаем загрузку...")
             if not self.load_height_map():
+                print(f"[ERROR] Не удалось загрузить height map")
                 return None
         
         h, w = self.height_map.shape
+        print(f"[DEBUG] Размер height map: {h}x{w}, общее количество пикселей: {h*w}")
         
         if not hasattr(self, 'mask'):
+            print(f"[DEBUG] Маска не создана, создаем из height map")
             self.mask = self.height_map > self.alpha_threshold
         
         y_indices, x_indices = np.where(self.mask)
         
+        print(f"[DEBUG] Пикселей в маске: {len(y_indices)} из {h*w} ({len(y_indices)/(h*w)*100:.1f}%)")
+        
         if len(y_indices) == 0:
+            print(f"[ERROR] Нет пикселей в маске")
             return None
         
         if source_scale_x is None:
@@ -524,14 +565,22 @@ class HeightMapMeshGenerator:
         rot_y = source_rotation_y if source_rotation_y is not None else self.source_rotation_y
         rot_z = source_rotation_z if source_rotation_z is not None else self.source_rotation_z
         
+        print(f"[DEBUG] Масштаб источника: ({source_scale_x}, {source_scale_y}, {source_scale_z})")
+        print(f"[DEBUG] Вращение источника: ({rot_x}, {rot_y}, {rot_z})")
+        
+        # Создание source_points
+        print(f"[DEBUG] Создание source_points из {len(y_indices)} пикселей...")
         source_points = []
-        for y, x in zip(y_indices, x_indices):
+        for idx, (y, x) in enumerate(zip(y_indices, x_indices)):
             height = self.height_map[y, x]
             
             # Применяем масштабирование
             world_x = (x / w - 0.5) * source_scale_x
             world_y = (y / h - 0.5) * source_scale_y
             world_z = height * source_scale_z
+
+            # world_x = -world_x
+            world_y = -world_y
             
             # Применяем вращение
             world_x, world_y, world_z = self._apply_rotation_xyz(world_x, world_y, world_z, rot_x, rot_y, rot_z)
@@ -547,21 +596,37 @@ class HeightMapMeshGenerator:
             world_z += world_position[2]
             
             source_points.append((world_x, world_y, world_z))
+            
+            if idx % 10000 == 0 and idx > 0:
+                print(f"[DEBUG] Обработано {idx}/{len(y_indices)} пикселей ({idx/len(y_indices)*100:.1f}%)")
         
         source_points = np.array(source_points)
+        print(f"[DEBUG] Source_points создан: {source_points.shape}, размер: {format_size(source_points.nbytes)}")
         
-        min_x = world_position[0] - self.target_width / 2
-        max_x = world_position[0] + self.target_width / 2
-        min_y = world_position[1] - self.target_height / 2
-        max_y = world_position[1] + self.target_height / 2
+        # Создание сетки
+        print(f"[DEBUG] Создание сетки...")
+        if not self.extrapolation_enabled:
+            min_x = world_position[0] - source_scale_x/2 if source_scale_x else world_position[0] - 1.0
+            max_x = world_position[0] + source_scale_x/2 if source_scale_x else world_position[0] + 1.0
+            min_y = world_position[1] - source_scale_y/2 if source_scale_y else world_position[1] - 1.0
+            max_y = world_position[1] + source_scale_y/2 if source_scale_y else world_position[1] + 1.0
+        else:
+            min_x = world_position[0] - self.target_width / 2
+            max_x = world_position[0] + self.target_width / 2
+            min_y = world_position[1] - self.target_height / 2
+            max_y = world_position[1] + self.target_height / 2
         
         x_grid = np.linspace(min_x, max_x, self.grid_resolution)
         y_grid = np.linspace(min_y, max_y, self.grid_resolution)
         grid_x, grid_y = np.meshgrid(x_grid, y_grid)
         
+        print(f"[DEBUG] Сетка создана: {grid_x.shape}, размер: {format_size(grid_x.nbytes + grid_y.nbytes)}")
+        print(f"[DEBUG] x_grid: {len(x_grid)} точек, y_grid: {len(y_grid)} точек")
+        
         source_height_grid = np.full((len(y_grid), len(x_grid)), np.nan, dtype=np.float32)
         source_mask = np.zeros((len(y_grid), len(x_grid)), dtype=bool)
         
+        print(f"[DEBUG] Заполнение source_height_grid и source_mask...")
         for wx, wy, wz in source_points:
             grid_x_idx = np.argmin(np.abs(x_grid - wx))
             grid_y_idx = np.argmin(np.abs(y_grid - wy))
@@ -572,7 +637,12 @@ class HeightMapMeshGenerator:
                 source_height_grid[grid_y_idx, grid_x_idx] = wz
                 source_mask[grid_y_idx, grid_x_idx] = True
         
+        print(f"[DEBUG] Пикселей в source_mask: {np.sum(source_mask)} из {source_mask.size}")
+        
+        # Поиск граничных точек
+        print(f"[DEBUG] Поиск граничных точек...")
         boundary_points = []
+        boundary_count = 0
         for i in range(len(y_grid)):
             for j in range(len(x_grid)):
                 if source_mask[i, j]:
@@ -591,17 +661,27 @@ class HeightMapMeshGenerator:
                     
                     if is_boundary:
                         boundary_points.append((x_grid[j], y_grid[i], source_height_grid[i, j]))
+                        boundary_count += 1
         
+        print(f"[DEBUG] Найдено граничных точек: {boundary_count}")
+        
+        # Генерация шума Перлина
+        print(f"[DEBUG] Генерация шума Перлина...")
         perlin_height = np.zeros((len(y_grid), len(x_grid)), dtype=np.float32)
-        
-        for i in range(len(y_grid)):
-            for j in range(len(x_grid)):
-                x = x_grid[j]
-                y = y_grid[i]
-                
-                noise_value = self._generate_perlin_noise(x, y)
-                noise_height = (noise_value + 1.0) / 2.0 * self.noise_strength
-                perlin_height[i, j] = noise_height
+    
+        # Генерируем перлин-шум только если включена экстраполяция
+        if self.extrapolation_enabled:
+            for i in range(len(y_grid)):
+                for j in range(len(x_grid)):
+                    x = x_grid[j]
+                    y = y_grid[i]
+                    
+                    noise_value = self._generate_perlin_noise(x, y)
+                    noise_height = (noise_value + 1.0) / 2.0 * self.noise_strength
+                    perlin_height[i, j] = noise_height
+        else:
+            # Без экстраполяции - плоская поверхность
+            perlin_height.fill(0.0)
         
         base_height_grid = perlin_height + self.base_height
         
@@ -611,38 +691,42 @@ class HeightMapMeshGenerator:
             key_z = source_points[:, 2]
             
             try:
-                if self.interpolation_method == 'rbf':
-                    rbf = Rbf(key_x, key_y, key_z, 
-                              function='multiquadric', 
-                              smooth=self.rbf_smooth)
+                if self.extrapolation_enabled:  # ← ПРОВЕРКА ФЛАГА
+                    if self.interpolation_method == 'rbf':
+                        rbf = Rbf(key_x, key_y, key_z, 
+                                function='multiquadric', 
+                                smooth=self.rbf_smooth)
+                        
+                        key_surface = rbf(grid_x, grid_y)
+                        
+                    elif self.interpolation_method in ['linear', 'cubic']:
+                        key_surface = griddata((key_x, key_y), key_z, 
+                                            (grid_x, grid_y), 
+                                            method=self.interpolation_method,
+                                            fill_value=self.base_height)
+                    else:
+                        raise ValueError(f"Unknown interpolation method: {self.interpolation_method}")
                     
-                    key_surface = rbf(grid_x, grid_y)
+                    blend_weights = np.zeros_like(grid_x, dtype=np.float32)
                     
-                elif self.interpolation_method in ['linear', 'cubic']:
-                    key_surface = griddata((key_x, key_y), key_z, 
-                                          (grid_x, grid_y), 
-                                          method=self.interpolation_method,
-                                          fill_value=self.base_height)
+                    for i in range(len(y_grid)):
+                        for j in range(len(x_grid)):
+                            if source_mask[i, j]:
+                                blend_weights[i, j] = 1.0
+                            else:
+                                distances = np.sqrt((key_x - grid_x[i, j])**2 + (key_y - grid_y[i, j])**2)
+                                min_distance = np.min(distances) if len(distances) > 0 else float('inf')
+                                
+                                influence_distance = 1.0
+                                if min_distance < influence_distance:
+                                    weight = 1.0 - (min_distance / influence_distance)
+                                    weight = weight * weight
+                                    blend_weights[i, j] = weight
+                    
+                    corrected_height = base_height_grid * (1.0 - blend_weights) + key_surface * blend_weights
                 else:
-                    raise ValueError(f"Unknown interpolation method: {self.interpolation_method}")
-                
-                blend_weights = np.zeros_like(grid_x, dtype=np.float32)
-                
-                for i in range(len(y_grid)):
-                    for j in range(len(x_grid)):
-                        if source_mask[i, j]:
-                            blend_weights[i, j] = 1.0
-                        else:
-                            distances = np.sqrt((key_x - grid_x[i, j])**2 + (key_y - grid_y[i, j])**2)
-                            min_distance = np.min(distances) if len(distances) > 0 else float('inf')
-                            
-                            influence_distance = 1.0
-                            if min_distance < influence_distance:
-                                weight = 1.0 - (min_distance / influence_distance)
-                                weight = weight * weight
-                                blend_weights[i, j] = weight
-                
-                corrected_height = base_height_grid * (1.0 - blend_weights) + key_surface * blend_weights
+                    # Без экстраполяции - только исходные данные
+                    corrected_height = base_height_grid.copy()
                 
                 for i in range(len(y_grid)):
                     for j in range(len(x_grid)):
@@ -658,7 +742,10 @@ class HeightMapMeshGenerator:
         else:
             corrected_height = base_height_grid
         
+        print(f"[DEBUG] Высота после интерполяции: {corrected_height.shape}, размер: {format_size(corrected_height.nbytes)}")
+        
         if self.source_mesh_smoothing_enabled and np.any(source_mask):
+            print(f"[DEBUG] Применение сглаживания исходного меша...")
             corrected_height = self._smooth_source_mesh(
                 corrected_height, source_mask,
                 sigma=self.source_mesh_smoothing_sigma,
@@ -667,12 +754,13 @@ class HeightMapMeshGenerator:
             )
             
             if self.source_mesh_smoothing_sigma > 1.0:  
+                print(f"[DEBUG] Постобработка граничной зоны...")
                 corrected_height = self._postprocess_boundary_zone(
                     corrected_height, source_mask, 
                     boundary_width=int(self.source_mesh_smoothing_sigma * 2)
                 )
         
-        if self.adaptive_lift_enabled and len(boundary_points) > 0:
+        if self.extrapolation_enabled and self.adaptive_lift_enabled and len(boundary_points) > 0:  # ← ДОБАВЛЕНА ПРОВЕРКА self.extrapolation_enabled
             corrected_height, lifted_mask = self._apply_adaptive_vertex_lift(
                 corrected_height, source_mask, x_grid, y_grid, boundary_points
             )
@@ -690,8 +778,11 @@ class HeightMapMeshGenerator:
             lifted_mask = np.zeros_like(source_mask, dtype=bool)
         
         if self.use_smoothing and self.smoothing_iterations > 0:
+            print(f"[DEBUG] Финальное сглаживание...")
             corrected_height = self._smooth_heightfield(corrected_height, self.smoothing_iterations)
         
+        # Создание геометрии
+        print(f"[DEBUG] Создание геометрии меша...")
         format = GeomVertexFormat.getV3n3t2()
         vdata = GeomVertexData("unified_perlin_mesh_with_lift", format, Geom.UHStatic)
         
@@ -702,6 +793,7 @@ class HeightMapMeshGenerator:
         vertices = []
         vertex_indices = {}
         
+        print(f"[DEBUG] Создание вершин...")
         for i, y in enumerate(y_grid):
             for j, x in enumerate(x_grid):
                 z = corrected_height[i, j]
@@ -712,8 +804,17 @@ class HeightMapMeshGenerator:
                 
                 vertex_indices[(i, j)] = len(vertices)
                 vertices.append((x, y, z))
+            
+            if i % 10 == 0 and i > 0:
+                print(f"[DEBUG] Создано вершин для {i}/{len(y_grid)} строк ({i/len(y_grid)*100:.1f}%)")
+        
+        print(f"[DEBUG] Всего создано вершин: {len(vertices)}")
         
         triangles = GeomTriangles(Geom.UHStatic)
+        
+        print(f"[DEBUG] Создание треугольников...")
+        total_triangles = (len(y_grid) - 1) * (len(x_grid) - 1) * 2
+        created_triangles = 0
         
         for i in range(len(y_grid) - 1):
             for j in range(len(x_grid) - 1):
@@ -724,8 +825,14 @@ class HeightMapMeshGenerator:
                 
                 triangles.addVertices(v1, v2, v3)
                 triangles.addVertices(v2, v4, v3)
+                
+                created_triangles += 2
+                
+                if created_triangles % 5000 == 0:
+                    print(f"[DEBUG] Создано {created_triangles}/{total_triangles} треугольников ({created_triangles/total_triangles*100:.1f}%)")
         
         triangles.closePrimitive()
+        print(f"[DEBUG] Создано всего треугольников: {created_triangles}")
         
         geom = Geom(vdata)
         geom.addPrimitive(triangles)
@@ -733,13 +840,16 @@ class HeightMapMeshGenerator:
         node = GeomNode("unified_perlin_mesh_with_lift")
         node.addGeom(geom)
         
+        print(f"[DEBUG] Расчет нормалей...")
         self._calculate_normals(vdata, geom)
         
+        print(f"[DEBUG] ====== СОЗДАНИЕ МЕША ЗАВЕРШЕНО ======")
         return node
     
     def _postprocess_boundary_zone(self, height_grid, source_mask, boundary_width=5):
         from scipy.ndimage import distance_transform_edt
         
+        print(f"[DEBUG] Постобработка граничной зоны шириной {boundary_width}")
         distance_in = distance_transform_edt(source_mask)
         
         corrected_height = height_grid.copy()
@@ -769,50 +879,8 @@ class HeightMapMeshGenerator:
         
         return corrected_height
     
-    def _create_simple_extended_mesh(self, x_grid, y_grid, source_mask, avg_source_height, 
-                                     world_position, vdata, vertex, normal, texcoord):
-        vertices = []
-        vertex_indices = {}
-        
-        for i, y in enumerate(y_grid):
-            for j, x in enumerate(x_grid):
-                if source_mask[i, j]:
-                    z = avg_source_height[i, j]
-                else:
-                    z = self.base_height
-                
-                vertex.addData3f(x, y, z)
-                normal.addData3f(0, 0, 1)
-                texcoord.addData2f(j / (len(x_grid)-1), i / (len(y_grid)-1))
-                
-                vertex_indices[(i, j)] = len(vertices)
-                vertices.append((x, y, z))
-        
-        triangles = GeomTriangles(Geom.UHStatic)
-        
-        for i in range(len(y_grid) - 1):
-            for j in range(len(x_grid) - 1):
-                v1 = vertex_indices[(i, j)]
-                v2 = vertex_indices[(i, j + 1)]
-                v3 = vertex_indices[(i + 1, j)]
-                v4 = vertex_indices[(i + 1, j + 1)]
-                
-                triangles.addVertices(v1, v2, v3)
-                triangles.addVertices(v2, v4, v3)
-        
-        triangles.closePrimitive()
-        
-        geom = Geom(vdata)
-        geom.addPrimitive(triangles)
-        
-        node = GeomNode("simple_extended_mesh")
-        node.addGeom(geom)
-        
-        self._calculate_normals(vdata, geom)
-        
-        return node
-    
     def _calculate_normals(self, vdata, geom):
+        print(f"[DEBUG] Начало расчета нормалей")
         vertex_reader = GeomVertexReader(vdata, "vertex")
         normal_writer = GeomVertexWriter(vdata, "normal")
         
@@ -820,6 +888,8 @@ class HeightMapMeshGenerator:
         while not vertex_reader.isAtEnd():
             pos = vertex_reader.getData3f()
             vertices.append((pos.x, pos.y, pos.z))
+        
+        print(f"[DEBUG] Вершин для расчета нормалей: {len(vertices)}")
         
         normals = [(0.0, 0.0, 0.0) for _ in range(len(vertices))]
         
@@ -855,6 +925,7 @@ class HeightMapMeshGenerator:
                                     curr[2] + normal[2]
                                 )
         
+        print(f"[DEBUG] Нормализация нормалей...")
         for i in range(len(normals)):
             nx, ny, nz = normals[i]
             norm = (nx*nx + ny*ny + nz*nz) ** 0.5
@@ -865,37 +936,8 @@ class HeightMapMeshGenerator:
             
             nx, ny, nz = self._apply_rotation(nx, ny, nz)
             normal_writer.setData3f(nx, ny, nz)
-    
-    def add_to_scene(self, position=(0, 0, 2)):
-        if self.mesh_node:
-            self.mesh_node.removeNode()
         
-        node = self.create_mesh_in_world_coordinates(position)
-        if node:
-            self.mesh_node = self.app.render.attachNewNode(node)
-            
-            material = Material()
-            material.setDiffuse((0.8, 0.8, 0.8, 1.0))
-            material.setAmbient((0.3, 0.3, 0.3, 1.0))
-            material.setSpecular((0.5, 0.5, 0.5, 1.0))
-            material.setShininess(50.0)
-            self.mesh_node.setTwoSided(True)
-            self.mesh_node.setMaterial(material, 1)
-            
-            self.mesh_node.setShaderAuto()
-
-            if not hasattr(self.app, 'loaded_models'):
-                self.app.loaded_models = []
-            if not hasattr(self.app, 'model_paths'):
-                self.app.model_paths = {}
-            
-            if self.mesh_node not in self.app.loaded_models:
-                self.app.loaded_models.append(self.mesh_node)
-                self.app.model_paths[id(self.mesh_node)] = "height_map_mesh_world"
-            
-            return self.mesh_node
-        
-        return None
+        print(f"[DEBUG] Расчет нормалей завершен")
     
     def set_source_scale(self, scale_x, scale_y, scale_z):
         self.source_scale_x = scale_x
@@ -911,10 +953,11 @@ class HeightMapMeshGenerator:
                           source_scale_y=None, source_scale_z=None,
                           source_offset_x=0.0, source_offset_y=0.0, source_offset_z=0.0,
                           source_rotation_x=None, source_rotation_y=None, source_rotation_z=None):
+        print(f"[DEBUG] Добавление расширенного меша на сцену")
         if self.mesh_node:
             self.mesh_node.removeNode()
         
-        node = self.create_extended_mesh(position, source_scale_x, source_scale_y, 
+        node = self.create_unified_perlin_mesh_with_lift(position, source_scale_x, source_scale_y, 
                                         source_scale_z, source_offset_x, source_offset_y, source_offset_z,
                                         source_rotation_x, source_rotation_y, source_rotation_z)
         if node:
@@ -944,55 +987,23 @@ class HeightMapMeshGenerator:
         
         return None
     
-    def add_unified_mesh_with_lift_to_scene(self, position=(0, 0, 2), source_scale_x=None,
-                                       source_scale_y=None, source_scale_z=None,
-                                       source_offset_x=0.0, source_offset_y=0.0, source_offset_z=0.0,
-                                       source_rotation_x=None, source_rotation_y=None, source_rotation_z=None):
-        if self.mesh_node:
-            self.mesh_node.removeNode()
-        
-        node = self.create_unified_perlin_mesh_with_lift(position, source_scale_x, source_scale_y,
-                                                        source_scale_z, source_offset_x, source_offset_y, source_offset_z,
-                                                        source_rotation_x, source_rotation_y, source_rotation_z)
-        if node:
-            self.mesh_node = self.app.render.attachNewNode(node)
-            
-            material = Material()
-            material.setDiffuse((0.8, 0.8, 0.8, 1.0))
-            material.setAmbient((0.3, 0.3, 0.3, 1.0))
-            material.setSpecular((0.5, 0.5, 0.5, 1.0))
-            material.setShininess(50.0)
-            self.mesh_node.setTwoSided(True)
-            self.mesh_node.setMaterial(material, 1)
-            
-            self.mesh_node.setShaderAuto()
-            self.mesh_node.setPos(0, 0, 2)
-            
-            if not hasattr(self.app, 'loaded_models'):
-                self.app.loaded_models = []
-            if not hasattr(self.app, 'model_paths'):
-                self.app.model_paths = {}
-            
-            if self.mesh_node not in self.app.loaded_models:
-                self.app.loaded_models.append(self.mesh_node)
-                self.app.model_paths[id(self.mesh_node)] = "unified_perlin_mesh_with_lift"
-            
-            return self.mesh_node
-        
-        return None
-    
     def remove_from_scene(self):
         """Удаление меша со сцены"""
+        print(f"[DEBUG] Удаление меша со сцены")
         if self.mesh_node:
-            if self.mesh_node in self.app.loaded_models:
+            if hasattr(self.app, 'loaded_models') and self.mesh_node in self.app.loaded_models:
                 self.app.loaded_models.remove(self.mesh_node)
             
-            model_id = id(self.mesh_node)
-            if model_id in self.app.model_paths:
-                del self.app.model_paths[model_id]
+            if hasattr(self.app, 'model_paths'):
+                model_id = id(self.mesh_node)
+                if model_id in self.app.model_paths:
+                    del self.app.model_paths[model_id]
             
             self.mesh_node.removeNode()
             self.mesh_node = None
+            print(f"[DEBUG] Меш успешно удален со сцены")
+        else:
+            print(f"[DEBUG] Меш не найден на сцене")
     
     def set_threshold(self, threshold):
         """Установка порога для определения фона"""
@@ -1013,6 +1024,7 @@ class HeightMapMeshGenerator:
     
     def set_grid_resolution(self, resolution):
         """Установка разрешения сетки для экстраполяции"""
+        print(f"[DEBUG] Установка разрешения сетки: {resolution}")
         self.grid_resolution = resolution
     
     def set_noise_scale(self, scale):
@@ -1064,7 +1076,6 @@ class HeightMapMeshGenerator:
         if intensity is not None:
             self.lift_intensity = max(0.0, intensity)
         
-
     def set_use_smoothing(self, use_smoothing):
         """Включение/выключение сглаживания"""
         self.use_smoothing = use_smoothing
