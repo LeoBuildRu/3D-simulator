@@ -405,111 +405,13 @@ class PerlinMeshGenerator:
         self.panda_app.loaded_models.append(perlin_base_np)
 
         target_volume = self.panda_app.Target_Volume
-        tolerance = 0.2
-        min_z = -2
-        max_z = 2
-        max_iterations = 50
 
-        best_z = perlin_base_np.getZ()
-        best_volume = None
-        best_error = float('inf')
-
-        if hasattr(self.panda_app, 'current_display_model') and self.panda_app.current_display_model:
-            self.panda_app.current_display_model.removeNode()
-        self.panda_app.current_display_model = None
-
-        search_points = [min_z + (max_z - min_z) * i / 10 for i in range(11)]
-        search_volumes = []
-
-        for z in search_points:
-            perlin_base_np.setPos(0, 0, z)
-            perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(perlin_base_np)
-            
-            result_csg = trimesh.boolean.difference(
-                [target_model_trimesh, perlin_model_trimesh_],
-                engine='blender'
-            )
-            
-            model_csg_plane_1 = self.panda_app.trimesh_to_panda(result_csg)
-            self._setup_transparent_material(model_csg_plane_1)
-            
-            if self.current_display_model is not None:
-                self.current_display_model.removeNode()
-            
-            self.current_display_model = model_csg_plane_1
-            self.current_display_model.reparentTo(self.panda_app.render)
-            
-            volume = self.panda_app.calculate_mesh_volume(self.current_display_model)
-            error = abs(volume - target_volume)
-            search_volumes.append((z, volume, error))
-            
-            if error < best_error:
-                best_error = error
-                best_z = z
-                best_volume = volume
-        
-        if best_error <= tolerance:
-            perlin_base_np.setPos(0, 0, best_z)
-            if self.current_display_model is not None:
-                self.current_display_model.removeNode()
-            return best_z
-
-        search_volumes.sort(key=lambda x: x[2])
-        best_points = search_volumes[:3]
-
-        if len(best_points) >= 2:
-            z_values = [p[0] for p in best_points]
-            min_search_z = min(z_values)
-            max_search_z = max(z_values)
-            
-            range_expand = (max_search_z - min_search_z) * 0.2
-            min_search_z = max(min_z, min_search_z - range_expand)
-            max_search_z = min(max_z, max_search_z + range_expand)
-            
-            phi = 0.618
-            a = min_search_z
-            b = max_search_z
-            
-            x1 = b - phi * (b - a)
-            x2 = a + phi * (b - a)
-            
-            iteration = 0
-            while (b - a) > 0.01 and iteration < max_iterations:
-                iteration += 1
-                
-                vol1, err1 = self._evaluate_z_position(perlin_base_np, target_model_trimesh, x1, target_volume)
-                vol2, err2 = self._evaluate_z_position(perlin_base_np, target_model_trimesh, x2, target_volume)
-                
-                if err1 < best_error:
-                    best_error = err1
-                    best_z = x1
-                    best_volume = vol1
-                
-                if err2 < best_error:
-                    best_error = err2
-                    best_z = x2
-                    best_volume = vol2
-                
-                if best_error <= tolerance:
-                    break
-                
-                if err1 < err2:
-                    b = x2
-                    x2 = x1
-                    err2 = err1
-                    x1 = b - phi * (b - a)
-                    vol1, err1 = self._evaluate_z_position(perlin_base_np, target_model_trimesh, x1, target_volume)
-                else:
-                    a = x1
-                    x1 = x2
-                    err1 = err2
-                    x2 = a + phi * (b - a)
-                    vol2, err2 = self._evaluate_z_position(perlin_base_np, target_model_trimesh, x2, target_volume)
-                
-                if best_error <= tolerance:
-                    break
-
-        perlin_base_np.setPos(0, 0, best_z)
+        best_z = self.find_best_z_position(
+            perlin_base_np, 
+            target_model_trimesh, 
+            target_volume,
+            initial_z=perlin_base_np.getZ()
+        )
         self.last_best_z = best_z
 
         if self.current_display_model is not None:
@@ -592,6 +494,164 @@ class PerlinMeshGenerator:
         perlin_detailed_np.hide()
         
         return True
+    
+    def find_best_z_position(self, mesh_np, target_model_trimesh, target_volume, initial_z=0):
+        """Поиск оптимальной Z-позиции меша для достижения целевого объема"""
+        tolerance = 0.2
+        min_z = -2
+        max_z = 2
+        max_iterations = 50
+
+        best_z = initial_z
+        best_volume = None
+        best_error = float('inf')
+
+        if hasattr(self, 'current_display_model') and self.current_display_model:
+            self.current_display_model.removeNode()
+        self.current_display_model = None
+
+        search_points = [min_z + (max_z - min_z) * i / 10 for i in range(11)]
+        search_volumes = []
+
+        # DEBUG: Начальные параметры
+        print("=== DEBUG: Начало поиска best_z ===")
+        print(f"Целевой объем: {target_volume}")
+        print(f"Допуск: {tolerance}")
+        print(f"Диапазон поиска: [{min_z}, {max_z}]")
+        print(f"Макс. итераций: {max_iterations}")
+        print(f"Начальные точки поиска ({len(search_points)}): {search_points}")
+
+        for z in search_points:
+            mesh_np.setPos(0, 0, z)
+            perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(mesh_np)
+            
+            result_csg = trimesh.boolean.difference(
+                [target_model_trimesh, perlin_model_trimesh_],
+                engine='blender'
+            )
+            
+            model_csg_plane_1 = self.panda_app.trimesh_to_panda(result_csg)
+            self._setup_transparent_material(model_csg_plane_1)
+            
+            if self.current_display_model is not None:
+                self.current_display_model.removeNode()
+            
+            self.current_display_model = model_csg_plane_1
+            self.current_display_model.reparentTo(self.panda_app.render)
+            
+            volume = self.panda_app.calculate_mesh_volume(self.current_display_model)
+            error = abs(volume - target_volume)
+            search_volumes.append((z, volume, error))
+            
+            # DEBUG: Результаты для каждой точки поиска
+            print(f"  z={z:.4f}: объем={volume:.6f}, ошибка={error:.6f}, best_error={best_error:.6f}, best_z={best_z:.4f}")
+            
+            if error < best_error:
+                best_error = error
+                best_z = z
+                best_volume = volume
+                print(f"    -> НОВЫЙ ЛУЧШИЙ! Обновлен best_z={best_z:.4f}, best_error={best_error:.6f}")
+        
+        # DEBUG: Результаты начального поиска
+        print(f"\n=== DEBUG: Результаты начального поиска ===")
+        print(f"Лучшая точка: z={best_z:.4f}, объем={best_volume:.6f}, ошибка={best_error:.6f}")
+        
+        if best_error <= tolerance:
+            mesh_np.setPos(0, 0, best_z)
+            if self.current_display_model is not None:
+                self.current_display_model.removeNode()
+            print(f"Достигнута требуемая точность! Возвращаем best_z={best_z:.4f}")
+            return best_z
+
+        search_volumes.sort(key=lambda x: x[2])
+        best_points = search_volumes[:3]
+        
+        # DEBUG: Лучшие точки для уточнения
+        print(f"\n=== DEBUG: Лучшие точки для уточнения ===")
+        for i, (z, vol, err) in enumerate(best_points):
+            print(f"  {i+1}: z={z:.4f}, объем={vol:.6f}, ошибка={err:.6f}")
+
+        if len(best_points) >= 2:
+            z_values = [p[0] for p in best_points]
+            min_search_z = min(z_values)
+            max_search_z = max(z_values)
+            
+            range_expand = (max_search_z - min_search_z) * 0.2
+            min_search_z = max(min_z, min_search_z - range_expand)
+            max_search_z = min(max_z, max_search_z + range_expand)
+            
+            # DEBUG: Параметры золотого сечения
+            print(f"\n=== DEBUG: Настройка золотого сечения ===")
+            print(f"Исходный диапазон: [{min(z_values):.4f}, {max(z_values):.4f}]")
+            print(f"Расширенный диапазон: [{min_search_z:.4f}, {max_search_z:.4f}]")
+            print(f"Коэффициент золотого сечения (phi): {0.618}")
+            
+            phi = 0.618
+            a = min_search_z
+            b = max_search_z
+            
+            x1 = b - phi * (b - a)
+            x2 = a + phi * (b - a)
+            
+            iteration = 0
+            while (b - a) > 0.01 and iteration < max_iterations:
+                iteration += 1
+                
+                # DEBUG: Начало итерации
+                print(f"\n--- Итерация {iteration} ---")
+                print(f"Текущий интервал: a={a:.6f}, b={b:.6f}, ширина={b-a:.6f}")
+                print(f"Точки проверки: x1={x1:.6f}, x2={x2:.6f}")
+                
+                vol1, err1 = self._evaluate_z_position(mesh_np, target_model_trimesh, x1, target_volume)
+                vol2, err2 = self._evaluate_z_position(mesh_np, target_model_trimesh, x2, target_volume)
+                
+                # DEBUG: Результаты проверки точек
+                print(f"  x1={x1:.6f}: объем={vol1:.6f}, ошибка={err1:.6f}")
+                print(f"  x2={x2:.6f}: объем={vol2:.6f}, ошибка={err2:.6f}")
+                print(f"  Текущий best_error={best_error:.6f}, best_z={best_z:.6f}")
+                
+                if err1 < best_error:
+                    best_error = err1
+                    best_z = x1
+                    best_volume = vol1
+                    print(f"    -> Обновление по x1! Новый best_z={best_z:.6f}, best_error={best_error:.6f}")
+                
+                if err2 < best_error:
+                    best_error = err2
+                    best_z = x2
+                    best_volume = vol2
+                    print(f"    -> Обновление по x2! Новый best_z={best_z:.6f}, best_error={best_error:.6f}")
+                
+                if best_error <= tolerance:
+                    print(f"Достигнута требуемая точность! Ошибка={best_error:.6f} <= {tolerance}")
+                    break
+                
+                if err1 < err2:
+                    print(f"  err1({err1:.6f}) < err2({err2:.6f}) -> обновляем b")
+                    b = x2
+                    x2 = x1
+                    err2 = err1
+                    x1 = b - phi * (b - a)
+                    vol1, err1 = self._evaluate_z_position(mesh_np, target_model_trimesh, x1, target_volume)
+                else:
+                    print(f"  err2({err2:.6f}) <= err1({err1:.6f}) -> обновляем a")
+                    a = x1
+                    x1 = x2
+                    err1 = err2
+                    x2 = a + phi * (b - a)
+                    vol2, err2 = self._evaluate_z_position(mesh_np, target_model_trimesh, x2, target_volume)
+                
+                if best_error <= tolerance:
+                    print(f"Достигнута требуемая точность после обновления интервала!")
+                    break
+        
+        mesh_np.setPos(0, 0, best_z)
+        
+        if self.current_display_model is not None:
+            self.current_display_model.removeNode()
+            self.current_display_model = None
+        
+        return best_z
     
     def _load_height_array(self, height_texture_path):
         """Загружает и обрабатывает текстуру высот"""
@@ -856,10 +916,10 @@ class PerlinMeshGenerator:
         
         return target_model_trimesh
     
-    def _evaluate_z_position(self, perlin_base_np, target_model_trimesh, z, target_volume):
-        """Оценивает объем при определенной Z-позиции"""
-        perlin_base_np.setPos(0, 0, z)
-        perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(perlin_base_np)
+    def _evaluate_z_position(self, mesh_np, target_model_trimesh, z, target_volume):
+        """Оценивает объем при определенной Z-позиции для любого меша"""
+        mesh_np.setPos(0, 0, z)
+        perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(mesh_np)
         
         result_csg = trimesh.boolean.difference(
             [target_model_trimesh, perlin_model_trimesh_],
@@ -877,6 +937,9 @@ class PerlinMeshGenerator:
         
         volume = self.panda_app.calculate_mesh_volume(self.current_display_model)
         error = abs(volume - target_volume)
+        
+        # DEBUG: вывод информации для отладки
+        print(f"    [DEBUG _evaluate_z_position] z={z:.6f}: volume={volume:.6f}, error={error:.6f}")
         
         return volume, error
     

@@ -7,6 +7,13 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 import yaml
+import trimesh
+
+from panda3d.core import (
+    Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
+    GeomTriangles, NodePath, Vec3, TextureStage, Texture,
+    Material, TransparencyAttrib, Shader, GeomVertexReader
+)
 
 from panda_widget import Panda3DWidget
 
@@ -492,13 +499,6 @@ class CameraControlGUI(QWidget):
         )
         recon_layout.addWidget(self.run_reconstruction_btn)
 
-        # НОВАЯ кнопка для HeightMapMeshGenerator
-        self.run_height_map_btn = self.create_accent_button(
-            "🗻 Сгенерировать HeightMap меш",
-            self.run_height_map_reconstruction
-        )
-        recon_layout.addWidget(self.run_height_map_btn)
-
         recon_section.setLayout(recon_layout)
         layout.addWidget(recon_section)
         
@@ -909,126 +909,73 @@ class CameraControlGUI(QWidget):
         """)
         self.status_bar.setText("Готов к работе")
 
-    def run_height_map_reconstruction(self):
-        """Запуск реконструкции через HeightMapMeshGenerator с учетом разницы поворотов"""
-        try:
-            # Если генератор еще не создан, создаем его
-            if not hasattr(self.panda_app, 'height_map_generator'):
-                self.panda_app.height_map_generator = HeightMapMeshGenerator(self.panda_app)
-            
-            generator = self.panda_app.height_map_generator
-            
-            # Получаем текущие параметры камеры
-            camera_data = self.panda_app.log_camera_parameters()
-            
-            # Извлекаем текущий поворот камеры
-            try:
-                # Если camera_data уже является словарем
-                if isinstance(camera_data, dict):
-                    current_rotation = camera_data.get('rotation', {})
-                else:
-                    # Если это JSON строка
-                    import json
-                    camera_dict = json.loads(camera_data)
-                    current_rotation = camera_dict.get('rotation', {})
-            except:
-                # Fallback: запросим напрямую из камеры
-                cam_orientation = self.panda_app.get_camera_orientation()
-                current_rotation = {
-                    'h': cam_orientation['hpr'][0],
-                    'p': cam_orientation['hpr'][1],
-                    'r': cam_orientation['hpr'][2]
-                }
-            
-            # Вычисляем разницу между текущим и фиксированным поворотом
-            rotation_diff = {
-                'h': current_rotation.get('h', 0) - self.fixed_camera_rotation['h'],
-                'p': current_rotation.get('p', 0) - self.fixed_camera_rotation['p'],
-                'r': current_rotation.get('r', 0) - self.fixed_camera_rotation['r']
-            }
-            
-            # Отладочный вывод
-            print(f"Текущий поворот: {current_rotation}")
-            print(f"Фиксированный поворот: {self.fixed_camera_rotation}")
-            print(f"Разница поворотов: {rotation_diff}")
-            
-            # Настройка параметров шума
-            generator.set_noise_scale(3.0)
-            generator.set_noise_strength(0.42)
-            generator.set_noise_octaves(4)
-            generator.set_noise_persistence(0.01)
-            generator.set_noise_lacunarity(1.0)
-            generator.set_noise_seed(random.randint(0, 10000))
-            
-            # Настройка параметров унифицированного подхода
-            generator.set_interpolation_method('rbf')
-            generator.set_rbf_smooth(0.1)
-            generator.set_use_smoothing(True)
-            generator.set_smoothing_iterations(1)
-            
-            # Настройка параметров адаптивного подъема
-            generator.set_adaptive_lift_enabled(True)
-            generator.set_lift_parameters(
-                base_distance=0.5,
-                min_distance=0.1,
-                max_distance=3.0,
-                intensity=1.0
-            )
-            
-            # Настройки для устранения волнообразности
-            generator.set_lift_smoothing_enabled(True)
-            generator.set_lift_smoothing_sigma(1.5)
-            generator.set_lift_blur_enabled(True)
-            generator.set_lift_blur_radius(2)
-            
-            # Настройки для сглаживания исходного меша
-            generator.set_source_mesh_smoothing_enabled(True)
-            generator.set_source_mesh_smoothing_iterations(1)
-            generator.set_source_mesh_smoothing_sigma(0.1)
-            generator.set_source_mesh_edge_preserving(True)
-            
-            # Настройка области для меша
-            generator.set_extended_area(2.5, 5.0)
-            generator.set_grid_resolution(60)
-            generator.set_base_height(0.0)
-            
-            # Создание унифицированного перлин-меша с адаптивным подъемом
-            # Применяем разницу поворотов к мешу
-            height_map_mesh = generator.add_extended_mesh_to_scene(
-                position=(0, 0, 0.0),
-                source_scale_x=2.5,
-                source_scale_y=3.2,
-                source_scale_z=1.75,
-                source_offset_x=0.0,
-                source_offset_y=0.0,
-                source_offset_z=0.0,
-                source_rotation_x=0,  # pitch -> rotation_x
-                source_rotation_y=0,  # roll -> rotation_y
-                source_rotation_z=rotation_diff['h']   # heading -> rotation_z
-            )
-            
-            # Сохраняем ссылку на меш
-            self.panda_app.height_map_mesh = height_map_mesh
-            
-            # Выводим информацию в статус
-            self.set_status(
-                f"✅ HeightMap меш создан с учетом разницы поворотов:\n"
-                f"ΔH={rotation_diff['h']:.1f}°, "
-                f"ΔP={rotation_diff['p']:.1f}°, "
-                f"ΔR={rotation_diff['r']:.1f}°"
-            )
-            
-            # Выводим в консоль для отладки
-            print(f"Параметры, переданные в add_extended_mesh_to_scene:")
-            print(f"  source_rotation_x = {rotation_diff['p']}")
-            print(f"  source_rotation_y = {rotation_diff['r']}")
-            print(f"  source_rotation_z = {rotation_diff['h']}")
-            
-        except Exception as e:
-            self.set_status(f"❌ Ошибка реконструкции: {str(e)}", True)
-            print(f"Ошибка при создании HeightMap: {e}")
-            import traceback
-            traceback.print_exc()
+    def _setup_transparent_material(self, model):
+        """Настраивает прозрачный материал для отображения"""
+        material = Material()
+        material.setDiffuse((0.3, 0.7, 0.9, 1))
+        material.setAmbient((0.15, 0.35, 0.45, 1))
+        material.setSpecular((0.8, 0.8, 0.8, 1))
+        material.setShininess(50)
+        model.setMaterial(material)
+        model.setShaderAuto()
+        model.setTransparency(TransparencyAttrib.MAlpha)
+        model.setAlphaScale(0.7)
+        model.setTwoSided(True)
+        model.setScale(1, 1, 1)
+        model.setPos(0, 0, 0)
+
+    def _prepare_target_model_for_boolean(self, target_model):
+        """Подготавливает целевую модель для boolean операций"""
+        original_min_bound, original_max_bound = target_model.getTightBounds()
+
+        original_size_x = original_max_bound.x - original_min_bound.x
+        original_size_y = original_max_bound.y - original_min_bound.y
+        original_size_z = original_max_bound.z - original_min_bound.z
+
+        original_center_x = (original_min_bound.x + original_max_bound.x) / 2
+        original_center_y = (original_min_bound.y + original_max_bound.y) / 2
+        original_center_z = (original_min_bound.z + original_max_bound.z) / 2
+
+        target_model_trimesh = self.panda_app.panda_to_trimesh(target_model)
+
+        self.processed_model = self.panda_app.trimesh_to_panda(target_model_trimesh)
+
+        target_model_trimesh = None
+
+        advanced_min_bound, advanced_max_bound = self.processed_model.getTightBounds()
+
+        advanced_size_x = advanced_max_bound.x - advanced_min_bound.x
+        advanced_size_y = advanced_max_bound.y - advanced_min_bound.y
+        advanced_size_z = advanced_max_bound.z - advanced_min_bound.z
+
+        advanced_center_x = (advanced_min_bound.x + advanced_max_bound.x) / 2
+        advanced_center_y = (advanced_min_bound.y + advanced_max_bound.y) / 2
+        advanced_center_z = (advanced_min_bound.z + advanced_max_bound.z) / 2
+
+        scale_x = original_size_x / advanced_size_x
+        scale_y = original_size_y / advanced_size_y
+        scale_z = original_size_z / advanced_size_z
+
+        self.processed_model.setScale(scale_x, scale_y, scale_z)
+
+        new_pos_x = original_center_x - (advanced_center_x * scale_x)
+        new_pos_y = original_center_y - (advanced_center_y * scale_y)
+        new_pos_z = original_center_z - (advanced_center_z * scale_z)
+
+        self.processed_model.setPos(new_pos_x, new_pos_y, new_pos_z)
+
+        target_model_copy = target_model.copyTo(target_model.getParent())
+
+        target_model_copy.setScale(scale_x, scale_y, scale_z)
+        target_model_copy.setPos(new_pos_x, new_pos_y, new_pos_z)
+
+        self.processed_model.hide()
+
+        target_model_trimesh = self.panda_app.panda_to_trimesh(target_model_copy)
+        
+        target_model_copy.removeNode()
+        
+        return target_model_trimesh
 
     def on_texture_set_changed(self, texture_set_name):
         if texture_set_name in self.textures_config:

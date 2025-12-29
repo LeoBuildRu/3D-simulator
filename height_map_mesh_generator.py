@@ -27,13 +27,13 @@ class HeightMapMeshGenerator:
         self.image_path = image_path or "height_example/No-visible-Depth.png"
         self.height_map = None
         self.mask = None
-        self.height_scale = 2.0  
+        self.height_scale = 0.0  
         self.alpha_threshold = 0.1
         self.mesh_node = None
         self.use_alpha_channel = True
         self.mesh_rotation = 0 
 
-        self.extrapolation_enabled = False
+        self.extrapolation_enabled = True
 
         self.source_offset_x = 0.0
         self.source_offset_y = 0.0
@@ -54,6 +54,12 @@ class HeightMapMeshGenerator:
         self.noise_persistence = 0.01
         self.noise_lacunarity = 1.0  
         self.noise_seed = random.randint(0, 10000)
+
+        self.displacement_texture_path = "textures/stones_8k/rocks_ground_01_disp_4k.jpg"
+        self.displacement_strength = 0.14
+        self.texture_repeatX = 1.35
+        self.texture_repeatY = 3.2
+        self.use_displacement = True
         
         self.interpolation_method = 'rbf'  
         self.rbf_smooth = 0.1 
@@ -526,9 +532,9 @@ class HeightMapMeshGenerator:
         return corrected_height, lifted_mask
     
     def create_unified_perlin_mesh_with_lift(self, world_position=(0, 0, 2), source_scale_x=None,
-                                            source_scale_y=None, source_scale_z=None,
-                                            source_offset_x=0.0, source_offset_y=0.0, source_offset_z=0.0, 
-                                            source_rotation_x=None, source_rotation_y=None, source_rotation_z=None):
+                                        source_scale_y=None, source_scale_z=None,
+                                        source_offset_x=0.0, source_offset_y=0.0, source_offset_z=0.0, 
+                                        source_rotation_x=None, source_rotation_y=None, source_rotation_z=None):
         print(f"[DEBUG] ====== НАЧАЛО СОЗДАНИЯ МЕША ======")
         print(f"[DEBUG] Позиция в мире: {world_position}")
         print(f"[DEBUG] Разрешение сетки: {self.grid_resolution}")
@@ -668,7 +674,7 @@ class HeightMapMeshGenerator:
         # Генерация шума Перлина
         print(f"[DEBUG] Генерация шума Перлина...")
         perlin_height = np.zeros((len(y_grid), len(x_grid)), dtype=np.float32)
-    
+
         # Генерируем перлин-шум только если включена экстраполяция
         if self.extrapolation_enabled:
             for i in range(len(y_grid)):
@@ -691,42 +697,8 @@ class HeightMapMeshGenerator:
             key_z = source_points[:, 2]
             
             try:
-                if self.extrapolation_enabled:  # ← ПРОВЕРКА ФЛАГА
-                    if self.interpolation_method == 'rbf':
-                        rbf = Rbf(key_x, key_y, key_z, 
-                                function='multiquadric', 
-                                smooth=self.rbf_smooth)
-                        
-                        key_surface = rbf(grid_x, grid_y)
-                        
-                    elif self.interpolation_method in ['linear', 'cubic']:
-                        key_surface = griddata((key_x, key_y), key_z, 
-                                            (grid_x, grid_y), 
-                                            method=self.interpolation_method,
-                                            fill_value=self.base_height)
-                    else:
-                        raise ValueError(f"Unknown interpolation method: {self.interpolation_method}")
-                    
-                    blend_weights = np.zeros_like(grid_x, dtype=np.float32)
-                    
-                    for i in range(len(y_grid)):
-                        for j in range(len(x_grid)):
-                            if source_mask[i, j]:
-                                blend_weights[i, j] = 1.0
-                            else:
-                                distances = np.sqrt((key_x - grid_x[i, j])**2 + (key_y - grid_y[i, j])**2)
-                                min_distance = np.min(distances) if len(distances) > 0 else float('inf')
-                                
-                                influence_distance = 1.0
-                                if min_distance < influence_distance:
-                                    weight = 1.0 - (min_distance / influence_distance)
-                                    weight = weight * weight
-                                    blend_weights[i, j] = weight
-                    
-                    corrected_height = base_height_grid * (1.0 - blend_weights) + key_surface * blend_weights
-                else:
-                    # Без экстраполяции - только исходные данные
-                    corrected_height = base_height_grid.copy()
+                # Без экстраполяции - только исходные данные
+                corrected_height = base_height_grid.copy()
                 
                 for i in range(len(y_grid)):
                     for j in range(len(x_grid)):
@@ -760,7 +732,7 @@ class HeightMapMeshGenerator:
                     boundary_width=int(self.source_mesh_smoothing_sigma * 2)
                 )
         
-        if self.extrapolation_enabled and self.adaptive_lift_enabled and len(boundary_points) > 0:  # ← ДОБАВЛЕНА ПРОВЕРКА self.extrapolation_enabled
+        if self.extrapolation_enabled and self.adaptive_lift_enabled and len(boundary_points) > 0:
             corrected_height, lifted_mask = self._apply_adaptive_vertex_lift(
                 corrected_height, source_mask, x_grid, y_grid, boundary_points
             )
@@ -781,6 +753,16 @@ class HeightMapMeshGenerator:
             print(f"[DEBUG] Финальное сглаживание...")
             corrected_height = self._smooth_heightfield(corrected_height, self.smoothing_iterations)
         
+        # ДОБАВЛЕНО: Применение displacement к высотам
+        if hasattr(self, 'use_displacement') and self.use_displacement:
+            print(f"[DEBUG] Применение displacement к высотам...")
+            corrected_height = self._apply_displacement_to_grid(
+                corrected_height, x_grid, y_grid,
+                self.displacement_strength,
+                self.texture_repeatX,
+                self.texture_repeatY
+            )
+        
         # Создание геометрии
         print(f"[DEBUG] Создание геометрии меша...")
         format = GeomVertexFormat.getV3n3t2()
@@ -800,7 +782,13 @@ class HeightMapMeshGenerator:
                 
                 vertex.addData3f(x, y, z)
                 normal.addData3f(0, 0, 1) 
-                texcoord.addData2f(j / (len(x_grid)-1), i / (len(y_grid)-1))
+                
+                # UV-координаты с учетом повторения текстуры
+                normalized_u = j / (len(x_grid) - 1) if len(x_grid) > 1 else 0.0
+                normalized_v = i / (len(y_grid) - 1) if len(y_grid) > 1 else 0.0
+                u = normalized_u * self.texture_repeatX
+                v = normalized_v * self.texture_repeatY
+                texcoord.addData2f(u, v)
                 
                 vertex_indices[(i, j)] = len(vertices)
                 vertices.append((x, y, z))
@@ -845,6 +833,101 @@ class HeightMapMeshGenerator:
         
         print(f"[DEBUG] ====== СОЗДАНИЕ МЕША ЗАВЕРШЕНО ======")
         return node
+    
+    def _load_displacement_texture(self):
+        """Загружает и обрабатывает текстуру высот для displacement (аналогично perlin_mesh_generator.py)"""
+        if not hasattr(self, 'displacement_texture_path') or self.displacement_texture_path is None:
+            print(f"[WARNING] Displacement texture path не указан")
+            return None, 0, 0
+        
+        try:
+            height_image = Image.open(self.displacement_texture_path).convert('L')
+            height_array = np.array(height_image, dtype=np.float32)
+            tex_height, tex_width = height_array.shape
+            
+            height_min = np.min(height_array)
+            height_max = np.max(height_array)
+            if height_max - height_min > 0:
+                height_array = (height_array - height_min) / (height_max - height_min)
+            else:
+                height_array = np.zeros_like(height_array)
+            
+            height_array = np.power(height_array, 0.7)
+            
+            print(f"[DEBUG] Displacement texture загружена: {tex_width}x{tex_height}")
+            return height_array, tex_width, tex_height
+            
+        except Exception as e:
+            print(f"[ERROR] Ошибка загрузки displacement texture: {e}")
+            return None, 0, 0
+
+    def _apply_displacement_to_grid(self, height_grid, x_grid, y_grid, strength, repeatX, repeatY):
+        """Применяет displacement к сетке высот (аналогично perlin_mesh_generator.py)"""
+        height_array, tex_width, tex_height = self._load_displacement_texture()
+        if height_array is None:
+            print(f"[WARNING] Не удалось загрузить displacement texture, пропускаем displacement")
+            return height_grid
+        
+        h, w = height_grid.shape
+        displaced_grid = height_grid.copy()
+        
+        print(f"[DEBUG] Применение displacement: сетка {w}x{h}, текстура {tex_width}x{tex_height}, сила={strength}")
+        
+        for i in range(h):
+            for j in range(w):
+                # Рассчитываем UV-координаты
+                normalized_u = j / (w - 1) if w > 1 else 0.0
+                normalized_v = i / (h - 1) if h > 1 else 0.0
+                u = normalized_u * repeatX
+                v = normalized_v * repeatY
+                
+                # Повторяем текстуру
+                u_repeated = u % 1.0
+                v_repeated = v % 1.0
+                
+                # Преобразуем в координаты текстуры
+                tex_x = u_repeated * (tex_width - 1)
+                tex_y = v_repeated * (tex_height - 1)
+                
+                # Билинейная интерполяция
+                x1 = max(0, min(tex_width - 1, int(tex_x)))
+                y1 = max(0, min(tex_height - 1, int(tex_y)))
+                x2 = max(0, min(tex_width - 1, x1 + 1))
+                y2 = max(0, min(tex_height - 1, y1 + 1))
+                
+                dx = tex_x - x1
+                dy = tex_y - y1
+                
+                h11 = height_array[y1, x1]
+                h12 = height_array[y2, x1]
+                h21 = height_array[y1, x2]
+                h22 = height_array[y2, x2]
+                
+                hx1 = h11 * (1 - dx) + h21 * dx
+                hx2 = h12 * (1 - dx) + h22 * dx
+                height_value = hx1 * (1 - dy) + hx2 * dy
+                
+                # Вычисляем смещение
+                displacement = (height_value - 0.5) * strength
+                displaced_grid[i, j] += displacement
+        
+        print(f"[DEBUG] Displacement применен успешно")
+        return displaced_grid
+
+    # Дополнительные методы для настройки displacement
+    def set_displacement_parameters(self, texture_path, strength=0.14, repeatX=1.35, repeatY=3.2, enabled=True):
+        """Установка параметров displacement"""
+        self.displacement_texture_path = texture_path
+        self.displacement_strength = strength
+        self.texture_repeatX = repeatX
+        self.texture_repeatY = repeatY
+        self.use_displacement = enabled
+        print(f"[DEBUG] Displacement параметры: texture={texture_path}, strength={strength}, repeat=({repeatX}, {repeatY}), enabled={enabled}")
+
+    def set_displacement_enabled(self, enabled):
+        """Включение/выключение displacement"""
+        self.use_displacement = enabled
+        print(f"[DEBUG] Displacement enabled: {enabled}")
     
     def _postprocess_boundary_zone(self, height_grid, source_mask, boundary_width=5):
         from scipy.ndimage import distance_transform_edt
@@ -972,7 +1055,6 @@ class HeightMapMeshGenerator:
             self.mesh_node.setMaterial(material, 1)
             
             self.mesh_node.setShaderAuto()
-            self.mesh_node.setPos(0, 0, 2)
             
             if not hasattr(self.app, 'loaded_models'):
                 self.app.loaded_models = []
