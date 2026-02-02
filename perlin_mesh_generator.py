@@ -4,6 +4,7 @@ import random
 import math
 import numpy as np
 from PIL import Image
+from mesh_distribution import MeshDistributor
 
 import trimesh
 from noise import pnoise2
@@ -159,12 +160,12 @@ class PerlinMeshGenerator:
         vertices = self._apply_falloff(vertices, size_x, size_y, base_z, falloff_config)
         
         normals_list = self._calculate_normals(vertices, grid_size)
-        
+
         base_vdata = GeomVertexData("perlin_base_data_with_displacement", vdata.getFormat(), Geom.UHStatic)
         base_vertex = GeomVertexWriter(base_vdata, "vertex")
         base_normal = GeomVertexWriter(base_vdata, "normal")
         base_texcoord = GeomVertexWriter(base_vdata, "texcoord")
-        
+
         for i in range(base_vertex_count):
             base_vertex.addData3f(vertices[i][0], vertices[i][1], vertices[i][2])
             base_normal.addData3f(normals_list[i][0], normals_list[i][1], normals_list[i][2])
@@ -298,6 +299,8 @@ class PerlinMeshGenerator:
         
         geom_node = self.panda_app.final_model.node()
         if geom_node.getNumGeoms() > 0:
+            self.distribute_meshes(geom_node)
+
             geom = geom_node.getGeom(0)
             vdata = geom.getVertexData()
             
@@ -353,6 +356,65 @@ class PerlinMeshGenerator:
         
         return True
     
+    def extract_mesh_from_geom_node(self, geom_node):
+        """
+        Extract vertices and triangle indices from a GeomNode.
+        Assumes the first Geom uses triangle primitives.
+        Returns:
+            vertices: np.ndarray of shape (V, 3)
+            indices:  np.ndarray of shape (T*3,) with dtype int32
+        """
+        if geom_node.getNumGeoms() == 0:
+            raise ValueError("GeomNode has no geoms")
+
+        geom = geom_node.getGeom(0)
+        vdata = geom.getVertexData()
+        primitive = geom.getPrimitive(0)
+
+        # Decompose to triangles if needed (e.g., from tristrips or quads)
+        primitive = primitive.decompose()
+
+        # --- Extract vertices ---
+        vertex_reader = GeomVertexReader(vdata, "vertex")
+        num_vertices = vdata.getNumRows()
+        vertices = []
+        for i in range(num_vertices):
+            v = vertex_reader.getData3()
+            vertices.append([v[0], v[1], v[2]])
+        vertices_np = np.array(vertices, dtype=np.float32)
+
+        # --- Extract indices ---
+        indices = []
+        for p in range(primitive.getNumPrimitives()):
+            start = primitive.getPrimitiveStart(p)
+            end = primitive.getPrimitiveEnd(p)
+            for i in range(start, end):
+                idx = primitive.getVertex(i)
+                indices.append(idx)
+        indices_np = np.array(indices, dtype=np.int32)
+
+        return vertices_np, indices_np
+
+    def distribute_meshes(self, geom_node):
+        if geom_node.getNumGeoms() > 0:
+            vertices_np, indices_np = self.extract_mesh_from_geom_node(geom_node)
+
+            for distrib in self.panda_app.mesh_distributions:
+                distrib.stop_rendering()
+
+            self.panda_app.mesh_distributions.clear()
+
+            for data in self.panda_app.mesh_distributions_data:
+                distrib = MeshDistributor(self.panda_app)
+
+                model1 = self.panda_app.loader.load_model(data['mesh'], noCache=True)
+
+                distrib.distribute(vertices_np, indices_np, data['count'], seed=data['seed'])
+                distrib.start_rendering(model1, data['size'], data['size_var'])
+
+                self.panda_app.mesh_distributions.append(distrib)
+
+
     def generate_perlin_mesh_from_csg(self):
         """Генерация перлин-меша на основе CSG операции"""
         if hasattr(self.panda_app, 'test_perlin_mesh') and self.panda_app.test_perlin_mesh is not None:
@@ -437,6 +499,8 @@ class PerlinMeshGenerator:
         
         geom_node = self.panda_app.final_model.node()
         if geom_node.getNumGeoms() > 0:
+            self.distribute_meshes(geom_node)
+
             geom = geom_node.getGeom(0)
             vdata = geom.getVertexData()
             
@@ -1039,12 +1103,13 @@ class PerlinMeshGenerator:
         
         normal_tex = self.panda_app.loader.loadTexture(normal_path)
         if normal_tex:
+            model_np.setShaderAuto()
             normal_tex.setMinfilter(Texture.FTLinearMipmapLinear)
             normal_tex.setMagfilter(Texture.FTLinear)
             normal_tex.setWrapU(Texture.WMRepeat)
             normal_tex.setWrapV(Texture.WMRepeat)
             
-            normal_stage = TextureStage('normal')
+            normal_stage = TextureStage('ts')
             normal_stage.setMode(TextureStage.MNormal)
             model_np.setTexture(normal_stage, normal_tex)
         

@@ -24,7 +24,13 @@ def compute_tri_areas(
     # Calculate the cross product of two edges of the triangle,
     # which gives a vector whose magnitude is twice the area of the triangle.
     cross = wp.cross((pt_1 - pt_0), (pt_2 - pt_0))
-    area = wp.length(cross) * 0.5
+    len = wp.length(cross)
+    area = len * 0.5
+    normal = cross / len
+    target = wp.vec3(0.0, 0.0, 1.0)
+
+    if wp.dot(normal, target) < 0.000001:
+        area = 0.0
 
     # Store the result.
     out_tri_areas[tri] = area
@@ -214,6 +220,6 @@ class MeshDistributor:
 
     def stop_rendering(self):
         # Удаляем геометрию инстансинга, если она была создана
-        if self.geom_prefab is not None:
+        if hasattr(self, 'geom_prefab') and self.geom_prefab is not None:
             self.geom_prefab.removeNode()
             self.geom_prefab = None

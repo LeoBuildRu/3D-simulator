@@ -6,6 +6,17 @@ asphalt_8k:
   textureRepeatX: 1.2
   textureRepeatY: 4.2
   strength: 0.06
+  mesh_distributions:
+  - mesh: "models/distribution_meshes/asphalt.bam"
+    count: 100000
+    size: 0.01
+    size_var: 0.005
+    seed: 123
+  - mesh: "models/distribution_meshes/asphalt.bam"
+    count: 1000
+    size: 0.02
+    size_var: 0.01
+    seed: 234
 
 concrete_8k:
   diffuse: "textures/concrete_8k/concrete_debris_diff_8k.jpg"
@@ -15,6 +26,17 @@ concrete_8k:
   textureRepeatX: 1.3
   textureRepeatY: 2.4
   strength: 0.16
+  mesh_distributions:
+  - mesh: "models/distribution_meshes/conrecte_rock_v1.gltf"
+    count: 10000
+    size: 0.02
+    size_var: 0.015
+    seed: 123
+  - mesh: "models/distribution_meshes/conrecte_rock_v1.gltf"
+    count: 100
+    size: 0.05
+    size_var: 0.03
+    seed: 234
 
 ground_8k:
   diffuse: "textures/ground_8k/brown_mud_dry_diff_8k.jpg"
@@ -24,6 +46,22 @@ ground_8k:
   textureRepeatX: 1.2
   textureRepeatY: 2.7
   strength: 0.12
+  mesh_distributions:
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 5000
+    size: 0.02
+    size_var: 0.02
+    seed: 123
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 50
+    size: 0.05
+    size_var: 0.03
+    seed: 234
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 50
+    size: 0.03
+    size_var: 0.02
+    seed: 345
 
 sand_8k:
   albedo: "textures/sand_8k/dune_albedo.jpg"
@@ -32,6 +70,22 @@ sand_8k:
   textureRepeatX: 1.0
   textureRepeatY: 2.0
   strength: 0.08
+  mesh_distributions:
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 40
+    size: 0.02
+    size_var: 0.01
+    seed: 123
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 300
+    size: 0.013
+    size_var: 0.006
+    seed: 345
+  - mesh: "models/distribution_meshes/sand/rock_lp3.gltf"
+    count: 200000
+    size: 0.004
+    size_var: 0.002
+    seed: 234
 
 stones_8k:
   diffuse: "textures/stones_8k/rocks_ground_01_diff_4k.jpg"
@@ -41,6 +95,22 @@ stones_8k:
   textureRepeatX: 1.35
   textureRepeatY: 2.8
   strength: 0.14
+  mesh_distributions:
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 15000
+    size: 0.02
+    size_var: 0.01
+    seed: 123
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 2000
+    size: 0.04
+    size_var: 0.02
+    seed: 234
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 50
+    size: 0.06
+    size_var: 0.02
+    seed: 345
 
 groundPerlin_8k:
   diffuse: "textures/groundPerlin_8k/aerial_beach_03_diff_8k.jpg"
@@ -54,3 +124,14 @@ Rock_texture_1:
   textureRepeatX: 1.0
   textureRepeatY: 1.0
   strength: 0.35
+  mesh_distributions:
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 10000
+    size: 0.02
+    size_var: 0.015
+    seed: 123
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 100
+    size: 0.05
+    size_var: 0.03
+    seed: 234

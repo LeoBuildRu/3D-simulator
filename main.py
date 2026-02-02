@@ -278,6 +278,8 @@ class MyApp(ShowBase):
         self.depth_renderer = None
         self.init_depth_renderer()
 
+        self.mesh_distributions = []
+
         self.perlin_generator = PerlinMeshGenerator(self)
         self.renderer_utils = RendererUtils(self)
 
@@ -325,9 +327,14 @@ class MyApp(ShowBase):
         
         self.current_texture_set = new_texture_set
         
+        if('mesh_distributions' in new_texture_set):
+            self.mesh_distributions_data = new_texture_set["mesh_distributions"]
+        else:
+            self.mesh_distributions_data = []
+        
         if hasattr(self, 'final_model') and self.final_model is not None:
             self.perlin_generator.create_mesh_from_perlin_data()
-        
+
         return new_texture_set
 
     def add_scene_points(self):
@@ -583,7 +590,7 @@ class MyApp(ShowBase):
         ])
         aabb_mesh.apply_transform(aabb_transform)
         
-        result_mesh = full_plane_mesh.intersection(aabb_mesh, engine='auto')
+        result_mesh = full_plane_mesh.intersection(aabb_mesh, engine='blender')
         
         if result_mesh.is_empty:
             return False
