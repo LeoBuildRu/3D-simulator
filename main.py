@@ -759,7 +759,6 @@ class MyApp(ShowBase):
         node.addGeom(geom)
         
         self.ground_plane = self.render.attachNewNode(node)
-        
         material = Material()
         material.setDiffuse((0, 0.7, 0, 1))
         material.setAmbient((0, 0.3, 0, 1))

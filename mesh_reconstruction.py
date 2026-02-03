@@ -14,7 +14,7 @@ import random
 from scipy.spatial import KDTree
 import trimesh
 import point_cloud_utils as pcu
-
+    
 class MeshReconstruction:
     def __init__(self, panda_app):
         self.panda_app = panda_app
@@ -125,7 +125,7 @@ class MeshReconstruction:
     def np_to_panda_vec(self, v):
         return LVector3f(float(v[0]), float(v[1]), float(v[2]))
 
-    def viewport_to_world_point_geometric(
+    def viewport_to_world_point(
         self,
         camera,
         u, v,
@@ -211,7 +211,7 @@ class MeshReconstruction:
             depth = self.correct_depth(self.height_map[y, x])
             z = depth * (max_depth - min_depth) + min_depth
 
-            point = self.viewport_to_world_point_geometric(camera, u, v, z)
+            point = self.viewport_to_world_point(camera, u, v, z)
             proj_3d.append(self.panda_vec3_to_np(point))
 
         M = self.compute_transform_np(
@@ -233,7 +233,7 @@ class MeshReconstruction:
             depth = self.correct_depth(self.height_map[y, x])
             z = depth * (max_depth - min_depth) + min_depth
 
-            point = self.viewport_to_world_point_geometric(camera, u, v, z)
+            point = self.viewport_to_world_point(camera, u, v, z)
             diff = point - scene_3d[i]
             distance = math.sqrt(diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2])
             if(debug):
@@ -251,6 +251,21 @@ class MeshReconstruction:
         box.set_scale(scale)
         box.reparent_to(self.panda_app.render)
         return box
+    
+    def cv_to_panda(self, p):
+        """
+        Convert point from OpenCV-style camera coordinates
+        (X right, Y down, Z forward)
+        to Panda3D camera coordinates
+        (X right, Y forward, Z up)
+        """
+        x, y, z = p
+        return LVector3f(
+            x,   # right -> right
+            z,   # forward -> forward
+            -y   # up (inverted Y) -> up
+        )
+
 
     def reconstruct_camera_pos_hpr_fov_depth(self, data):
         key_points = data["keypoints"]
@@ -263,25 +278,78 @@ class MeshReconstruction:
 
         self.aspect_ratio = img_w/img_h
         
+        lerpT = 1.0 / 2
+
+        iterations = 24
+
         scene_3d = [np.array(p, dtype=float) for p in data["points_3d"]]
 
+        min_scale = 0.0001
+        max_scale = 1000
+
+        best_scale_error = 10**10
+        best_scale = 1
+
         if "keypoints_3d" in data:
+            print("Using 3d keypoints")
+
+            #cam_pos = self.panda_vec3_to_np(camera.get_pos(camera.get_parent()))
+            #quat = camera.get_quat()
+
+            def ApplyScale(scale):
+                #camera.set_pos(self.np_to_panda_point(cam_pos))
+                #camera.set_quat(quat)
+
+                transformed_keypoints = keypoints_3d.copy()
+                for i in range(len(keypoints_3d)):
+                    transformed_keypoints[i] = self.panda_app.render.get_relative_point(camera, keypoints_3d[i] * scale)
+
+                M = self.compute_transform_np(
+                    scene_3d[0], scene_3d[1], scene_3d[2],
+                    transformed_keypoints[0], transformed_keypoints[1], transformed_keypoints[2]
+                )
+
+                self.apply_transform(M, camera)
+
+                error = 0
+                for i in range(len(transformed_keypoints)):
+                    op = self.panda_app.render.get_relative_point(camera, keypoints_3d[i] * scale)
+                    sp = scene_3d[i]
+                    diff = self.np_to_panda_point(op - sp)
+                    error += math.sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z)
+                return error
+
             keypoints_3d = [np.array(p, dtype=float) for p in data["keypoints_3d"]]
+
             for i in range(len(keypoints_3d)):
-                keypoints_3d[i] = self.panda_app.render.get_relative_point(camera, self.np_to_panda_point(keypoints_3d[i] * 0.01))
+                keypoints_3d[i] = self.cv_to_panda(self.np_to_panda_point(keypoints_3d[i]))
+
             #hardcoded for now
+            #self.aspect_ratio = 4/3
             self.setVertFOV(lens, 50.6)
-            M = self.compute_transform_np(
-                scene_3d[0], scene_3d[1], scene_3d[2],
-                keypoints_3d[0], keypoints_3d[1], keypoints_3d[2]
-            )
-            for i in range(len(keypoints_3d)):
-                print("da")
-                print(scene_3d[i])
-                print(keypoints_3d[i])
-                print(self.panda_app.render.get_relative_point(camera, self.np_to_panda_point(keypoints_3d[i])))
-                print(self.panda_app.render.get_relative_point(camera, self.np_to_panda_point(scene_3d[i])))
-            self.apply_transform(M, camera)
+
+            scaleStart = min_scale
+            scaleEnd = max_scale
+
+            for i in range(iterations):
+                scaleStep = (scaleEnd - scaleStart) / 2
+                
+                if scaleStep == 0:
+                    break
+
+                scale = scaleStart - scaleStep
+                while scale < scaleEnd:
+                    scale += scaleStep
+                    error = ApplyScale(scale)
+                    if error < best_scale_error:
+                        best_scale_error = error
+                        best_scale = scale
+
+                scaleStart = self.lerp(best_scale, scaleStart, lerpT)
+                scaleEnd = self.lerp(best_scale, scaleEnd, lerpT)
+
+            ApplyScale(best_scale)
+            print(f"Best error: {best_scale_error} at {best_scale}")
             return
 
         self.fov_y = lens.getFov()[1]
@@ -312,16 +380,11 @@ class MeshReconstruction:
         start_min_depth = 1
         start_max_depth = 200
 
-        iterations = 16
-
         bestError = 10**10
 
         bestMinDepth = 0
         bestMaxDepth = 0
         bestFOV = 0
-
-        lerpT = 1.0 / 2.71828 # e
-
 
         render_depth_known = True
 
@@ -344,7 +407,7 @@ class MeshReconstruction:
             self.fov_y = fov
 
             if fov_known:
-                if(known_fov_x is not 0):
+                if(known_fov_x != 0):
                     lens.setFov(known_fov_x, known_fov_y)
                     self.fov_y = known_fov_y
                 else:
@@ -352,47 +415,47 @@ class MeshReconstruction:
             else:
                 self.setVertFOV(lens, fov)
 
-            localMinDepthStart = start_min_depth
-            localMinDepthEnd = start_max_depth
+            scaleStart = start_min_depth
+            scaleEnd = start_max_depth
             localMaxDepthStart = start_min_depth
             localMaxDepthEnd = start_max_depth
 
             localBest = 10**10
 
             for i in range(iterations):
-                minDepthStep = (localMaxDepthEnd - localMaxDepthStart) / 2
+                scaleStep = (localMaxDepthEnd - localMaxDepthStart) / 2
                 maxDepthStep = (localMaxDepthEnd - localMaxDepthStart) / 2
 
-                if minDepthStep == 0 or maxDepthStep == 0:
+                if scaleStep == 0 or maxDepthStep == 0:
                     break
                 
-                max_depth = localMaxDepthStart - maxDepthStep
-                while max_depth < localMaxDepthEnd:
-                    max_depth += maxDepthStep
-                    min_depth = localMinDepthStart - minDepthStep
-                    while min_depth < localMinDepthEnd:
-                        min_depth += minDepthStep
+                scale = localMaxDepthStart - maxDepthStep
+                while scale < localMaxDepthEnd:
+                    scale += maxDepthStep
+                    min_depth = scaleStart - scaleStep
+                    while min_depth < scaleEnd:
+                        min_depth += scaleStep
 
                         if(render_depth_known):
-                            min_depth = max_depth * ratio
+                            min_depth = scale * ratio
 
                         try:
-                            error = self.resolve_keypoints(scene_3d, points_2d, camera, min_depth, max_depth, False)
+                            error = self.resolve_keypoints(scene_3d, points_2d, camera, min_depth, scale, False)
                             if(error < localBest):
                                 localBest = error
                             if(error < bestError):
                                 bestError = error
                                 bestFOV = fov
                                 bestMinDepth = min_depth
-                                bestMaxDepth = max_depth
+                                bestMaxDepth = scale
                         except:
                             continue
 
                         if(render_depth_known):
                             break
                 
-                localMinDepthStart = self.lerp(bestMinDepth, localMinDepthStart, lerpT)
-                localMinDepthEnd = self.lerp(bestMinDepth, localMinDepthEnd, lerpT)
+                scaleStart = self.lerp(bestMinDepth, scaleStart, lerpT)
+                scaleEnd = self.lerp(bestMinDepth, scaleEnd, lerpT)
                 localMaxDepthStart = self.lerp(bestMaxDepth, localMaxDepthStart, lerpT)
                 localMaxDepthEnd = self.lerp(bestMaxDepth, localMaxDepthEnd, lerpT)
             
@@ -408,7 +471,7 @@ class MeshReconstruction:
         fov = bestFOV
         self.fov_y = fov
 
-        if(known_fov_x is not 0):
+        if(known_fov_x != 0):
             lens.setFov(known_fov_x, known_fov_y)
             self.fov_y = known_fov_y
         else:
@@ -490,7 +553,7 @@ class MeshReconstruction:
                 u = (x / w)
                 v = (y / h)
 
-                point = self.viewport_to_world_point_geometric(camera, u, v, distance)
+                point = self.viewport_to_world_point(camera, u, v, distance)
                 
                 vertex.addData3f(point)
                 normal.addData3f(0, 0, 1) 
@@ -631,6 +694,8 @@ class MeshReconstruction:
             return
 
         self.reconstruct_camera_pos_hpr_fov_depth(data)
+
+        return
 
         self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
 

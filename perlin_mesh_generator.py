@@ -1073,69 +1073,114 @@ class PerlinMeshGenerator:
         model.setPos(0, 0, 0)
     
     def _apply_textures_and_material(self, model_np):
-        """Применяет текстуры и материал к модели"""
-        if 'diffuse' in self.panda_app.current_texture_set:
-            diffuse_path = self.panda_app.current_texture_set['diffuse']
-        elif 'albedo' in self.panda_app.current_texture_set:
-            diffuse_path = self.panda_app.current_texture_set['albedo']
-        else:
-            diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        
-        normal_path = self.panda_app.current_texture_set.get('normal', 
-            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg")
-        
-        roughness_path = self.panda_app.current_texture_set.get('roughness', None)
-        
+        """Apply PBR textures correctly for tobspr RenderPipeline"""
+
+        import os
+        from panda3d.core import Texture, TextureStage, Material
+
+        texset = self.panda_app.current_texture_set
+
+        # ------------------------------------------------------------------
+        # Resolve paths
+        # ------------------------------------------------------------------
+        diffuse_path = (
+            texset.get("diffuse")
+            or texset.get("albedo")
+            or "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
+        )
+
+        normal_path = texset.get(
+            "normal",
+            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
+        )
+
+        roughness_path = texset.get("roughness")
+        metallic_path  = texset.get("metallic")   # optional
+
         if not os.path.exists(diffuse_path):
             diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        
+
         if not os.path.exists(normal_path):
             normal_path = "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
-        
+
+        # ------------------------------------------------------------------
+        # Create RP-compatible material
+        # ------------------------------------------------------------------
+        mat = Material()
+
+        # MUST be white for PBR
+        mat.set_base_color((1, 1, 1, 1))
+
+        # enable normal map strength (RP trick)
+        mat.set_emission((0, 1, 0, 0))
+
+        model_np.set_material(mat)
+
+        # ------------------------------------------------------------------
+        # Helper to configure textures
+        # ------------------------------------------------------------------
+        def setup_tex(tex, srgb=False):
+            if srgb:
+                tex.set_format(Texture.F_srgb)
+
+            tex.set_minfilter(Texture.FTLinearMipmapLinear)
+            tex.set_magfilter(Texture.FTLinear)
+            tex.set_wrap_u(Texture.WMRepeat)
+            tex.set_wrap_v(Texture.WMRepeat)
+
+        # ------------------------------------------------------------------
+        # Texture stages (STRICT ORDER)
+        # ------------------------------------------------------------------
+        ts_color = TextureStage("0-color")
+        ts_color.set_sort(0)
+        ts_color.set_priority(0)
+
+        ts_normal = TextureStage("1-normal")
+        ts_normal.set_sort(1)
+        ts_normal.set_priority(1)
+
+        ts_metal = TextureStage("2-metallic")
+        ts_metal.set_sort(2)
+        ts_metal.set_priority(2)
+
+        ts_rough = TextureStage("3-roughness")
+        ts_rough.set_sort(3)
+        ts_rough.set_priority(3)
+
+        # ------------------------------------------------------------------
+        # Load + assign textures
+        # ------------------------------------------------------------------
+
+        # Albedo
         diffuse_tex = self.panda_app.loader.loadTexture(diffuse_path)
-        if diffuse_tex:
-            diffuse_tex.set_format(Texture.F_srgb)
-            diffuse_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-            diffuse_tex.setMagfilter(Texture.FTLinear)
-            diffuse_tex.setWrapU(Texture.WMRepeat)
-            diffuse_tex.setWrapV(Texture.WMRepeat)
-            model_np.setTexture(diffuse_tex, 1)
-        
+        setup_tex(diffuse_tex, srgb=True)
+        model_np.set_texture(ts_color, diffuse_tex)
+
+        # Normal
         normal_tex = self.panda_app.loader.loadTexture(normal_path)
-        if normal_tex:
-            model_np.setShaderAuto()
-            normal_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-            normal_tex.setMagfilter(Texture.FTLinear)
-            normal_tex.setWrapU(Texture.WMRepeat)
-            normal_tex.setWrapV(Texture.WMRepeat)
-            
-            normal_stage = TextureStage('ts')
-            normal_stage.setMode(TextureStage.MNormal)
-            model_np.setTexture(normal_stage, normal_tex)
-        
+        setup_tex(normal_tex)
+        model_np.set_texture(ts_normal, normal_tex)
+
+        # Metallic (REQUIRED SLOT even if dummy)
+        if metallic_path and os.path.exists(metallic_path):
+            metal_tex = self.panda_app.loader.loadTexture(metallic_path)
+        else:
+            # dummy white metallic map
+            metal_tex = Texture("dummy_metal")
+            metal_tex.setup2dTexture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+            metal_tex.setRamImage(b"\x00")
+
+        setup_tex(metal_tex)
+        model_np.set_texture(ts_metal, metal_tex)
+
+        # Roughness
         if roughness_path and os.path.exists(roughness_path):
-            roughness_tex = self.panda_app.loader.loadTexture(roughness_path)
-            if roughness_tex:
-                roughness_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-                roughness_tex.setMagfilter(Texture.FTLinear)
-                roughness_tex.setWrapU(Texture.WMRepeat)
-                roughness_tex.setWrapV(Texture.WMRepeat)
-                
-                roughness_stage = TextureStage('roughness')
-                roughness_stage.setMode(TextureStage.MModulate)
-                model_np.setTexture(roughness_stage, roughness_tex)
-        
-        base_material = Material("perlin_base_material_with_displacement")
-        base_material.setDiffuse((0.4, 0.4, 0.4, 1.0))
-        base_material.setAmbient((0.7, 0.7, 0.7, 1.0))
-        base_material.setSpecular((0.1, 0.1, 0.1, 1.0))
-        base_material.setShininess(5.0)
-        base_material.setRoughness(0.85)
-        base_material.setMetallic(0.0)
-        base_material.setRefractiveIndex(1.5)
-        model_np.setMaterial(base_material, 1)
-        
-        model_np.setShaderAuto()
-        model_np.setTwoSided(True)
-        model_np.setBin("fixed", 0)
-        model_np.setDepthOffset(1)
+            rough_tex = self.panda_app.loader.loadTexture(roughness_path)
+            setup_tex(rough_tex)
+            model_np.set_texture(ts_rough, rough_tex)
+
+        # ------------------------------------------------------------------
+        # RP required flags
+        # ------------------------------------------------------------------
+        model_np.set_shader_auto()
+        model_np.set_two_sided(True)
