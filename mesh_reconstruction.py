@@ -14,6 +14,10 @@ import random
 from scipy.spatial import KDTree
 import trimesh
 import point_cloud_utils as pcu
+
+import cProfile
+import pstats
+import io
     
 class MeshReconstruction:
     def __init__(self, panda_app):
@@ -131,8 +135,8 @@ class MeshReconstruction:
         u, v,
         distance
     ):
-        lens = self.panda_app.cam.node().getLens()
-        nearPoint = Point3()   
+        lens = self.cam_node.getLens()
+        nearPoint = Point3()
         farPoint = Point3()
         film_point = Point2((u - 0.5) * 2, (0.5 - v) * 2)
         lens.extrude(film_point, nearPoint, farPoint)     
@@ -521,128 +525,152 @@ class MeshReconstruction:
             print(f"[ERROR] Ошибка загрузки height map: {e}")
             return False
         
+    # ---- fast normal calculator (no numpy) ----
+    def _calculate_normals(self, vdata, geom):
+        """
+        Fast vertex-normal calculation.
+        Expects triangles. Decomposes primitives to ensure direct vertex list access.
+        """
+        # Readers/writers
+        vreader = GeomVertexReader(vdata, "vertex")
+        nwriter = GeomVertexWriter(vdata, "normal")
+
+        # Read all vertex positions into a list of tuples
+        vertices = []
+        while not vreader.isAtEnd():
+            p = vreader.getData3f()
+            vertices.append((p.x, p.y, p.z))
+
+        n_verts = len(vertices)
+        # mutable per-vertex normal accumulators
+        normals = [[0.0, 0.0, 0.0] for _ in range(n_verts)]
+
+        # Walk all primitives, decompose() to get simple triangle list
+        for i in range(geom.getNumPrimitives()):
+            prim = geom.getPrimitive(i)
+            prim = prim.decompose()  # returns a simple primitive list (triangles)
+            # iterate vertices in groups of 3
+            nv = prim.getNumVertices()
+            j = 0
+            while j < nv:
+                vi0 = prim.getVertex(j)
+                vi1 = prim.getVertex(j + 1)
+                vi2 = prim.getVertex(j + 2)
+                x0, y0, z0 = vertices[vi0]
+                x1, y1, z1 = vertices[vi1]
+                x2, y2, z2 = vertices[vi2]
+
+                # edges
+                e1x = x1 - x0; e1y = y1 - y0; e1z = z1 - z0
+                e2x = x2 - x0; e2y = y2 - y0; e2z = z2 - z0
+
+                # cross product
+                nx = e1y * e2z - e1z * e2y
+                ny = e1z * e2x - e1x * e2z
+                nz = e1x * e2y - e1y * e2x
+
+                # normalize face normal (skip degenerate)
+                mag2 = nx*nx + ny*ny + nz*nz
+                if mag2 > 0.0:
+                    inv_len = 1.0 / (mag2 ** 0.5)
+                    nx *= inv_len; ny *= inv_len; nz *= inv_len
+
+                    # accumulate to vertex normals
+                    normals[vi0][0] += nx; normals[vi0][1] += ny; normals[vi0][2] += nz
+                    normals[vi1][0] += nx; normals[vi1][1] += ny; normals[vi1][2] += nz
+                    normals[vi2][0] += nx; normals[vi2][1] += ny; normals[vi2][2] += nz
+
+                j += 3
+
+        # Write normalized normals back into vdata (use writer row-by-row)
+        # Reset row pointer for writer (it begins at row 0 by default if newly created)
+        nwriter.setRow(0)
+        for nx, ny, nz in normals:
+            mag2 = nx*nx + ny*ny + nz*nz
+            if mag2 > 0.0:
+                inv_len = 1.0 / (mag2 ** 0.5)
+                nwriter.setData3f(nx * inv_len, ny * inv_len, nz * inv_len)
+            else:
+                # fallback normal
+                nwriter.setData3f(0.0, 0.0, 1.0)
+
+
+    # ---- optimized mesh builder (calls _calculate_normals) ----
     def create_unified_perlin_mesh_with_lift(self):
-        print(f"[DEBUG] Загрузка height map...")
+        print("[DEBUG] Загрузка height map...")
         if not self.load_height_map():
-            print(f"[ERROR] Не удалось загрузить height map")
+            print("[ERROR] Не удалось загрузить height map")
             return
 
-        h, w = self.height_map.shape
+        height_map = self.height_map
+        mask = self.mask
+        correct_depth = self.correct_depth
+        viewport_to_world_point = self.viewport_to_world_point
+        camera = self.panda_app.camera
 
-        format = GeomVertexFormat.getV3n3t2()
-        vdata = GeomVertexData("unified_perlin_mesh_with_lift", format, Geom.UHStatic)
-        
+        h, w = height_map.shape
+        inv_w = 1.0 / w
+        inv_h = 1.0 / h
+        min_depth = self.min_depth
+        depth_range = self.max_depth - min_depth
+
+        fmt = GeomVertexFormat.getV3n3t2()
+        vdata = GeomVertexData("unified_perlin_mesh_with_lift", fmt, Geom.UHStatic)
+
         vertex = GeomVertexWriter(vdata, "vertex")
         normal = GeomVertexWriter(vdata, "normal")
         texcoord = GeomVertexWriter(vdata, "texcoord")
-        
-        vertices = 0
-        vertex_indices = {}
 
-        camera = self.panda_app.camera
-        
+        # Preallocate writers' row growth (optional)
+        # vdata.setNumRows(h * w)  # sometimes useful, but depends on Panda3D version
+
+        # VERTICES
         for y in range(h):
+            v = y * inv_h
             for x in range(w):
-                z = self.correct_depth(self.height_map[y, x])
+                u = x * inv_w
 
-                min_depth = self.min_depth
-                max_depth = self.max_depth
+                z = correct_depth(height_map[y, x])
+                distance = z * depth_range + min_depth
 
-                distance = z * (max_depth - min_depth) + min_depth
+                point = viewport_to_world_point(camera, u, v, distance)
 
-                u = (x / w)
-                v = (y / h)
-
-                point = self.viewport_to_world_point(camera, u, v, distance)
-                
                 vertex.addData3f(point)
-                normal.addData3f(0, 0, 1) 
-                texcoord.addData2f(x / w, y / h)
-                
-                vertex_indices[(y, x)] = vertices
-                vertices += 1
-        
-        triangles = GeomTriangles(Geom.UHStatic)
-        
-        for y in range(h - 1):
-            for x in range(w - 1):
-                if not self.mask[y + 1, x] or not self.mask[y, x + 1]: continue #used in both tris
+                normal.addData3f(0.0, 0.0, 1.0)   # placeholder
+                texcoord.addData2f(u, v)
 
-                v1 = vertex_indices[(y, x)]
-                v2 = vertex_indices[(y, x + 1)]
-                v3 = vertex_indices[(y + 1, x)]
-                v4 = vertex_indices[(y + 1, x + 1)]
-                
-                if self.mask[y, x]:
-                    triangles.addVertices(v1, v3, v2)
-                
-                if self.mask[y+1, x+1]:
-                    triangles.addVertices(v2, v3, v4)
-        
-        triangles.closePrimitive()
-        
+        # TRIANGLES (index math: idx = y*w + x)
+        tris = GeomTriangles(Geom.UHStatic)
+        for y in range(h - 1):
+            row = y * w
+            next_row = (y + 1) * w
+            for x in range(w - 1):
+                # early mask check for shared edges
+                if not mask[y + 1, x] or not mask[y, x + 1]:
+                    continue
+
+                v1 = row + x
+                v2 = row + x + 1
+                v3 = next_row + x
+                v4 = next_row + x + 1
+
+                if mask[y, x]:
+                    tris.addVertices(v1, v3, v2)
+
+                if mask[y + 1, x + 1]:
+                    tris.addVertices(v2, v3, v4)
+
+        tris.closePrimitive()
+
         geom = Geom(vdata)
-        geom.addPrimitive(triangles)
-        
+        geom.addPrimitive(tris)
+
+        # Compute normals using the Python routine (fast, in-place)
+        self._calculate_normals(vdata, geom)
+
         node = GeomNode("unified_perlin_mesh_with_lift")
         node.addGeom(geom)
-        
-        self._calculate_normals(vdata, geom)
-        
         return node
-    
-    def _calculate_normals(self, vdata, geom):
-        vertex_reader = GeomVertexReader(vdata, "vertex")
-        normal_writer = GeomVertexWriter(vdata, "normal")
-        
-        vertices = []
-        while not vertex_reader.isAtEnd():
-            pos = vertex_reader.getData3f()
-            vertices.append((pos.x, pos.y, pos.z))
-        
-        normals = [(0.0, 0.0, 0.0) for _ in range(len(vertices))]
-        
-        for i in range(geom.getNumPrimitives()):
-            prim = geom.getPrimitive(i)
-            if prim.getNumPrimitives() > 0:
-                for j in range(prim.getNumPrimitives()):
-                    start = prim.getPrimitiveStart(j)
-                    end = prim.getPrimitiveEnd(j)
-                    
-                    if end - start == 3:
-                        vi0 = prim.getVertex(start)
-                        vi1 = prim.getVertex(start + 1)
-                        vi2 = prim.getVertex(start + 2)
-                        
-                        v0 = np.array(vertices[vi0])
-                        v1 = np.array(vertices[vi1])
-                        v2 = np.array(vertices[vi2])
-                        
-                        edge1 = v1 - v0
-                        edge2 = v2 - v0
-                        normal = np.cross(edge1, edge2)
-                        norm = np.linalg.norm(normal)
-                        
-                        if norm > 0:
-                            normal = normal / norm
-                            
-                            for vi in [vi0, vi1, vi2]:
-                                curr = normals[vi]
-                                normals[vi] = (
-                                    curr[0] + normal[0],
-                                    curr[1] + normal[1],
-                                    curr[2] + normal[2]
-                                )
-        
-        for i in range(len(normals)):
-            nx, ny, nz = normals[i]
-            norm = (nx*nx + ny*ny + nz*nz) ** 0.5
-            if norm > 0:
-                nx /= norm
-                ny /= norm
-                nz /= norm
-
-            normal_writer.setData3f(nx, ny, nz)
 
 
     def add_extended_mesh_to_scene(self, node):
@@ -692,16 +720,23 @@ class MeshReconstruction:
         # Загружаем height_map до реконструкции камеры
         if not self.load_height_map(): 
             return
+        
+        self.cam_node = self.panda_app.cam.node()
 
         self.reconstruct_camera_pos_hpr_fov_depth(data)
 
-        return
-
         self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
 
+        pr = cProfile.Profile()
+        pr.enable()
+        
         node = self.create_unified_perlin_mesh_with_lift()
-
         self.add_extended_mesh_to_scene(node)
+
+        s = io.StringIO()
+        ps = pstats.Stats(pr, stream=s).sort_stats("cumtime")
+        ps.print_stats(30)   # top 30
+        print(s.getvalue())
 
 
         

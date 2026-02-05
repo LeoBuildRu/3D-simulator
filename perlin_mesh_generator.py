@@ -9,6 +9,12 @@ from mesh_distribution import MeshDistributor
 import trimesh
 from noise import pnoise2
 
+import cProfile
+import pstats
+import io
+
+from blender_manager import BlenderManager
+
 from panda3d.core import (
     Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
     GeomTriangles, NodePath, Vec3, TextureStage, Texture,
@@ -468,6 +474,14 @@ class PerlinMeshGenerator:
 
         target_volume = self.panda_app.Target_Volume
 
+        pr = cProfile.Profile()
+        pr.enable()
+        
+        #bm = BlenderManager(blender_executable="C:/Users/xmake/Desktop/IQoko/blender-2.77a-windows64/blender.exe", server_port=50510)
+        #bm = BlenderManager(blender_executable="C:/Users/xmake/Downloads/blender-3.6.23-windows-x64/blender.exe", server_port=50508)
+        #bm.start_server()  # starts Blender in background and the server inside it
+        #self.blender = bm
+        
         best_z = self.find_best_z_position(
             perlin_base_np, 
             target_model_trimesh, 
@@ -475,6 +489,13 @@ class PerlinMeshGenerator:
             initial_z=perlin_base_np.getZ()
         )
         self.last_best_z = best_z
+
+        #bm.stop_server()
+
+        s = io.StringIO()
+        ps = pstats.Stats(pr, stream=s).sort_stats("cumtime")
+        ps.print_stats(30)   # top 30
+        print(s.getvalue())
 
         if self.current_display_model is not None:
             self.current_display_model.removeNode()
@@ -565,6 +586,7 @@ class PerlinMeshGenerator:
         min_z = -2
         max_z = 2
         max_iterations = 50
+        pre_iterations = 5
 
         best_z = initial_z
         best_volume = None
@@ -574,7 +596,7 @@ class PerlinMeshGenerator:
             self.current_display_model.removeNode()
         self.current_display_model = None
 
-        search_points = [min_z + (max_z - min_z) * i / 10 for i in range(11)]
+        search_points = [min_z + (max_z - min_z) * i / (pre_iterations - 1) for i in range(pre_iterations)]
         search_volumes = []
 
         # DEBUG: Начальные параметры
@@ -586,25 +608,7 @@ class PerlinMeshGenerator:
         print(f"Начальные точки поиска ({len(search_points)}): {search_points}")
 
         for z in search_points:
-            mesh_np.setPos(0, 0, z)
-            perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(mesh_np)
-            
-            result_csg = trimesh.boolean.difference(
-                [target_model_trimesh, perlin_model_trimesh_],
-                engine='blender'
-            )
-            
-            model_csg_plane_1 = self.panda_app.trimesh_to_panda(result_csg)
-            self._setup_transparent_material(model_csg_plane_1)
-            
-            if self.current_display_model is not None:
-                self.current_display_model.removeNode()
-            
-            self.current_display_model = model_csg_plane_1
-            self.current_display_model.reparentTo(self.panda_app.render)
-            
-            volume = self.panda_app.calculate_mesh_volume(self.current_display_model)
-            error = abs(volume - target_volume)
+            volume, error = self._evaluate_z_position(mesh_np, target_model_trimesh, z, target_volume)
             search_volumes.append((z, volume, error))
             
             # DEBUG: Результаты для каждой точки поиска
@@ -984,7 +988,11 @@ class PerlinMeshGenerator:
         """Оценивает объем при определенной Z-позиции для любого меша"""
         mesh_np.setPos(0, 0, z)
         perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(mesh_np)
-        
+
+        #result_csg = self.blender.boolean_difference(
+        #    [target_model_trimesh, perlin_model_trimesh_]
+        #)
+
         result_csg = trimesh.boolean.difference(
             [target_model_trimesh, perlin_model_trimesh_],
             engine='blender'
