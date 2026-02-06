@@ -6,8 +6,12 @@
 enabled:
     - ao
     - bloom
+    - clouds
     - color_correction
+    - dof
+    - env_probes
     - forward_shading
+    - fxaa
     - motion_blur
     - pssm
     - scattering
@@ -15,11 +19,7 @@ enabled:
     - sky_ao
     - smaa
     - ssr
-    # - clouds
-    # - dof
-    - env_probes
-    # - fxaa
-    # - volumetrics
+    - volumetrics
     # - vxgi
 
 
@@ -74,7 +74,7 @@ overrides:
         film_grain_strength: 0.1286
         color_lut: film_luts/default_lut.png
         use_chromatic_aberration: True
-        chromatic_aberration_strength: 0.019
+        chromatic_aberration_strength: 0.1512
         chromatic_aberration_samples: 2
         manual_camera_parameters: False
         min_exposure_value: 0.01
@@ -87,10 +87,10 @@ overrides:
         sharpen_twice: False
 
     dof:
-        focal_point: 1000.0
-        focal_size: 994.0
-        blur_strength: 0.0
-        near_blur_strength: 0.4286
+        focal_point: 15.0
+        focal_size: 12.0
+        blur_strength: 0.5
+        near_blur_strength: 0.8857
 
     env_probes:
         probe_resolution: 128
