@@ -272,33 +272,36 @@ class MeshReconstruction:
 
 
     def reconstruct_camera_pos_hpr_fov_depth(self, data):
-        key_points = data["keypoints"]
         camera = self.panda_app.camera
 
         lens = self.panda_app.cam.node().getLens()
 
-        img_w = data["metadata"]["image_size"]["width"]
-        img_h = data["metadata"]["image_size"]["height"]
-
-        self.aspect_ratio = img_w/img_h
+        self.aspect_ratio = 16/9
         
         lerpT = 1.0 / 2
 
         iterations = 24
 
         scene_3d = [np.array(p, dtype=float) for p in data["points_3d"]]
-
-        min_scale = 0.0001
-        max_scale = 1000
-
-        best_scale_error = 10**10
-        best_scale = 1
+        self.scene_3d = scene_3d
 
         if "keypoints_3d" in data:
             print("Using 3d keypoints")
 
-            #cam_pos = self.panda_vec3_to_np(camera.get_pos(camera.get_parent()))
-            #quat = camera.get_quat()
+            min_scale = 0.0001
+            max_scale = 1000
+
+            best_scale_error = 10**10
+            best_scale = 1
+
+            find_scale = False
+
+            #self.setVertFOV(lens, 50.6)
+
+            keypoints_3d = [np.array(p, dtype=float) for p in data["keypoints_3d"]]
+
+            for i in range(len(keypoints_3d)):
+                keypoints_3d[i] = self.cv_to_panda(self.np_to_panda_point(keypoints_3d[i]))
 
             def ApplyScale(scale):
                 #camera.set_pos(self.np_to_panda_point(cam_pos))
@@ -306,14 +309,25 @@ class MeshReconstruction:
 
                 transformed_keypoints = keypoints_3d.copy()
                 for i in range(len(keypoints_3d)):
-                    transformed_keypoints[i] = self.panda_app.render.get_relative_point(camera, keypoints_3d[i] * scale)
+                    #transformed_keypoints[i] = self.panda_app.render.get_relative_point(camera, keypoints_3d[i] * scale)
+                    transformed_keypoints[i] = keypoints_3d[i] * scale
 
                 M = self.compute_transform_np(
                     scene_3d[0], scene_3d[1], scene_3d[2],
                     transformed_keypoints[0], transformed_keypoints[1], transformed_keypoints[2]
                 )
 
-                self.apply_transform(M, camera)
+                self.trs_matrix = M
+                
+                error = 0
+                for i in range(len(transformed_keypoints)):
+                    op = self.trs_matrix @ np.append(transformed_keypoints[i], 1.0)
+                    sp = np.append(scene_3d[i], 1.0)
+                    diff = self.np_to_panda_point(op - sp)
+                    error += math.sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z)
+                return error
+
+                #self.apply_transform(M, camera)
 
                 error = 0
                 for i in range(len(transformed_keypoints)):
@@ -323,39 +337,45 @@ class MeshReconstruction:
                     error += math.sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z)
                 return error
 
-            keypoints_3d = [np.array(p, dtype=float) for p in data["keypoints_3d"]]
+            if(find_scale):
+                scaleStart = min_scale
+                scaleEnd = max_scale
 
-            for i in range(len(keypoints_3d)):
-                keypoints_3d[i] = self.cv_to_panda(self.np_to_panda_point(keypoints_3d[i]))
+                for i in range(iterations):
+                    scaleStep = (scaleEnd - scaleStart) / 2
+                    
+                    if scaleStep == 0:
+                        break
 
-            #hardcoded for now
-            #self.aspect_ratio = 4/3
-            self.setVertFOV(lens, 50.6)
+                    scale = scaleStart - scaleStep
+                    while scale < scaleEnd:
+                        scale += scaleStep
+                        error = ApplyScale(scale)
+                        if error < best_scale_error:
+                            best_scale_error = error
+                            best_scale = scale
 
-            scaleStart = min_scale
-            scaleEnd = max_scale
+                    scaleStart = self.lerp(best_scale, scaleStart, lerpT)
+                    scaleEnd = self.lerp(best_scale, scaleEnd, lerpT)
 
-            for i in range(iterations):
-                scaleStep = (scaleEnd - scaleStart) / 2
-                
-                if scaleStep == 0:
-                    break
-
-                scale = scaleStart - scaleStep
-                while scale < scaleEnd:
-                    scale += scaleStep
-                    error = ApplyScale(scale)
-                    if error < best_scale_error:
-                        best_scale_error = error
-                        best_scale = scale
-
-                scaleStart = self.lerp(best_scale, scaleStart, lerpT)
-                scaleEnd = self.lerp(best_scale, scaleEnd, lerpT)
-
-            ApplyScale(best_scale)
+            best_scale_error = ApplyScale(best_scale)
             print(f"Best error: {best_scale_error} at {best_scale}")
-            return
 
+            trs_points = [self.cv_to_panda(self.np_to_panda_point(v)) for v in self.point_cloud]
+            trs_points = [self.trs_matrix @ np.append(self.panda_vec3_to_np(v), 1.0) for v in trs_points]
+            self.trs_points = trs_points
+
+            return
+        else:
+            print("WARNING: No 3D keypoints! behaviour is undefined, results may be inaccurate. Please provide 3d keypoints for better reconstruction.")
+
+        img_w = data["metadata"]["image_size"]["width"]
+        img_h = data["metadata"]["image_size"]["height"]
+
+        self.aspect_ratio = img_w/img_h
+
+        key_points = data["keypoints"]
+            
         self.fov_y = lens.getFov()[1]
 
         points_2d = []
@@ -623,7 +643,7 @@ class MeshReconstruction:
 
         # Preallocate writers' row growth (optional)
         # vdata.setNumRows(h * w)  # sometimes useful, but depends on Panda3D version
-
+        
         # VERTICES
         for y in range(h):
             v = y * inv_h
@@ -659,6 +679,99 @@ class MeshReconstruction:
 
                 if mask[y + 1, x + 1]:
                     tris.addVertices(v2, v3, v4)
+
+        tris.closePrimitive()
+
+        geom = Geom(vdata)
+        geom.addPrimitive(tris)
+
+        # Compute normals using the Python routine (fast, in-place)
+        self._calculate_normals(vdata, geom)
+
+        node = GeomNode("unified_perlin_mesh_with_lift")
+        node.addGeom(geom)
+        return node
+
+     # ---- optimized mesh builder (calls _calculate_normals) ----
+    def create_mesh_from_point_cloud(self, size = 512, n_samples = 3):
+        h = size
+        w = size
+
+        inv_w = 1.0 / w
+        inv_h = 1.0 / h
+
+        fmt = GeomVertexFormat.getV3n3t2()
+        vdata = GeomVertexData("unified_perlin_mesh_with_lift", fmt, Geom.UHStatic)
+
+        vertex = GeomVertexWriter(vdata, "vertex")
+        normal = GeomVertexWriter(vdata, "normal")
+        texcoord = GeomVertexWriter(vdata, "texcoord")
+
+        # Preallocate writers' row growth (optional)
+        # vdata.setNumRows(h * w)  # sometimes useful, but depends on Panda3D version
+        
+        source_points_2d = np.array([[v[0], v[1]] for v in self.trs_points])
+        kd_tree = KDTree(source_points_2d)
+
+        min_x = 10**10
+        min_y = 10**10
+        max_x = -min_x
+        max_y = -min_y
+
+        for p in self.scene_3d:
+            min_x = min(min_x, p[0])
+            max_x = max(max_x, p[0])
+            min_y = min(min_y, p[1])
+            max_y = max(max_y, p[1])
+
+        x_range = max_x - min_x
+        y_range = max_y - min_y
+
+        source_heights = np.array([v[2] for v in self.trs_points])
+
+        # VERTICES
+        for y in range(h):
+            v = y * inv_h
+            for x in range(w):
+                u = x * inv_w
+
+                sx = min_x + u * x_range
+                sy = min_y + v * y_range
+
+                distances, indices = kd_tree.query([[sx, sy]], k=n_samples)
+
+                idx_list = indices[0]
+                
+                weights = np.exp(-distances[0] / 0.2)
+                weights = weights / np.sum(weights)
+                z = np.sum(source_heights[idx_list] * weights)
+
+                point = LPoint3f(sx, sy, z)
+
+                vertex.addData3f(point)
+                normal.addData3f(0.0, 0.0, 1.0)   # placeholder
+                texcoord.addData2f(u, v)
+
+        # TRIANGLES (index math: idx = y*w + x)
+        tris = GeomTriangles(Geom.UHStatic)
+        for y in range(h - 1):
+            row = y * w
+            next_row = (y + 1) * w
+            for x in range(w - 1):
+                # early mask check for shared edges
+                #if not mask[y + 1, x] or not mask[y, x + 1]:
+                #    continue
+
+                v1 = row + x
+                v2 = row + x + 1
+                v3 = next_row + x
+                v4 = next_row + x + 1
+
+                #if mask[y, x]:
+                tris.addVertices(v1, v2, v3)
+
+                #if mask[y + 1, x + 1]:
+                tris.addVertices(v2, v4, v3)
 
         tris.closePrimitive()
 
@@ -713,24 +826,29 @@ class MeshReconstruction:
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["image_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
-        self.ply_path =  json_path.replace("input-", "output-").replace(".json", ".ply")
-        self.point_cloud = pcu.load_mesh_v(self.ply_path)
-        #print(len(self.point_cloud))
-        # Загружаем height_map до реконструкции камеры
-        if not self.load_height_map(): 
-            return
+        self.ply_path =  json_path.replace(".json", ".ply")
+        if(os.path.exists(self.ply_path)):
+            self.using_ply = True
+            self.point_cloud = pcu.load_mesh_v(self.ply_path)
+        else:
+            self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["image_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
+            if not self.load_height_map(): 
+                return
         
         self.cam_node = self.panda_app.cam.node()
 
         self.reconstruct_camera_pos_hpr_fov_depth(data)
 
-        self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
+        #self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
 
         pr = cProfile.Profile()
         pr.enable()
         
-        node = self.create_unified_perlin_mesh_with_lift()
+        if self.using_ply:
+            node = self.create_mesh_from_point_cloud()
+        else:
+            node = self.create_unified_perlin_mesh_with_lift()
+        
         self.add_extended_mesh_to_scene(node)
 
         s = io.StringIO()

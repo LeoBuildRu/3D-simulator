@@ -90,7 +90,7 @@ overrides:
         focal_point: 15.0
         focal_size: 12.0
         blur_strength: 0.5
-        near_blur_strength: 0.8857
+        near_blur_strength: 1.0
 
     env_probes:
         probe_resolution: 128
@@ -184,11 +184,11 @@ overrides:
 
     volumetrics:
         enable_volumetric_shadows: True
-        volumetric_shadow_intensity: 8.31
-        volumetric_shadow_brightness: 1.66
-        volumetric_shadow_pow: 1.15999
-        volumetric_max_distance: 79.41429
-        volumetric_shadow_fadein_distance: 9.49
+        volumetric_shadow_intensity: 2.0
+        volumetric_shadow_brightness: 1.0
+        volumetric_shadow_pow: 1.39
+        volumetric_max_distance: 29.51
+        volumetric_shadow_fadein_distance: 8.07143
         volumetric_num_steps: 128
 
     vxgi:

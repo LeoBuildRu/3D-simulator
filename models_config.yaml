@@ -1,3 +1,10 @@
+FAW:
+  cuzov: "models/FAW-Cuzov.bam"
+  napolnitel: "models/Kerax-Napolnitel.gltf"
+  other: "models/FAW-Other.bam"
+  max_volume: 25
+  ground_plane: 2.0
+
 Scania:
   cuzov: "models/Scania-Cuzov.bam"
   napolnitel: "models/Scania-Napolnitel.gltf"
