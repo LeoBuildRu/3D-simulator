@@ -1,6 +1,6 @@
 FAW:
   cuzov: "models/FAW-Cuzov.bam"
-  napolnitel: "models/Kerax-Napolnitel.gltf"
+  napolnitel: "models/FAW-Napolnitel.gltf"
   other: "models/FAW-Other.bam"
   max_volume: 25
   ground_plane: 2.0
