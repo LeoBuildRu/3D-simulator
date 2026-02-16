@@ -28,17 +28,17 @@ class MeshReconstruction:
         self.alpha_threshold = 0.5
 
         self.adaptive_lift_enabled = True
-        self.lift_intensity = 40.0
-        self.lift_smoothing_sigma = 40.0
-        self.lift_blur_radius = 40
-        self.boundary_zone_width = 40
-        self.smoothing_iterations = 4
+        self.lift_intensity = 1.0
+        self.lift_smoothing_sigma = 20.0
+        self.lift_blur_radius = 12
+        self.boundary_zone_width = 10
+        self.smoothing_iterations = 7
 
         # Параметры экстраполяции
         self.extrapolation_enabled = False
-        self.target_width = 15.0  # Ширина целевой области в метрах
-        self.target_height = 10.0  # Высота целевой области в метрах
-        self.grid_resolution = 812  # Разрешение сетки экстраполяции
+        self.target_width = 4.0  # Ширина целевой области в метрах
+        self.target_height = 8.0  # Высота целевой области в метрах
+        self.grid_resolution = 1024  # Разрешение сетки экстраполяции
         
         # Параметры шума Перлина
         self.noise_scale = 0.5
@@ -50,9 +50,9 @@ class MeshReconstruction:
         
         # Параметры displacement map
         self.displacement_texture_path = "textures/sand_8k/dune_height.jpg"
-        self.displacement_strength = 0.15
-        self.texture_repeatX = 1.75
-        self.texture_repeatY = 2.4
+        self.displacement_strength = 0.07
+        self.texture_repeatX = 1.5
+        self.texture_repeatY = 2.1
         self.use_displacement = True
         
         # Для хранения мешей
@@ -945,128 +945,7 @@ class MeshReconstruction:
         
         return node
     
-    # ---- optimized mesh builder (calls _calculate_normals) ----
-    def create_mesh_from_point_cloud_smoothed(self, size = 128, n_samples = 2000):
-        h = size
-        w = size
-
-        fmt = GeomVertexFormat.getV3n3t2()
-        vdata = GeomVertexData("unified_perlin_mesh_with_lift", fmt, Geom.UHStatic)
-
-        vertex = GeomVertexWriter(vdata, "vertex")
-        normal = GeomVertexWriter(vdata, "normal")
-        texcoord = GeomVertexWriter(vdata, "texcoord")
-
-        # Preallocate writers' row growth (optional)
-        # vdata.setNumRows(h * w)  # sometimes useful, but depends on Panda3D version
-        
-        source_points_2d = np.array([[v[0], v[1]] for v in self.trs_points])
-        kd_tree = KDTree(source_points_2d)
-
-        min_x = 10**10
-        min_y = 10**10
-        max_x = -min_x
-        max_y = -min_y
-
-        for p in self.scene_3d:
-            min_x = min(min_x, p[0])
-            max_x = max(max_x, p[0])
-            min_y = min(min_y, p[1])
-            max_y = max(max_y, p[1])
-
-        x_range = max_x - min_x
-        y_range = max_y - min_y
-
-        w = int(w * x_range)
-        h = int(h * y_range)
-
-        print(x_range, y_range)
-        print(w, h)
-
-        inv_w = 1.0 / w
-        inv_h = 1.0 / h
-
-        source_heights = np.array([v[2] for v in self.trs_points])
-
-        # VERTICES
-        for y in range(h):
-            v = y * inv_h
-            for x in range(w):
-                u = x * inv_w
-
-                sx = min_x + u * x_range
-                sy = min_y + v * y_range
-
-                max_dist = 0.1
-
-                distances, indices = kd_tree.query([[sx, sy]], k=n_samples)
-
-                idx_list = indices[0]
-
-                z_sum = 0
-                w_sum = 0
-
-                dst = distances[0]
-
-                #max_dist = max(dst)
-
-                for i in range(n_samples):
-                    if(dst[i] > max_dist): continue
-
-                    id = idx_list[i]
-
-                    z_l = source_heights[id]
-
-                    dist = max_dist - dst[i]
-
-                    z_sum += z_l * dist
-                    w_sum += dist
-
-                if(w_sum > 0):
-                    z = z_sum / w_sum
-                else:
-                    z = 0
-
-                point = LPoint3f(sx, sy, z)
-
-                vertex.addData3f(point)
-                normal.addData3f(0.0, 0.0, 1.0)   # placeholder
-                texcoord.addData2f(u, v)
-
-        # TRIANGLES (index math: idx = y*w + x)
-        tris = GeomTriangles(Geom.UHStatic)
-        for y in range(h - 1):
-            row = y * w
-            next_row = (y + 1) * w
-            for x in range(w - 1):
-                # early mask check for shared edges
-                #if not mask[y + 1, x] or not mask[y, x + 1]:
-                #    continue
-
-                v1 = row + x
-                v2 = row + x + 1
-                v3 = next_row + x
-                v4 = next_row + x + 1
-
-                #if mask[y, x]:
-                tris.addVertices(v1, v3, v2)
-
-                #if mask[y + 1, x + 1]:
-                tris.addVertices(v2, v3, v4)
-
-        tris.closePrimitive()
-
-        geom = Geom(vdata)
-        geom.addPrimitive(tris)
-
-        # Compute normals using the Python routine (fast, in-place)
-        self._calculate_normals(vdata, geom)
-
-        node = GeomNode("unified_perlin_mesh_with_lift")
-        node.addGeom(geom)
-        return node
-    
-    def create_mesh_from_point_cloud(self, size=512, n_samples=3):
+    def create_mesh_from_point_cloud(self, size=512, n_samples=200):
         """
         Создаёт единый меш с плоской базой и адаптивным подъёмом вершин,
         используя точки из self.trs_points в качестве источника высот.
@@ -1097,18 +976,18 @@ class MeshReconstruction:
         if hasattr(self, 'target_width') and self.target_width > 0:
             target_width = self.target_width
         else:
-            target_width = max(max_x - min_x, 1.0) * 1.2   # запас 20%
+            target_width = max(max_x - min_x, 1.0) * 1.05   # запас 20%
 
         if hasattr(self, 'target_height') and self.target_height > 0:
             target_height = self.target_height
         else:
-            target_height = max(max_y - min_y, 1.0) * 1.2
+            target_height = max(max_y - min_y, 1.0) * 1.05
 
         # Разрешение сетки
         grid_res = getattr(self, 'grid_resolution', size)
 
         # Центр плоской сетки – центр ограничивающего прямоугольника, Z = 0
-        plane_center = np.array([(min_x + max_x) * 0.5, (min_y + max_y) * 0.5, 0.0])
+        plane_center = np.array([0, 0, 0.0])
 
         # Координаты узлов сетки в локальной системе (относительно центра)
         x_vals = np.linspace(-target_width / 2, target_width / 2, grid_res)
@@ -1251,31 +1130,31 @@ class MeshReconstruction:
         if np.any(lifted_mask):
             print("[DEBUG] Сглаживание поднятой области...")
             height_grid = self._smooth_lifted_area(height_grid, lifted_mask)
-
+  
         # ------------------------------------------------------------
         # 8. Размытие границ перехода
         # ------------------------------------------------------------
         if len(boundary_points) > 0:
             print("[DEBUG] Размытие границ перехода...")
             height_grid = self._blur_lift_boundary(height_grid, source_mask, boundary_points)
-
+  
         # ------------------------------------------------------------
         # 9. Постобработка граничной зоны
         # ------------------------------------------------------------
         print("[DEBUG] Постобработка граничной зоны...")
         height_grid = self._postprocess_boundary_zone(height_grid, source_mask)
-
+  
         # ------------------------------------------------------------
         # 10. Общее сглаживание сетки
         # ------------------------------------------------------------
         print("[DEBUG] Общее сглаживание сетки...")
         height_grid = self._smooth_heightfield(height_grid)
-
+  
         # ------------------------------------------------------------
         # 11. ПРИМЕНЕНИЕ DISPLACEMENT MAP (после всех сглаживаний)
         # ------------------------------------------------------------
         print("[DEBUG] Применение displacement map...")
-        height_grid = self._apply_displacement_to_grid(height_grid, grid_res, plane_center, target_width, target_height)
+        # height_grid = self._apply_displacement_to_grid(height_grid, grid_res, plane_center, target_width, target_height)
 
         # ------------------------------------------------------------
         # 12. Создание геометрии
@@ -1451,6 +1330,7 @@ class MeshReconstruction:
         return corrected_height
 
     def _smooth_heightfield(self, height_grid, smoothing_iterations=4):
+        smoothing_iterations = self.smoothing_iterations
         """Общее сглаживание heightfield"""
         print(f"[DEBUG] Начало сглаживания heightfield: {height_grid.shape}, итераций: {smoothing_iterations}")
         smoothed = height_grid.copy()
@@ -1558,6 +1438,88 @@ class MeshReconstruction:
             return self.mesh_node
         
         return None
+
+    def run_2d_to_3d_reconstruction(self):
+        json_path = self.recon_json_path
+        if not json_path or not os.path.isfile(json_path):
+            #QMessageBox.warning(self.panda_app, "Ошибка", "Пожалуйста, выберите корректный JSON-файл.")
+            return
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        self.ply_path =  json_path.replace(".json", ".ply")
+        if(os.path.exists(self.ply_path)):
+            self.using_ply = True
+            self.point_cloud = pcu.load_mesh_v(self.ply_path)
+        else:
+            self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["image_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
+            if not self.load_height_map(): 
+                return
+        
+        self.cam_node = self.panda_app.cam.node()
+
+        self.reconstruct_camera_pos_hpr_fov_depth(data)
+
+        # self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
+
+        if self.using_ply:
+            node = self.create_mesh_from_point_cloud()
+        else:
+            node = self.create_unified_perlin_mesh_with_lift()
+
+        mesh_node = self.add_extended_mesh_to_scene(node)
+
+        target_model = None
+        for model in self.panda_app.loaded_models:
+            model_id = id(model)
+            if model_id in self.panda_app.model_paths:
+                if self.panda_app.Target_Napolnitel in self.panda_app.model_paths[model_id]:
+                    target_model = model
+                    break
+                
+        if target_model is None:
+            if self.panda_app.loaded_models:
+                for model in self.panda_app.loaded_models:
+                    model_id = id(model)
+            return False
+        
+        target_model_trimesh = self._prepare_target_model_for_boolean(target_model)
+        self.last_target_model_trimesh = target_model_trimesh
+        
+        if target_model_trimesh is None:
+            target_model.setScale(1.0, 1.0, 1.0)
+            return False
+        
+        target_model.setScale(1.0, 1.0, 1.0)
+        target_model.setPos(0.0, 0.0, 0.0)
+        
+        mesh_node_trimesh = self.panda_app.panda_to_trimesh(mesh_node)
+        
+        mesh_node_result_trimesh = trimesh.boolean.difference(
+            [target_model_trimesh, mesh_node_trimesh],
+            engine='blender'
+        )
+        
+        final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
+        
+        # ВАЖНО: После boolean операции нужно правильно установить UV-координаты
+        print(f"[DEBUG] Настройка UV-координат после boolean операции...")
+        final_mesh_node = self._setup_uv_coordinates_after_boolean(final_mesh_node, mesh_node)
+        
+        if final_mesh_node is None or final_mesh_node.is_empty():
+            print(f"[ERROR] Не удалось создать меш с UV-координатами")
+            return
+        
+        print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={final_mesh_node.is_empty()}")
+        
+        # Применяем текстуры и материал
+        print(f"[DEBUG] Применение текстур к финальному мешу...")
+        self._apply_textures_and_material(final_mesh_node)
+        print(self.panda_app.calculate_mesh_volume(final_mesh_node))
+        # final_mesh_node.setPos(0, 0, 4)
+        
+        mesh_node.removeNode()
 
     def _setup_uv_coordinates_after_boolean(self, boolean_mesh_np, original_mesh_np):
         """
@@ -1712,117 +1674,71 @@ class MeshReconstruction:
         return new_mesh_np
     
     def _apply_textures_and_material(self, model_np):
-        """Apply PBR textures correctly for tobspr RenderPipeline"""
-
-        import os
-        from panda3d.core import Texture, TextureStage, Material
-
-        texset = self.panda_app.current_texture_set
-
-        # ------------------------------------------------------------------
-        # Resolve paths
-        # ------------------------------------------------------------------
-        diffuse_path = (
-            texset.get("diffuse")
-            or texset.get("albedo")
-            or "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        )
-
-        normal_path = texset.get(
-            "normal",
-            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
-        )
-
-        roughness_path = texset.get("roughness")
-        metallic_path  = texset.get("metallic")   # optional
-
+        """Применяет текстуры и материал к модели"""
+        if 'diffuse' in self.panda_app.current_texture_set:
+            diffuse_path = self.panda_app.current_texture_set['diffuse']
+        elif 'albedo' in self.panda_app.current_texture_set:
+            diffuse_path = self.panda_app.current_texture_set['albedo']
+        else:
+            diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
+        
+        normal_path = self.panda_app.current_texture_set.get('normal', 
+            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg")
+        
+        roughness_path = self.panda_app.current_texture_set.get('roughness', None)
+        
         if not os.path.exists(diffuse_path):
             diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-
+        
         if not os.path.exists(normal_path):
             normal_path = "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
-
-        # ------------------------------------------------------------------
-        # Create RP-compatible material
-        # ------------------------------------------------------------------
-        mat = Material()
-
-        # MUST be white for PBR
-        mat.set_base_color((1, 1, 1, 1))
-
-        # enable normal map strength (RP trick)
-        mat.set_emission((0, 1, 0, 0))
-
-        model_np.set_material(mat)
-
-        # ------------------------------------------------------------------
-        # Helper to configure textures
-        # ------------------------------------------------------------------
-        def setup_tex(tex, srgb=False):
-            if srgb:
-                tex.set_format(Texture.F_srgb)
-
-            tex.set_minfilter(Texture.FTLinearMipmapLinear)
-            tex.set_magfilter(Texture.FTLinear)
-            tex.set_wrap_u(Texture.WMRepeat)
-            tex.set_wrap_v(Texture.WMRepeat)
-
-        # ------------------------------------------------------------------
-        # Texture stages (STRICT ORDER)
-        # ------------------------------------------------------------------
-        ts_color = TextureStage("0-color")
-        ts_color.set_sort(0)
-        ts_color.set_priority(0)
-
-        ts_normal = TextureStage("1-normal")
-        ts_normal.set_sort(1)
-        ts_normal.set_priority(1)
-
-        ts_metal = TextureStage("2-metallic")
-        ts_metal.set_sort(2)
-        ts_metal.set_priority(2)
-
-        ts_rough = TextureStage("3-roughness")
-        ts_rough.set_sort(3)
-        ts_rough.set_priority(3)
-
-        # ------------------------------------------------------------------
-        # Load + assign textures
-        # ------------------------------------------------------------------
-
-        # Albedo
+        
         diffuse_tex = self.panda_app.loader.loadTexture(diffuse_path)
-        setup_tex(diffuse_tex, srgb=True)
-        model_np.set_texture(ts_color, diffuse_tex)
-
-        # Normal
+        if diffuse_tex:
+            diffuse_tex.set_format(Texture.F_srgb)
+            diffuse_tex.setMinfilter(Texture.FTLinearMipmapLinear)
+            diffuse_tex.setMagfilter(Texture.FTLinear)
+            diffuse_tex.setWrapU(Texture.WMRepeat)
+            diffuse_tex.setWrapV(Texture.WMRepeat)
+            model_np.setTexture(diffuse_tex, 1)
+        
         normal_tex = self.panda_app.loader.loadTexture(normal_path)
-        setup_tex(normal_tex)
-        model_np.set_texture(ts_normal, normal_tex)
-
-        # Metallic (REQUIRED SLOT even if dummy)
-        if metallic_path and os.path.exists(metallic_path):
-            metal_tex = self.panda_app.loader.loadTexture(metallic_path)
-        else:
-            # dummy white metallic map
-            metal_tex = Texture("dummy_metal")
-            metal_tex.setup2dTexture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
-            metal_tex.setRamImage(b"\x00")
-
-        setup_tex(metal_tex)
-        model_np.set_texture(ts_metal, metal_tex)
-
-        # Roughness
+        if normal_tex:
+            normal_tex.setMinfilter(Texture.FTLinearMipmapLinear)
+            normal_tex.setMagfilter(Texture.FTLinear)
+            normal_tex.setWrapU(Texture.WMRepeat)
+            normal_tex.setWrapV(Texture.WMRepeat)
+            
+            normal_stage = TextureStage('normal')
+            normal_stage.setMode(TextureStage.MNormal)
+            model_np.setTexture(normal_stage, normal_tex)
+        
         if roughness_path and os.path.exists(roughness_path):
-            rough_tex = self.panda_app.loader.loadTexture(roughness_path)
-            setup_tex(rough_tex)
-            model_np.set_texture(ts_rough, rough_tex)
-
-        # ------------------------------------------------------------------
-        # RP required flags
-        # ------------------------------------------------------------------
-        model_np.set_shader_auto()
-        model_np.set_two_sided(True)
+            roughness_tex = self.panda_app.loader.loadTexture(roughness_path)
+            if roughness_tex:
+                roughness_tex.setMinfilter(Texture.FTLinearMipmapLinear)
+                roughness_tex.setMagfilter(Texture.FTLinear)
+                roughness_tex.setWrapU(Texture.WMRepeat)
+                roughness_tex.setWrapV(Texture.WMRepeat)
+                
+                roughness_stage = TextureStage('roughness')
+                roughness_stage.setMode(TextureStage.MModulate)
+                model_np.setTexture(roughness_stage, roughness_tex)
+        
+        base_material = Material("perlin_base_material_with_displacement")
+        # base_material.setDiffuse((0.4, 0.4, 0.4, 1.0))
+        # base_material.setAmbient((0.7, 0.7, 0.7, 1.0))
+        # base_material.setSpecular((0.1, 0.1, 0.1, 1.0))
+        # base_material.setShininess(5.0)
+        # base_material.setRoughness(0.85)
+        # base_material.setMetallic(0.0)
+        # base_material.setRefractiveIndex(1.5)
+        model_np.setMaterial(base_material, 1)
+        
+        model_np.setShaderAuto()
+        model_np.setTwoSided(True)
+        model_np.setBin("fixed", 0)
+        model_np.setDepthOffset(1)
 
     def _prepare_target_model_for_boolean(self, target_model):
         """Подготавливает целевую модель для boolean операций"""
@@ -1876,88 +1792,3 @@ class MeshReconstruction:
         target_model_copy.removeNode()
         
         return target_model_trimesh
-    
-
-    def run_2d_to_3d_reconstruction(self):
-        json_path = self.recon_json_path
-        if not json_path or not os.path.isfile(json_path):
-            #QMessageBox.warning(self.panda_app, "Ошибка", "Пожалуйста, выберите корректный JSON-файл.")
-            return
-        
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        self.ply_path =  json_path.replace(".json", ".ply")
-        if(os.path.exists(self.ply_path)):
-            self.using_ply = True
-            self.point_cloud = pcu.load_mesh_v(self.ply_path)
-        else:
-            self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["image_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
-            if not self.load_height_map(): 
-                return
-        
-        self.cam_node = self.panda_app.cam.node()
-
-        self.reconstruct_camera_pos_hpr_fov_depth(data)
-
-        # self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
-
-        if self.using_ply:
-            node = self.create_mesh_from_point_cloud_smoothed()
-        else:
-            node = self.create_unified_perlin_mesh_with_lift()
-
-        mesh_node = self.add_extended_mesh_to_scene(node)
-
-        return
-
-        target_model = None
-        for model in self.panda_app.loaded_models:
-            model_id = id(model)
-            if model_id in self.panda_app.model_paths:
-                if self.panda_app.Target_Napolnitel in self.panda_app.model_paths[model_id]:
-                    target_model = model
-                    break
-                
-        if target_model is None:
-            if self.panda_app.loaded_models:
-                for model in self.panda_app.loaded_models:
-                    model_id = id(model)
-            return False
-        
-        target_model_trimesh = self._prepare_target_model_for_boolean(target_model)
-        self.last_target_model_trimesh = target_model_trimesh
-        
-        if target_model_trimesh is None:
-            target_model.setScale(1.0, 1.0, 1.0)
-            return False
-        
-        target_model.setScale(1.0, 1.0, 1.0)
-        target_model.setPos(0.0, 0.0, 0.0)
-        
-        mesh_node_trimesh = self.panda_app.panda_to_trimesh(mesh_node)
-        
-        mesh_node_result_trimesh = trimesh.boolean.difference(
-            [target_model_trimesh, mesh_node_trimesh],
-            engine='blender'
-        )
-        
-        final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
-        
-        # ВАЖНО: После boolean операции нужно правильно установить UV-координаты
-        print(f"[DEBUG] Настройка UV-координат после boolean операции...")
-        final_mesh_node = self._setup_uv_coordinates_after_boolean(final_mesh_node, mesh_node)
-        
-        if final_mesh_node is None or final_mesh_node.is_empty():
-            print(f"[ERROR] Не удалось создать меш с UV-координатами")
-            return
-        
-        print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={final_mesh_node.is_empty()}")
-        
-        # Применяем текстуры и материал
-        print(f"[DEBUG] Применение текстур к финальному мешу...")
-        self._apply_textures_and_material(final_mesh_node)
-        print(self.panda_app.calculate_mesh_volume(final_mesh_node))
-        # final_mesh_node.setPos(0, 0, 4)
-        
-        mesh_node.removeNode()
