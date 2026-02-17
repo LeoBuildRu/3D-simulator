@@ -5,6 +5,13 @@ FAW:
   max_volume: 25
   ground_plane: 2.0
 
+FAW3x3:
+  cuzov: "models/FAW3x3-Cuzov.bam"
+  napolnitel: "models/FAW3x3-Napolnitel.gltf"
+  other: "models/FAW3x3-Other.bam"
+  max_volume: 15
+  ground_plane: 2.0
+
 Scania:
   cuzov: "models/Scania-Cuzov.bam"
   napolnitel: "models/Scania-Napolnitel.gltf"

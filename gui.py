@@ -1,5 +1,4 @@
 # gui.py
-from height_map_mesh_generator import HeightMapMeshGenerator
 import random
 import math
 import os
@@ -469,35 +468,160 @@ class CameraControlGUI(QWidget):
         recon_layout = QVBoxLayout()
         recon_layout.setSpacing(8)
 
-        # Выбор JSON-файла (СУЩЕСТВУЮЩИЙ ФУНКЦИОНАЛ)
-        file_group = QWidget()
-        file_layout = QHBoxLayout(file_group)
-        file_layout.setContentsMargins(0, 0, 0, 0)
+        import json
+        from datetime import datetime
+        from PyQt5.QtCore import Qt, QDate
 
-        file_layout.addWidget(QLabel("Данные (.json):"))
-        self.recon_json_path = QLineEdit()
-        self.recon_json_path.setPlaceholderText("Выберите файл с 2D-данными")
-        self.recon_json_path.setReadOnly(True)
-        file_layout.addWidget(self.recon_json_path)
+        self.json_folder = os.path.join(os.getcwd(), "lidar_example")
+        self.recon_all_files = []
 
-        def pick_recon_config():
-            newConf = self.panda_app.mesh_reconstruction.browse_recon_json()
-            if newConf:
-                self.recon_json_path.setText(newConf)
+        # === ФИЛЬТРЫ ===
+        filter_layout = QHBoxLayout()
 
-        browse_btn = QPushButton("📂")
-        browse_btn.setFixedWidth(45)
-        browse_btn.clicked.connect(pick_recon_config)
-        file_layout.addWidget(browse_btn)
+        # Фильтр по имени
+        filter_layout.addWidget(QLabel("Имя:"))
+        self.recon_name_filter = QLineEdit()
+        self.recon_name_filter.setPlaceholderText("Фильтр по имени файла...")
+        filter_layout.addWidget(self.recon_name_filter)
 
-        recon_layout.addWidget(file_group)
+        # Фильтр по модели
+        filter_layout.addWidget(QLabel("Модель:"))
+        self.recon_model_filter = QComboBox()
+        self.recon_model_filter.addItem("Все модели")
+        filter_layout.addWidget(self.recon_model_filter)
 
-        # Кнопка запуска реконструкции из JSON (СУЩЕСТВУЮЩИЙ ФУНКЦИОНАЛ)
-        self.run_reconstruction_btn = self.create_accent_button(
-            "🔄 Запустить реконструкцию (из JSON)",
-            self.panda_app.mesh_reconstruction.run_2d_to_3d_reconstruction
-        )
-        recon_layout.addWidget(self.run_reconstruction_btn)
+        # Фильтр по дате
+        filter_layout.addWidget(QLabel("С:"))
+        self.recon_date_from = QDateEdit()
+        self.recon_date_from.setCalendarPopup(True)
+        self.recon_date_from.setDisplayFormat("dd.MM.yyyy")
+        self.recon_date_from.setDate(QDate(2000, 1, 1))
+        filter_layout.addWidget(self.recon_date_from)
+
+        filter_layout.addWidget(QLabel("По:"))
+        self.recon_date_to = QDateEdit()
+        self.recon_date_to.setCalendarPopup(True)
+        self.recon_date_to.setDisplayFormat("dd.MM.yyyy")
+        self.recon_date_to.setDate(QDate.currentDate())
+        filter_layout.addWidget(self.recon_date_to)
+
+        recon_layout.addLayout(filter_layout)
+
+        # === СПИСОК JSON ===
+        self.recon_json_list = QListWidget()
+        self.recon_json_list.setMinimumHeight(250)
+        recon_layout.addWidget(self.recon_json_list)
+
+
+        # ======================
+        # ЗАГРУЗКА JSON ФАЙЛОВ
+        # ======================
+        def load_recon_jsons():
+            self.recon_all_files.clear()
+            self.recon_model_filter.blockSignals(True)
+            self.recon_model_filter.clear()
+            self.recon_model_filter.addItem("Все модели")
+
+            models = set()
+
+            if not os.path.exists(self.json_folder):
+                return
+
+            for file in os.listdir(self.json_folder):
+                if not file.endswith(".json"):
+                    continue
+
+                full_path = os.path.join(self.json_folder, file)
+
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+
+                    model = data.get("model", "Unknown")
+                    time_str = data.get("time", "")
+                    dt = datetime.strptime(time_str, "%d.%m.%Y %H:%M")
+
+                    self.recon_all_files.append({
+                        "name": file,
+                        "path": full_path,
+                        "model": model,
+                        "datetime": dt
+                    })
+
+                    models.add(model)
+
+                except Exception:
+                    continue
+
+            for m in sorted(models):
+                self.recon_model_filter.addItem(m)
+
+            self.recon_model_filter.blockSignals(False)
+            apply_recon_filters()
+
+
+        # ======================
+        # ФИЛЬТРАЦИЯ
+        # ======================
+        def apply_recon_filters():
+            self.recon_json_list.clear()
+
+            name_text = self.recon_name_filter.text().lower()
+            selected_model = self.recon_model_filter.currentText()
+
+            from_date = self.recon_date_from.date().toPyDate()
+            to_date = self.recon_date_to.date().toPyDate()
+
+            sorted_files = sorted(
+                self.recon_all_files,
+                key=lambda x: x["datetime"],
+                reverse=True
+            )
+
+            for file in sorted_files:
+                if name_text and name_text not in file["name"].lower():
+                    continue
+
+                if selected_model != "Все модели" and file["model"] != selected_model:
+                    continue
+
+                file_date = file["datetime"].date()
+                if not (from_date <= file_date <= to_date):
+                    continue
+
+                item = QListWidgetItem(
+                    f'{file["name"]} | {file["model"]} | {file["datetime"].strftime("%d.%m.%Y %H:%M")}'
+                )
+                item.setData(Qt.UserRole, file)
+                self.recon_json_list.addItem(item)
+
+
+        # ======================
+        # КЛИК ПО ФАЙЛУ
+        # ======================
+        def on_recon_file_clicked(item):
+            file_data = item.data(Qt.UserRole)
+
+            model = file_data["model"]
+            path = file_data["path"]
+
+            # 1️⃣ Сначала обновляем модель
+            self.load_model_set(model)
+
+            # 2️⃣ Затем запускаем реконструкцию
+            self.panda_app.mesh_reconstruction.run_2d_to_3d_reconstruction_from(path)
+
+
+        # ======================
+        # СИГНАЛЫ
+        # ======================
+        self.recon_name_filter.textChanged.connect(apply_recon_filters)
+        self.recon_model_filter.currentIndexChanged.connect(apply_recon_filters)
+        self.recon_date_from.dateChanged.connect(apply_recon_filters)
+        self.recon_date_to.dateChanged.connect(apply_recon_filters)
+        self.recon_json_list.itemClicked.connect(on_recon_file_clicked)
+
+        load_recon_jsons()
 
         recon_section.setLayout(recon_layout)
         layout.addWidget(recon_section)
@@ -1014,6 +1138,9 @@ class CameraControlGUI(QWidget):
     def load_selected_model_set(self):
         model_set_name = self.model_set_combo.currentText()
         
+        self.load_model_set(model_set_name)
+
+    def load_model_set(self, model_set_name):
         if not model_set_name or model_set_name not in self.models_config:
             self.set_status("⚠️ Не выбран набор моделей!", True)
             return

@@ -9,7 +9,7 @@ class TLS_client:
     Клиент для взаимодействия с сервером перлин-генерации и булевых операций через REST API.
     """
 
-    def __init__(self, host='192.168.123.53', port=9999, timeout=300.0):
+    def __init__(self, host='78.25.191.12', port=9999, timeout=300.0):
         """
         :param host: IP-адрес сервера
         :param port: порт сервера

@@ -1439,87 +1439,6 @@ class MeshReconstruction:
         
         return None
 
-    def run_2d_to_3d_reconstruction(self):
-        json_path = self.recon_json_path
-        if not json_path or not os.path.isfile(json_path):
-            #QMessageBox.warning(self.panda_app, "Ошибка", "Пожалуйста, выберите корректный JSON-файл.")
-            return
-        
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        self.ply_path =  json_path.replace(".json", ".ply")
-        if(os.path.exists(self.ply_path)):
-            self.using_ply = True
-            self.point_cloud = pcu.load_mesh_v(self.ply_path)
-        else:
-            self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["image_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
-            if not self.load_height_map(): 
-                return
-        
-        self.cam_node = self.panda_app.cam.node()
-
-        self.reconstruct_camera_pos_hpr_fov_depth(data)
-
-        # self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
-
-        if self.using_ply:
-            node = self.create_mesh_from_point_cloud()
-        else:
-            node = self.create_unified_perlin_mesh_with_lift()
-
-        mesh_node = self.add_extended_mesh_to_scene(node)
-
-        target_model = None
-        for model in self.panda_app.loaded_models:
-            model_id = id(model)
-            if model_id in self.panda_app.model_paths:
-                if self.panda_app.Target_Napolnitel in self.panda_app.model_paths[model_id]:
-                    target_model = model
-                    break
-                
-        if target_model is None:
-            if self.panda_app.loaded_models:
-                for model in self.panda_app.loaded_models:
-                    model_id = id(model)
-            return False
-        
-        target_model_trimesh = self._prepare_target_model_for_boolean(target_model)
-        self.last_target_model_trimesh = target_model_trimesh
-        
-        if target_model_trimesh is None:
-            target_model.setScale(1.0, 1.0, 1.0)
-            return False
-        
-        target_model.setScale(1.0, 1.0, 1.0)
-        target_model.setPos(0.0, 0.0, 0.0)
-        
-        mesh_node_trimesh = self.panda_app.panda_to_trimesh(mesh_node)
-        
-        mesh_node_result_trimesh = trimesh.boolean.difference(
-            [target_model_trimesh, mesh_node_trimesh],
-            engine='blender'
-        )
-        
-        final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
-        
-        # ВАЖНО: После boolean операции нужно правильно установить UV-координаты
-        print(f"[DEBUG] Настройка UV-координат после boolean операции...")
-        final_mesh_node = self._setup_uv_coordinates_after_boolean(final_mesh_node, mesh_node)
-        
-        if final_mesh_node is None or final_mesh_node.is_empty():
-            print(f"[ERROR] Не удалось создать меш с UV-координатами")
-            return
-        
-        print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={final_mesh_node.is_empty()}")
-        
-        # Применяем текстуры и материал
-        print(f"[DEBUG] Применение текстур к финальному мешу...")
-        self._apply_textures_and_material(final_mesh_node)
-        print(self.panda_app.calculate_mesh_volume(final_mesh_node))
-        # final_mesh_node.setPos(0, 0, 4)
-        
-        mesh_node.removeNode()
 
     def _setup_uv_coordinates_after_boolean(self, boolean_mesh_np, original_mesh_np):
         """
@@ -1792,3 +1711,87 @@ class MeshReconstruction:
         target_model_copy.removeNode()
         
         return target_model_trimesh
+    
+    def run_2d_to_3d_reconstruction(self):
+        self.run_2d_to_3d_reconstruction_from(self.recon_json_path)
+    
+    def run_2d_to_3d_reconstruction_from(self, json_path):
+        if not json_path or not os.path.isfile(json_path):
+            #QMessageBox.warning(self.panda_app, "Ошибка", "Пожалуйста, выберите корректный JSON-файл.")
+            return
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        self.ply_path =  json_path.replace(".json", ".ply")
+        if(os.path.exists(self.ply_path)):
+            self.using_ply = True
+            self.point_cloud = pcu.load_mesh_v(self.ply_path)
+        else:
+            self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["image_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
+            if not self.load_height_map(): 
+                return
+        
+        self.cam_node = self.panda_app.cam.node()
+
+        self.reconstruct_camera_pos_hpr_fov_depth(data)
+
+        # self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
+
+        if self.using_ply:
+            node = self.create_mesh_from_point_cloud()
+        else:
+            node = self.create_unified_perlin_mesh_with_lift()
+
+        mesh_node = self.add_extended_mesh_to_scene(node)
+
+        target_model = None
+        for model in self.panda_app.loaded_models:
+            model_id = id(model)
+            if model_id in self.panda_app.model_paths:
+                if self.panda_app.Target_Napolnitel in self.panda_app.model_paths[model_id]:
+                    target_model = model
+                    break
+                
+        if target_model is None:
+            if self.panda_app.loaded_models:
+                for model in self.panda_app.loaded_models:
+                    model_id = id(model)
+            return False
+        
+        target_model_trimesh = self._prepare_target_model_for_boolean(target_model)
+        self.last_target_model_trimesh = target_model_trimesh
+        
+        if target_model_trimesh is None:
+            target_model.setScale(1.0, 1.0, 1.0)
+            return False
+        
+        target_model.setScale(1.0, 1.0, 1.0)
+        target_model.setPos(0.0, 0.0, 0.0)
+        
+        mesh_node_trimesh = self.panda_app.panda_to_trimesh(mesh_node)
+        
+        mesh_node_result_trimesh = trimesh.boolean.difference(
+            [target_model_trimesh, mesh_node_trimesh],
+            engine='blender'
+        )
+        
+        final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
+        
+        # ВАЖНО: После boolean операции нужно правильно установить UV-координаты
+        print(f"[DEBUG] Настройка UV-координат после boolean операции...")
+        final_mesh_node = self._setup_uv_coordinates_after_boolean(final_mesh_node, mesh_node)
+        
+        if final_mesh_node is None or final_mesh_node.is_empty():
+            print(f"[ERROR] Не удалось создать меш с UV-координатами")
+            return
+        
+        print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={final_mesh_node.is_empty()}")
+        
+        # Применяем текстуры и материал
+        print(f"[DEBUG] Применение текстур к финальному мешу...")
+        self._apply_textures_and_material(final_mesh_node)
+        print(self.panda_app.calculate_mesh_volume(final_mesh_node))
+        # final_mesh_node.setPos(0, 0, 4)
+        
+        mesh_node.removeNode()
