@@ -31,6 +31,8 @@ class PerlinMeshGenerator:
         self.perlin_texcoords_before_displace = None
         self.processed_model = None
         self.current_display_model = None
+
+        self.canDistributeMeshes = True
         
         # Создаём клиент для общения с сервером
         self.tls_client = TLS_client(host=server_host, port=server_port)
@@ -181,6 +183,65 @@ class PerlinMeshGenerator:
         if grid_size > 1 and vertices:
             step_x = abs(vertices[1][0] - vertices[0][0])  
             step_y = abs(vertices[grid_size][1] - vertices[0][1])  
+
+    def extract_mesh_from_geom_node(self, geom_node):
+        """
+        Extract vertices and triangle indices from a GeomNode.
+        Assumes the first Geom uses triangle primitives.
+        Returns:
+            vertices: np.ndarray of shape (V, 3)
+            indices:  np.ndarray of shape (T*3,) with dtype int32
+        """
+        if geom_node.getNumGeoms() == 0:
+            raise ValueError("GeomNode has no geoms")
+
+        geom = geom_node.getGeom(0)
+        vdata = geom.getVertexData()
+        primitive = geom.getPrimitive(0)
+
+        # Decompose to triangles if needed (e.g., from tristrips or quads)
+        primitive = primitive.decompose()
+
+        # --- Extract vertices ---
+        vertex_reader = GeomVertexReader(vdata, "vertex")
+        num_vertices = vdata.getNumRows()
+        vertices = []
+        for i in range(num_vertices):
+            v = vertex_reader.getData3()
+            vertices.append([v[0], v[1], v[2]])
+        vertices_np = np.array(vertices, dtype=np.float32)
+
+        # --- Extract indices ---
+        indices = []
+        for p in range(primitive.getNumPrimitives()):
+            start = primitive.getPrimitiveStart(p)
+            end = primitive.getPrimitiveEnd(p)
+            for i in range(start, end):
+                idx = primitive.getVertex(i)
+                indices.append(idx)
+        indices_np = np.array(indices, dtype=np.int32)
+
+        return vertices_np, indices_np
+
+    def distribute_meshes(self, geom_node):
+        if geom_node.getNumGeoms() > 0:
+            vertices_np, indices_np = self.extract_mesh_from_geom_node(geom_node)
+
+            for distrib in self.panda_app.mesh_distributions:
+                distrib.stop_rendering()
+
+            self.panda_app.mesh_distributions.clear()
+
+            for data in self.panda_app.mesh_distributions_data:
+                distrib = MeshDistributor(self.panda_app)
+
+                model1 = self.panda_app.loader.load_model(data['mesh'], noCache=True)
+
+                distrib.distribute(vertices_np, indices_np, data['count'], seed=data['seed'])
+                distrib.start_rendering(model1, data['size'], data['size_var'])
+
+                self.panda_app.mesh_distributions.append(distrib)
+
     
     def create_mesh_from_perlin_data(self):
         """Создание меша из сохраненных данных перлина"""
@@ -257,6 +318,8 @@ class PerlinMeshGenerator:
         
         geom_node = self.panda_app.final_model.node()
         if geom_node.getNumGeoms() > 0:
+            if(self.canDistributeMeshes):
+                self.distribute_meshes(geom_node)
             geom = geom_node.getGeom(0)
             vdata = geom.getVertexData()
             
