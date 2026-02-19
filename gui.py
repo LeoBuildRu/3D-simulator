@@ -19,6 +19,7 @@ from panda_widget import Panda3DWidget
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 class CameraControlGUI(QWidget):
+    # local
     def __init__(self, panda_app):
         super().__init__()
         self.panda_app = panda_app
@@ -40,6 +41,37 @@ class CameraControlGUI(QWidget):
         self.status_timer = QTimer()
         self.status_timer.setSingleShot(True)
         self.status_timer.timeout.connect(self.clear_status)
+
+    # build
+    # def __init__(self, panda_app, models_config=None, textures_config=None):
+    #     super().__init__()
+    #     self.panda_app = panda_app
+    #     self.panda_widget = Panda3DWidget()
+    #     
+    #     # Фиксированные значения поворота камеры
+    #     self.fixed_camera_rotation = {
+    #         'h': 0,
+    #         'p': -90.0,
+    #         'r': 0.0
+    #     }
+    #     
+    #     # Используем переданные конфиги, если они есть
+    #     if models_config is not None:
+    #         self.models_config = models_config
+    #     else:
+    #         self.models_config = self.load_models_config()
+    #         
+    #     if textures_config is not None:
+    #         self.textures_config = textures_config
+    #     else:
+    #         self.textures_config = self.load_textures_config()
+    #     
+    #     self.setup_styles()
+    #     self.init_ui()
+    #     
+    #     self.status_timer = QTimer()
+    #     self.status_timer.setSingleShot(True)
+    #     self.status_timer.timeout.connect(self.clear_status)
 
     def load_models_config(self):
         config_path = "models_config.yaml"
