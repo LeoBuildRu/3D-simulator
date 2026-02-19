@@ -75,7 +75,8 @@ if os.path.isdir(warp_bin_path):
 datas = [
     # Папки и файлы вашего проекта – все копируются в корень (target = ".")
     ("models", "models"),                     # вся папка models со всем содержимым
-    ("textures", "textures"),                  # вся папка textures со всем содержимым
+    ("textures", "textures"),   
+    ("lidar_example", "lidar_example"),               # вся папка textures со всем содержимым
     ("render_pipeline", "render_pipeline"),    # папка render_pipeline
     ("models_config.yaml", "."),                # конфиг моделей – в корень
     ("textures_config.yaml", "."),              # конфиг текстур – в корень

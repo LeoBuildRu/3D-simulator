@@ -1,124 +1,130 @@
 # ---------------------------------------------------------------------
 # .dll для билда
 # ---------------------------------------------------------------------
-# import os
-# import sys
-# import ctypes
-# import yaml
-# 
-# if getattr(sys, 'frozen', False):
-#     basedir = os.path.dirname(sys.executable)
-#     internal_dir = os.path.join(basedir, '_internal')
-# 
-#     # Меняем рабочую директорию на папку с exe
-#     os.chdir(basedir)
-#     print(f"[INFO] Рабочая директория изменена на: {os.getcwd()}")
-# 
-#     # Добавляем пути для поиска DLL
-#     if hasattr(os, 'add_dll_directory'):
-#         os.add_dll_directory(basedir)
-#         if os.path.exists(internal_dir):
-#             os.add_dll_directory(internal_dir)
-# 
-#     # Список DLL
-#     dlls_to_try = [
-#         'libpanda.dll',
-#         'libpandaexpress.dll',
-#         'libp3framework.dll',
-#         'libp3dtool.dll',
-#         'libp3direct.dll',
-#         'libp3openal.dll',
-#         'libp3windisplay.dll',
-#         'libpandagl.dll'
-#     ]
-# 
-#     for dll in dlls_to_try:
-#         dll_path = os.path.join(basedir, dll)
-#         if not os.path.exists(dll_path):
-#             dll_path = os.path.join(internal_dir, dll)
-#         try:
-#             if os.path.exists(dll_path):
-#                 ctypes.CDLL(dll_path)
-#                 print(f"[DLL] Successfully loaded {dll_path}")
-#             else:
-#                 print(f"[DLL] {dll} not found")
-#         except Exception as e:
-#             print(f"[DLL] Failed to load {dll_path}: {e}")
-# 
-#     # --- Диагностика и поиск ресурсов ---
-#     print("[DEBUG] Содержимое basedir (первые 20):")
-#     try:
-#         for f in os.listdir(basedir)[:20]:
-#             print("  ", f)
-#     except:
-#         pass
-# 
-#     print("[DEBUG] Содержимое internal_dir (первые 20):")
-#     try:
-#         for f in os.listdir(internal_dir)[:20]:
-#             print("  ", f)
-#     except:
-#         pass
-# 
-#     # Поиск конфигов
-#     models_cfg = None
-#     for loc in [basedir, internal_dir]:
-#         p = os.path.join(loc, 'models_config.yaml')
-#         if os.path.exists(p):
-#             models_cfg = p
-#             break
-# 
-#     textures_cfg = None
-#     for loc in [basedir, internal_dir]:
-#         p = os.path.join(loc, 'textures_config.yaml')
-#         if os.path.exists(p):
-#             textures_cfg = p
-#             break
-# 
-#     print(f"[DEBUG] models_config.yaml найден: {models_cfg}")
-#     print(f"[DEBUG] textures_config.yaml найден: {textures_cfg}")
-# 
-#     # Загружаем конфиги
-#     models_config_data = None
-#     textures_config_data = None
-# 
-#     if models_cfg:
-#         with open(models_cfg, 'r', encoding='utf-8') as f:
-#             models_config_data = yaml.safe_load(f)
-#         print(f"[INFO] Загружен models_config, ключи: {list(models_config_data.keys()) if models_config_data else []}")
-# 
-#     if textures_cfg:
-#         with open(textures_cfg, 'r', encoding='utf-8') as f:
-#             textures_config_data = yaml.safe_load(f)
-#         print(f"[INFO] Загружен textures_config, ключи: {list(textures_config_data.keys()) if textures_config_data else []}")
-# 
-#     # Поиск папок models и textures
-#     models_dir = None
-#     for loc in [basedir, internal_dir]:
-#         d = os.path.join(loc, 'models')
-#         if os.path.isdir(d):
-#             models_dir = d
-#             break
-# 
-#     textures_dir = None
-#     for loc in [basedir, internal_dir]:
-#         d = os.path.join(loc, 'textures')
-#         if os.path.isdir(d):
-#             textures_dir = d
-#             break
-# 
-#     print(f"[DEBUG] Папка models найдена: {models_dir}")
-#     print(f"[DEBUG] Папка textures найдена: {textures_dir}")
-# 
-# else:
-#     # Не frozen (режим разработки)
-#     basedir = os.path.dirname(os.path.abspath(__file__))
-#     os.chdir(basedir)
-#     print("[INFO] Режим разработки, рабочая директория:", os.getcwd())
-# 
-# from panda3d.core import loadPrcFileData
-# loadPrcFileData("", "load-display pandagl")
-# loadPrcFileData("", "aux-display pandagl")
+import os
+import sys
+import ctypes
+import yaml
+
+if getattr(sys, 'frozen', False):
+    basedir = os.path.dirname(sys.executable)
+    internal_dir = os.path.join(basedir, '_internal')
+
+    # Меняем рабочую директорию на папку с exe
+    os.chdir(basedir)
+    print(f"[INFO] Рабочая директория изменена на: {os.getcwd()}")
+
+    # Добавляем пути для поиска DLL
+    if hasattr(os, 'add_dll_directory'):
+        os.add_dll_directory(basedir)
+        if os.path.exists(internal_dir):
+            os.add_dll_directory(internal_dir)
+
+    # Список DLL
+    dlls_to_try = [
+        'libpanda.dll',
+        'libpandaexpress.dll',
+        'libp3framework.dll',
+        'libp3dtool.dll',
+        'libp3direct.dll',
+        'libp3openal.dll',
+        'libp3windisplay.dll',
+        'libpandagl.dll'
+    ]
+
+    for dll in dlls_to_try:
+        dll_path = os.path.join(basedir, dll)
+        if not os.path.exists(dll_path):
+            dll_path = os.path.join(internal_dir, dll)
+        try:
+            if os.path.exists(dll_path):
+                ctypes.CDLL(dll_path)
+                print(f"[DLL] Successfully loaded {dll_path}")
+            else:
+                print(f"[DLL] {dll} not found")
+        except Exception as e:
+            print(f"[DLL] Failed to load {dll_path}: {e}")
+
+    # --- Диагностика и поиск ресурсов ---
+    print("[DEBUG] Содержимое basedir (первые 20):")
+    try:
+        for f in os.listdir(basedir)[:20]:
+            print("  ", f)
+    except:
+        pass
+
+    print("[DEBUG] Содержимое internal_dir (первые 20):")
+    try:
+        for f in os.listdir(internal_dir)[:20]:
+            print("  ", f)
+    except:
+        pass
+
+    # Поиск конфигов
+    models_cfg = None
+    for loc in [basedir, internal_dir]:
+        p = os.path.join(loc, 'models_config.yaml')
+        if os.path.exists(p):
+            models_cfg = p
+            break
+
+    textures_cfg = None
+    for loc in [basedir, internal_dir]:
+        p = os.path.join(loc, 'textures_config.yaml')
+        if os.path.exists(p):
+            textures_cfg = p
+            break
+
+    print(f"[DEBUG] models_config.yaml найден: {models_cfg}")
+    print(f"[DEBUG] textures_config.yaml найден: {textures_cfg}")
+
+    # Загружаем конфиги
+    models_config_data = None
+    textures_config_data = None
+
+    if models_cfg:
+        with open(models_cfg, 'r', encoding='utf-8') as f:
+            models_config_data = yaml.safe_load(f)
+        print(f"[INFO] Загружен models_config, ключи: {list(models_config_data.keys()) if models_config_data else []}")
+
+    if textures_cfg:
+        with open(textures_cfg, 'r', encoding='utf-8') as f:
+            textures_config_data = yaml.safe_load(f)
+        print(f"[INFO] Загружен textures_config, ключи: {list(textures_config_data.keys()) if textures_config_data else []}")
+
+    # Поиск папок models и textures
+    models_dir = None
+    for loc in [basedir, internal_dir]:
+        d = os.path.join(loc, 'models')
+        if os.path.isdir(d):
+            models_dir = d
+            break
+
+    textures_dir = None
+    for loc in [basedir, internal_dir]:
+        d = os.path.join(loc, 'textures')
+        if os.path.isdir(d):
+            textures_dir = d
+            break
+
+    print(f"[DEBUG] Папка models найдена: {models_dir}")
+    print(f"[DEBUG] Папка textures найдена: {textures_dir}")
+
+    # Добавляем internal_dir в model-path для поиска ресурсов
+    from panda3d.core import get_model_path
+    if internal_dir:
+        get_model_path().prepend_directory(internal_dir)
+        print(f"[INFO] Добавлен путь internal_dir в model-path: {internal_dir}")
+
+else:
+    # Не frozen (режим разработки)
+    basedir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(basedir)
+    print("[INFO] Режим разработки, рабочая директория:", os.getcwd())
+
+from panda3d.core import loadPrcFileData
+loadPrcFileData("", "load-display pandagl")
+loadPrcFileData("", "aux-display pandagl")
 
 
 
@@ -1769,9 +1775,9 @@ def main():
     panda_app = MyApp()
     
     # build 
-    # control_panel = CameraControlGUI(panda_app, models_config_data, textures_config_data)
+    control_panel = CameraControlGUI(panda_app, models_config_data, textures_config_data)
     # local
-    control_panel = CameraControlGUI(panda_app)
+    # control_panel = CameraControlGUI(panda_app)
     control_panel.setMinimumWidth(380)
     control_panel.setMaximumWidth(380)
     control_panel.setMinimumHeight(1080)

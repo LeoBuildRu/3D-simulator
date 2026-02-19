@@ -14,6 +14,7 @@ import random
 from scipy.spatial import KDTree
 import trimesh
 import point_cloud_utils as pcu
+from perlin_mesh_generator import get_resource_path
 
 import cProfile
 import pstats
@@ -32,7 +33,7 @@ class MeshReconstruction:
         self.lift_smoothing_sigma = 20.0
         self.lift_blur_radius = 12
         self.boundary_zone_width = 10
-        self.smoothing_iterations = 7
+        self.smoothing_iterations = 2
 
         # Параметры экстраполяции
         self.extrapolation_enabled = False
@@ -1593,26 +1594,52 @@ class MeshReconstruction:
         return new_mesh_np
     
     def _apply_textures_and_material(self, model_np):
-        """Применяет текстуры и материал к модели"""
+        from perlin_mesh_generator import get_resource_path
+        import os
+        from panda3d.core import Filename, Texture, TextureStage, Material
+
+        # --- Диффузная текстура ---
         if 'diffuse' in self.panda_app.current_texture_set:
-            diffuse_path = self.panda_app.current_texture_set['diffuse']
+            diffuse_rel = self.panda_app.current_texture_set['diffuse']
         elif 'albedo' in self.panda_app.current_texture_set:
-            diffuse_path = self.panda_app.current_texture_set['albedo']
+            diffuse_rel = self.panda_app.current_texture_set['albedo']
         else:
-            diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        
-        normal_path = self.panda_app.current_texture_set.get('normal', 
+            diffuse_rel = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
+
+        # --- Normal текстура ---
+        normal_rel = self.panda_app.current_texture_set.get('normal',
             "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg")
-        
-        roughness_path = self.panda_app.current_texture_set.get('roughness', None)
-        
+
+        # --- Roughness текстура ---
+        roughness_rel = self.panda_app.current_texture_set.get('roughness', None)
+
+        # Преобразуем относительные пути в абсолютные
+        diffuse_path = get_resource_path(diffuse_rel)
+        normal_path = get_resource_path(normal_rel) if normal_rel else None
+        roughness_path = get_resource_path(roughness_rel) if roughness_rel else None
+
+        # --- Fallback для diffuse (аналогично perlin_mesh_generator) ---
+        print(f"[DEBUG] Попытка загрузить диффузную текстуру: {diffuse_path}")
         if not os.path.exists(diffuse_path):
-            diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        
-        if not os.path.exists(normal_path):
-            normal_path = "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
-        
-        diffuse_tex = self.panda_app.loader.loadTexture(diffuse_path)
+            print(f"[ERROR] Файл не существует: {diffuse_path}")
+            # Пробуем заменить _4k на _8k и наоборот
+            alt_path = diffuse_path.replace('_4k.jpg', '_8k.jpg')
+            if os.path.exists(alt_path):
+                diffuse_path = alt_path
+                print(f"[INFO] Использую альтернативный файл: {alt_path}")
+            else:
+                alt_path = diffuse_path.replace('_8k.jpg', '_4k.jpg')
+                if os.path.exists(alt_path):
+                    diffuse_path = alt_path
+                    print(f"[INFO] Использую альтернативный файл: {alt_path}")
+                else:
+                    print("[ERROR] Нет доступной текстуры, пропускаем")
+                    return
+        else:
+            print(f"[INFO] Файл найден, размер: {os.path.getsize(diffuse_path)} байт")
+
+        # Загрузка диффузной текстуры
+        diffuse_tex = self.panda_app.loader.loadTexture(Filename.from_os_specific(diffuse_path))
         if diffuse_tex:
             diffuse_tex.set_format(Texture.F_srgb)
             diffuse_tex.setMinfilter(Texture.FTLinearMipmapLinear)
@@ -1620,40 +1647,53 @@ class MeshReconstruction:
             diffuse_tex.setWrapU(Texture.WMRepeat)
             diffuse_tex.setWrapV(Texture.WMRepeat)
             model_np.setTexture(diffuse_tex, 1)
-        
-        normal_tex = self.panda_app.loader.loadTexture(normal_path)
-        if normal_tex:
-            normal_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-            normal_tex.setMagfilter(Texture.FTLinear)
-            normal_tex.setWrapU(Texture.WMRepeat)
-            normal_tex.setWrapV(Texture.WMRepeat)
-            
-            normal_stage = TextureStage('normal')
-            normal_stage.setMode(TextureStage.MNormal)
-            model_np.setTexture(normal_stage, normal_tex)
-        
-        if roughness_path and os.path.exists(roughness_path):
-            roughness_tex = self.panda_app.loader.loadTexture(roughness_path)
-            if roughness_tex:
-                roughness_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-                roughness_tex.setMagfilter(Texture.FTLinear)
-                roughness_tex.setWrapU(Texture.WMRepeat)
-                roughness_tex.setWrapV(Texture.WMRepeat)
-                
-                roughness_stage = TextureStage('roughness')
-                roughness_stage.setMode(TextureStage.MModulate)
-                model_np.setTexture(roughness_stage, roughness_tex)
-        
+
+        # --- Normal текстура с fallback ---
+        if normal_path:
+            if not os.path.exists(normal_path):
+                alt_norm = normal_path.replace('_4k.jpg', '_8k.jpg')
+                if os.path.exists(alt_norm):
+                    normal_path = alt_norm
+                else:
+                    alt_norm = normal_path.replace('_8k.jpg', '_4k.jpg')
+                    if os.path.exists(alt_norm):
+                        normal_path = alt_norm
+            if os.path.exists(normal_path):
+                normal_tex = self.panda_app.loader.loadTexture(Filename.from_os_specific(normal_path))
+                if normal_tex:
+                    normal_tex.setMinfilter(Texture.FTLinearMipmapLinear)
+                    normal_tex.setMagfilter(Texture.FTLinear)
+                    normal_tex.setWrapU(Texture.WMRepeat)
+                    normal_tex.setWrapV(Texture.WMRepeat)
+                    normal_stage = TextureStage('normal')
+                    normal_stage.setMode(TextureStage.MNormal)
+                    model_np.setTexture(normal_stage, normal_tex)
+
+        # --- Roughness текстура с fallback ---
+        if roughness_path:
+            if not os.path.exists(roughness_path):
+                alt_rough = roughness_path.replace('_4k.jpg', '_8k.jpg')
+                if os.path.exists(alt_rough):
+                    roughness_path = alt_rough
+                else:
+                    alt_rough = roughness_path.replace('_8k.jpg', '_4k.jpg')
+                    if os.path.exists(alt_rough):
+                        roughness_path = alt_rough
+            if os.path.exists(roughness_path):
+                roughness_tex = self.panda_app.loader.loadTexture(Filename.from_os_specific(roughness_path))
+                if roughness_tex:
+                    roughness_tex.setMinfilter(Texture.FTLinearMipmapLinear)
+                    roughness_tex.setMagfilter(Texture.FTLinear)
+                    roughness_tex.setWrapU(Texture.WMRepeat)
+                    roughness_tex.setWrapV(Texture.WMRepeat)
+                    roughness_stage = TextureStage('roughness')
+                    roughness_stage.setMode(TextureStage.MModulate)
+                    model_np.setTexture(roughness_stage, roughness_tex)
+
+        # Материал (можно оставить как есть)
         base_material = Material("perlin_base_material_with_displacement")
-        # base_material.setDiffuse((0.4, 0.4, 0.4, 1.0))
-        # base_material.setAmbient((0.7, 0.7, 0.7, 1.0))
-        # base_material.setSpecular((0.1, 0.1, 0.1, 1.0))
-        # base_material.setShininess(5.0)
-        # base_material.setRoughness(0.85)
-        # base_material.setMetallic(0.0)
-        # base_material.setRefractiveIndex(1.5)
         model_np.setMaterial(base_material, 1)
-        
+
         model_np.setShaderAuto()
         model_np.setTwoSided(True)
         model_np.setBin("fixed", 0)
