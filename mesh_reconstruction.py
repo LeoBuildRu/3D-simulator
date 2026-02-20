@@ -32,7 +32,7 @@ class MeshReconstruction:
         self.lift_smoothing_sigma = 20.0
         self.lift_blur_radius = 12
         self.boundary_zone_width = 10
-        self.smoothing_iterations = 2
+        self.smoothing_iterations = 7
 
         # Параметры экстраполяции
         self.extrapolation_enabled = False
