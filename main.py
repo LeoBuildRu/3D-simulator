@@ -637,43 +637,70 @@ class MyApp(ShowBase):
         return True
 
     def panda_to_trimesh(self, node_path):
+        from panda3d.core import GeomNode, GeomVertexReader, GeomTriangles
+        import numpy as np
+        import trimesh
+
+        # Ensure we have a GeomNodePath
+        if not isinstance(node_path.node(), GeomNode):
+            node_path = node_path.find("**/+GeomNode")
+            if node_path.isEmpty():
+                return None
+
         geom_node = node_path.node()
-        if not isinstance(geom_node, GeomNode):
-            geom_node_path = node_path.find("**/+GeomNode")
-            geom_node = geom_node_path.node()
-        
+
+        # IMPORTANT: use the GeomNode's world transform
         transform = node_path.getNetTransform().getMat()
-        
+
         vertices = []
         faces = []
-        
+        vertex_offset = 0
+
         for i in range(geom_node.getNumGeoms()):
             geom = geom_node.getGeom(i)
             vdata = geom.getVertexData()
-            
+
+            # ---- Read vertices ----
             vertex_reader = GeomVertexReader(vdata, "vertex")
+
+            geom_vertices = []
             while not vertex_reader.isAtEnd():
                 pos = vertex_reader.getData3f()
-                pos = transform.xformPoint(pos)
-                vertices.append([pos.x, pos.z, pos.y])
-            
+
+                # Convert to world-space
+                world_pos = transform.xformPoint(pos)
+
+                geom_vertices.append([world_pos.x, world_pos.y, world_pos.z])
+
+            vertices.extend(geom_vertices)
+
+            # ---- Read faces ----
             for j in range(geom.getNumPrimitives()):
-                prim = geom.getPrimitive(j)
+                prim = geom.getPrimitive(j).decompose()
+
                 if isinstance(prim, GeomTriangles):
                     for k in range(prim.getNumPrimitives()):
-                        start = prim.getPrimitiveStart(k)
-                        end = prim.getPrimitiveEnd(k)
+                        s = prim.getPrimitiveStart(k)
+                        e = prim.getPrimitiveEnd(k)
+
                         face = []
-                        for idx in range(start, end):
+                        for idx in range(s, e):
                             vi = prim.getVertex(idx)
-                            face.append(vi)
+                            face.append(vi + vertex_offset)
+
                         if len(face) == 3:
                             faces.append(face)
-        
+
+            vertex_offset += len(geom_vertices)
+
         if not vertices or not faces:
             return None
-            
-        return trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(faces))
+
+        return trimesh.Trimesh(
+            vertices=np.array(vertices, dtype=np.float32),
+            faces=np.array(faces, dtype=np.int64),
+            process=False
+        )
 
     def trimesh_to_panda(self, trimesh_mesh):
         vertices = trimesh_mesh.vertices
@@ -693,7 +720,7 @@ class MyApp(ShowBase):
         texcoord_writer = GeomVertexWriter(vdata, "texcoord")
         
         for i, vertex in enumerate(vertices):
-            vertex_writer.addData3f(vertex[0], vertex[2], vertex[1])
+            vertex_writer.addData3f(vertex[0], vertex[1], vertex[2])
             
             if i < len(normals):
                 normal = normals[i]

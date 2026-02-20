@@ -344,76 +344,44 @@ class PerlinMeshGenerator:
         
         return True
     
-    def extract_mesh_data(self, nodepath):
-        """
-        Returns:
-            vertices: flat list [x0,y0,z0, x1,y1,z1, ...]
-            indices:  flat list [i0,i1,i2, ...]
-        """
-
-        vertices = []
-        indices = []
-
-        # Find all GeomNodes inside NodePath
-        geom_nodes = nodepath.findAllMatches("**/+GeomNode")
-
-        vertex_offset = 0
-
-        for np in geom_nodes:
-            geom_node = np.node()
-
-            for i in range(geom_node.getNumGeoms()):
-                geom = geom_node.getGeom(i)
-                vdata = geom.getVertexData()
-
-                # --- Read vertices ---
-                vertex_reader = GeomVertexReader(vdata, "vertex")
-                num_rows = vdata.getNumRows()
-
-                scale = 2
-
-                for _ in range(num_rows):
-                    v = vertex_reader.getData3f()
-                    vertices.extend([v.x * scale, v.y * scale, v.z * scale])
-
-                # --- Read indices ---
-                for p in range(geom.getNumPrimitives()):
-                    prim = geom.getPrimitive(p).decompose()
-                    for j in range(prim.getNumPrimitives()):
-                        s = prim.getPrimitiveStart(j)
-                        e = prim.getPrimitiveEnd(j)
-
-                        for k in range(s, e):
-                            idx = prim.getVertex(k)
-                            indices.append(idx + vertex_offset)
-
-                vertex_offset += num_rows
-
-        return vertices, indices
-    
     def generate_perlin_mesh_from_csg(self):
-        """Только визуализация target_model и детального перлин-меша (с отладкой)."""
-        # Поиск целевой модели
+        """Генерация перлин-меша на основе CSG операции с использованием сервера для булевой разности"""
+        # Очистка предыдущих моделей (как в оригинале)
+        if hasattr(self.panda_app, 'test_perlin_mesh') and self.panda_app.test_perlin_mesh is not None:
+            if self.panda_app.test_perlin_mesh in self.panda_app.loaded_models:
+                self.panda_app.loaded_models.remove(self.panda_app.test_perlin_mesh)
+            self.panda_app.test_perlin_mesh.removeNode()
+            self.panda_app.test_perlin_mesh = None
+
+        if hasattr(self.panda_app, 'final_model') and self.panda_app.final_model:
+            if self.panda_app.final_model in self.panda_app.loaded_models:
+                self.panda_app.loaded_models.remove(self.panda_app.final_model)
+            self.panda_app.final_model.removeNode()
+            self.panda_app.final_model = None
+
+        # Поиск целевой модели (как в оригинале)
         target_model = None
+        target_model_path = None
         for model in self.panda_app.loaded_models:
             model_id = id(model)
             if model_id in self.panda_app.model_paths:
                 if self.panda_app.Target_Napolnitel in self.panda_app.model_paths[model_id]:
                     target_model = model
+                    target_model_path = self.panda_app.model_paths[model_id]
                     break
 
         if target_model is None:
             print("Целевая модель не найдена")
             return False
 
-        # Принудительно репарентим и показываем
-        target_model.reparentTo(self.panda_app.render)
-        target_model.show()
-        self._apply_textures_and_material(target_model)
-
-        # Отладка целевой модели
-        print(f"target_model позиция: {target_model.getPos()}")
-        print(f"target_model скрыта? {target_model.isHidden()}")
+        # Подготовка target_model для boolean (без изменений)
+        target_model_trimesh = self._prepare_target_model_for_boolean(target_model)
+        self.last_target_model_trimesh = target_model_trimesh
+        if target_model_trimesh is None:
+            target_model.setScale(1.0, 1.0, 1.0)
+            return False
+        target_model.setScale(1.0, 1.0, 1.0)
+        target_model.setPos(0.0, 0.0, 0.0)
 
         # Генерация базового перлин-меша (grid_size=48)
         perlin_base_np = self.generate_perlin_mesh(grid_size=48)
@@ -439,17 +407,18 @@ class PerlinMeshGenerator:
         perlin_base_np.removeNode()
 
         # Генерация детального меша (grid_size=128)
-        perlin_detailed_np = self.generate_perlin_mesh(grid_size=512)
+        perlin_detailed_np = self.generate_perlin_mesh(grid_size=48)
         perlin_detailed_np.setPos(0, 0, best_z)
 
         # Получаем trimesh детального меша
         perlin_trimesh = self.panda_app.panda_to_trimesh(perlin_detailed_np)
 
+        # Отправляем запрос на сервер для булевой разности (получаем геометрию)
         result_vertices, result_triangles = self.tls_client.send_boolean_request(
-            target_vertices,
-            target_indices,
-            perlin_vertices,
-            perlin_indices,
+            target_model_trimesh.vertices,
+            target_model_trimesh.faces,
+            perlin_trimesh.vertices,
+            perlin_trimesh.faces,
             return_volume_only=False
         )
         print(f"[DEBUG] Boolean request completed: vertices={len(result_vertices)}, triangles={len(result_triangles)}")
@@ -457,47 +426,97 @@ class PerlinMeshGenerator:
         result_trimesh = trimesh.Trimesh(vertices=result_vertices, faces=result_triangles)
 
         self.panda_app.particle_flag = True
-        self.panda_app.final_model = self.panda_app.create_nodepath_from_vertices_triangles(
-            result_vertices, result_triangles, compute_normals=True
-        )
+        self.panda_app.final_model = self.panda_app.trimesh_to_panda(result_trimesh)
         self.panda_app.particle_flag = False
 
-        # Пересчёт UV (как в оригинале, но используем result_vertices вместо чтения из модели)
-        if self.last_size_x is not None and self.last_size_y is not None:
+
+        # ---- НОВЫЙ КОД ВМЕСТО СТАРОГО ПЕРЕСЧЁТА UV ----
+        # Используем сохранённые размеры перлин-меша
+        if (self.last_size_x is not None and self.last_size_y is not None and
+            self.last_half_size_x is not None and self.last_half_size_y is not None):
             size_x = self.last_size_x
             size_y = self.last_size_y
             half_size_x = self.last_half_size_x
             half_size_y = self.last_half_size_y
         else:
-            # fallback
+            # fallback – если по какой-то причине размеры не сохранены
             bounds = self.panda_app.final_model.getTightBounds()
-            min_pt, max_pt = bounds
-            size_x = max_pt.x - min_pt.x
-            size_y = max_pt.y - min_pt.y
-            half_size_x = (min_pt.x + max_pt.x) / 2.0
-            half_size_y = (min_pt.y + max_pt.y) / 2.0
+            if bounds[0] is not None and bounds[1] is not None:
+                min_pt, max_pt = bounds
+                size_x = max_pt.x - min_pt.x
+                size_y = max_pt.y - min_pt.y
+                half_size_x = (min_pt.x + max_pt.x) / 2.0
+                half_size_y = (min_pt.y + max_pt.y) / 2.0
+            else:
+                size_x = 10.0
+                size_y = 10.0
+                half_size_x = 0.0
+                half_size_y = 0.0
 
         tex_repeat_x = self.panda_app.current_texture_set.get('textureRepeatX', 1.35)
         tex_repeat_y = self.panda_app.current_texture_set.get('textureRepeatY', 3.2)
 
-        num_verts = len(result_vertices) // 3
-        print(f"DEBUG: num_verts = {num_verts}, len(result_vertices) = {len(result_vertices)}")
-        texcoords = []
-        for i in range(num_verts):
-            vx = result_vertices[i*3]
-            vy = result_vertices[i*3 + 1]
-            u = ((vx + half_size_x) / size_x) * tex_repeat_x
-            v = ((vy + half_size_y) / size_y) * tex_repeat_y
-            texcoords.extend([u, v])
-        print(f"DEBUG: len(texcoords) = {len(texcoords)} (ожидалось {num_verts * 2})")
+        # Извлекаем геометрию финальной модели
+        try:
+            geom_node = self.panda_app.final_model.node()
+            if geom_node.getNumGeoms() > 0:
+                geom = geom_node.getGeom(0)
+                vdata = geom.getVertexData()
+                vertex_reader = GeomVertexReader(vdata, "vertex")
 
-        new_model = self.panda_app.create_nodepath_from_vertices_triangles(
-            result_vertices, result_triangles, texcoords=texcoords, compute_normals=True
-        )
-        self.panda_app.final_model.removeNode()
-        self.panda_app.final_model = new_model
+                vertices = []
+                while not vertex_reader.isAtEnd():
+                    v = vertex_reader.getData3f()
+                    vertices.append((v.x, v.y, v.z))
 
-        # Применяем текстуры и материал
+                # Создаём новые данные с UV
+                format = GeomVertexFormat.getV3n3t2()
+                new_vdata = GeomVertexData("final_mesh_with_uv", format, Geom.UHStatic)
+                vertex_writer = GeomVertexWriter(new_vdata, "vertex")
+                normal_writer = GeomVertexWriter(new_vdata, "normal")
+                texcoord_writer = GeomVertexWriter(new_vdata, "texcoord")
+
+                normal_reader = GeomVertexReader(vdata, "normal") if vdata.hasColumn("normal") else None
+
+                for vx, vy, vz in vertices:
+                    vertex_writer.addData3f(vx, vy, vz)
+                    if normal_reader:
+                        n = normal_reader.getData3f()
+                        normal_writer.addData3f(n.x, n.y, n.z)
+                    else:
+                        normal_writer.addData3f(0, 0, 1)
+
+                    # Генерация UV на основе исходных размеров перлин-меша
+                    u = ((vx + half_size_x) / size_x) * tex_repeat_x
+                    v = ((vy + half_size_y) / size_y) * tex_repeat_y
+                    texcoord_writer.addData2f(u, v)
+
+                # Копируем индексы треугольников
+                prim = geom.getPrimitive(0)
+                new_prim = GeomTriangles(Geom.UHStatic)
+                for i in range(prim.getNumPrimitives()):
+                    start = prim.getPrimitiveStart(i)
+                    end = prim.getPrimitiveEnd(i)
+                    for j in range(start, end):
+                        idx = prim.getVertex(j)
+                        new_prim.addVertex(idx)
+                new_prim.closePrimitive()
+
+                new_geom = Geom(new_vdata)
+                new_geom.addPrimitive(new_prim)
+                new_geom_node = GeomNode("final_mesh_with_uv")
+                new_geom_node.addGeom(new_geom)
+
+                # Заменяем старую модель
+                self.panda_app.final_model.removeNode()
+                self.panda_app.final_model = self.panda_app.render.attachNewNode(new_geom_node)
+            else:
+                print("[WARN] final_model не содержит геометрии")
+        except Exception as e:
+            print(f"[ERROR] Ошибка при пересчёте UV: {e}")
+            traceback.print_exc()
+
+        # Применение текстур и материала (как было)
         self._apply_textures_and_material(self.panda_app.final_model)
 
         target_model.hide()
@@ -508,7 +527,7 @@ class PerlinMeshGenerator:
         tolerance = 0.2
         min_z = -2
         max_z = 2
-        max_iterations = 50
+        max_iterations = -1
 
         best_z = initial_z
         best_volume = None
@@ -873,55 +892,7 @@ class PerlinMeshGenerator:
     
     def _prepare_target_model_for_boolean(self, target_model):
         """Подготавливает целевую модель для boolean операций"""
-        original_min_bound, original_max_bound = target_model.getTightBounds()
-
-        original_size_x = original_max_bound.x - original_min_bound.x
-        original_size_y = original_max_bound.y - original_min_bound.y
-        original_size_z = original_max_bound.z - original_min_bound.z
-
-        original_center_x = (original_min_bound.x + original_max_bound.x) / 2
-        original_center_y = (original_min_bound.y + original_max_bound.y) / 2
-        original_center_z = (original_min_bound.z + original_max_bound.z) / 2
-
         target_model_trimesh = self.panda_app.panda_to_trimesh(target_model)
-
-        self.processed_model = self.panda_app.trimesh_to_panda(target_model_trimesh)
-
-        target_model_trimesh = None
-
-        advanced_min_bound, advanced_max_bound = self.processed_model.getTightBounds()
-
-        advanced_size_x = advanced_max_bound.x - advanced_min_bound.x
-        advanced_size_y = advanced_max_bound.y - advanced_min_bound.y
-        advanced_size_z = advanced_max_bound.z - advanced_min_bound.z
-
-        advanced_center_x = (advanced_min_bound.x + advanced_max_bound.x) / 2
-        advanced_center_y = (advanced_min_bound.y + advanced_max_bound.y) / 2
-        advanced_center_z = (advanced_min_bound.z + advanced_max_bound.z) / 2
-
-        scale_x = original_size_x / advanced_size_x
-        scale_y = original_size_y / advanced_size_y
-        scale_z = original_size_z / advanced_size_z
-
-        self.processed_model.setScale(scale_x, scale_y, scale_z)
-
-        new_pos_x = original_center_x - (advanced_center_x * scale_x)
-        new_pos_y = original_center_y - (advanced_center_y * scale_y)
-        new_pos_z = original_center_z - (advanced_center_z * scale_z)
-
-        self.processed_model.setPos(new_pos_x, new_pos_y, new_pos_z)
-
-        target_model_copy = target_model.copyTo(target_model.getParent())
-
-        target_model_copy.setScale(scale_x, scale_y, scale_z)
-        target_model_copy.setPos(new_pos_x, new_pos_y, new_pos_z)
-
-        self.processed_model.hide()
-
-        target_model_trimesh = self.panda_app.panda_to_trimesh(target_model_copy)
-        
-        target_model_copy.removeNode()
-        
         return target_model_trimesh
     
     def _evaluate_z_position(self, mesh_np, target_model_trimesh, z, target_volume):
