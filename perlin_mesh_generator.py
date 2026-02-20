@@ -415,37 +415,35 @@ class PerlinMeshGenerator:
         print(f"target_model позиция: {target_model.getPos()}")
         print(f"target_model скрыта? {target_model.isHidden()}")
 
-        # Генерация детального меша
-        perlin_detailed_np = self.generate_perlin_mesh(grid_size=128)
-        # Явно репарентим
-        perlin_detailed_np.reparentTo(self.panda_app.render)
-        perlin_detailed_np.show()
+        # Генерация базового перлин-меша (grid_size=48)
+        perlin_base_np = self.generate_perlin_mesh(grid_size=48)
+        ground_pos = self.panda_app.ground_plane.getPos()
+        perlin_base_np.setPos(ground_pos.x, ground_pos.y, ground_pos.z - 2.25)
+        self.panda_app.loaded_models.append(perlin_base_np)
 
-        # Отключаем текстуры для теста (просто цвет)
-        perlin_detailed_np.setColor(1, 0, 0, 1)  # красный
-        perlin_detailed_np.setTransparency(False)
+        target_volume = self.panda_app.Target_Volume
 
-        # Отладка детального меша
-        print(f"perlin_detailed_np позиция: {perlin_detailed_np.getPos()}")
-        bounds = perlin_detailed_np.getTightBounds()
-        if bounds:
-            print(f"Bounding box: {bounds[0]} - {bounds[1]}")
-        else:
-            print("Нет bounding box — геометрия пуста!")
+        # Поиск оптимальной Z (использует обновлённый _evaluate_z_position)
+        best_z = self.find_best_z_position(
+            perlin_base_np,
+            target_model_trimesh,
+            target_volume,
+            initial_z=perlin_base_np.getZ()
+        )
+        self.last_best_z = best_z
 
-        # Сохраняем ссылки
-        self.perlin_detailed_np = perlin_detailed_np
-        self.target_model = target_model
+        if self.current_display_model is not None:
+            self.current_display_model.removeNode()
+            self.current_display_model = None
 
-        target_model.hide()
-        perlin_detailed_np.hide()
+        perlin_base_np.removeNode()
 
-        perlin_detailed_np.setPos(0,0,-1)
+        # Генерация детального меша (grid_size=128)
+        perlin_detailed_np = self.generate_perlin_mesh(grid_size=512)
+        perlin_detailed_np.setPos(0, 0, best_z)
 
-        target_model.setScale(2,2,2)
-
-        target_vertices, target_indices = self.extract_mesh_data(target_model)
-        perlin_vertices, perlin_indices = self.extract_mesh_data(perlin_detailed_np)
+        # Получаем trimesh детального меша
+        perlin_trimesh = self.panda_app.panda_to_trimesh(perlin_detailed_np)
 
         result_vertices, result_triangles = self.tls_client.send_boolean_request(
             target_vertices,
@@ -454,67 +452,59 @@ class PerlinMeshGenerator:
             perlin_indices,
             return_volume_only=False
         )
+        print(f"[DEBUG] Boolean request completed: vertices={len(result_vertices)}, triangles={len(result_triangles)}")
 
-        self.create_mesh_from_arrays(result_vertices, result_triangles)
+        result_trimesh = trimesh.Trimesh(vertices=result_vertices, faces=result_triangles)
 
-        print("target_model и perlin_detailed_np визуализированы (проверьте позицию).")
-        return True
-    
-    def create_mesh_from_arrays(self, vertices, indices, name="custom_mesh"):
-        """
-        vertices: flat list [x0,y0,z0, x1,y1,z1, ...]
-        indices:  flat list [i0,i1,i2, i3,i4,i5, ...]
-        """
+        self.panda_app.particle_flag = True
+        self.panda_app.final_model = self.panda_app.create_nodepath_from_vertices_triangles(
+            result_vertices, result_triangles, compute_normals=True
+        )
+        self.panda_app.particle_flag = False
 
-        # --- Vertex format (position + normal only) ---
-        fmt = GeomVertexFormat.getV3n3()
-        vdata = GeomVertexData(name, fmt, Geom.UHStatic)
+        # Пересчёт UV (как в оригинале, но используем result_vertices вместо чтения из модели)
+        if self.last_size_x is not None and self.last_size_y is not None:
+            size_x = self.last_size_x
+            size_y = self.last_size_y
+            half_size_x = self.last_half_size_x
+            half_size_y = self.last_half_size_y
+        else:
+            # fallback
+            bounds = self.panda_app.final_model.getTightBounds()
+            min_pt, max_pt = bounds
+            size_x = max_pt.x - min_pt.x
+            size_y = max_pt.y - min_pt.y
+            half_size_x = (min_pt.x + max_pt.x) / 2.0
+            half_size_y = (min_pt.y + max_pt.y) / 2.0
 
-        vertex_writer = GeomVertexWriter(vdata, "vertex")
-        normal_writer = GeomVertexWriter(vdata, "normal")
+        tex_repeat_x = self.panda_app.current_texture_set.get('textureRepeatX', 1.35)
+        tex_repeat_y = self.panda_app.current_texture_set.get('textureRepeatY', 3.2)
 
-        vertex_count = len(vertices)
-        vdata.setNumRows(vertex_count)
+        num_verts = len(result_vertices) // 3
+        print(f"DEBUG: num_verts = {num_verts}, len(result_vertices) = {len(result_vertices)}")
+        texcoords = []
+        for i in range(num_verts):
+            vx = result_vertices[i*3]
+            vy = result_vertices[i*3 + 1]
+            u = ((vx + half_size_x) / size_x) * tex_repeat_x
+            v = ((vy + half_size_y) / size_y) * tex_repeat_y
+            texcoords.extend([u, v])
+        print(f"DEBUG: len(texcoords) = {len(texcoords)} (ожидалось {num_verts * 2})")
 
-        # --- Add vertices ---
-        for i in range(vertex_count):
-            vert = vertices[i]
-            vertex_writer.addData3f(vert[0], vert[1], vert[2])
-            normal_writer.addData3f(0.0, 0.0, 1.0)  # placeholder normals
+        new_model = self.panda_app.create_nodepath_from_vertices_triangles(
+            result_vertices, result_triangles, texcoords=texcoords, compute_normals=True
+        )
+        self.panda_app.final_model.removeNode()
+        self.panda_app.final_model = new_model
 
-        # --- Add triangle indices ---
-        tris = GeomTriangles(Geom.UHStatic)
+        # Применяем текстуры и материал
+        self._apply_textures_and_material(self.panda_app.final_model)
 
-        for i in range(0, len(indices)):
-            inds = indices[i]
-            #for k in range(3):
-            #    ind = inds[k]
-            #    if(ind > )
-
-            tris.addVertices(
-                inds[0],
-                inds[1],
-                inds[2]
-            )
-
-        tris.closePrimitive()
-
-        # --- Build geom ---
-        geom = Geom(vdata)
-        geom.addPrimitive(tris)
-
-        # --- Recalculate normals (reuse your existing function) ---
-        #self._calculate_normals(vdata, geom)
-
-        # --- Create node and attach to render ---
-        node = GeomNode(name)
-        node.addGeom(geom)
-
-        nodepath = self.panda_app.render.attachNewNode(node)
-
-        return nodepath
+        target_model.hide()
+        perlin_detailed_np.hide()
     
     def find_best_z_position(self, mesh_np, target_model_trimesh, target_volume, initial_z=0):
+        """Поиск оптимальной Z-позиции меша для достижения целевого объема"""
         tolerance = 0.2
         min_z = -2
         max_z = 2
@@ -524,68 +514,61 @@ class PerlinMeshGenerator:
         best_volume = None
         best_error = float('inf')
 
-        if self.current_display_model:
+        if hasattr(self, 'current_display_model') and self.current_display_model:
             self.current_display_model.removeNode()
-            self.current_display_model = None
+        self.current_display_model = None
 
-        # Извлекаем локальные вершины и треугольники из mesh_np (без учёта позиции)
-        original_pos = mesh_np.getPos()
-        mesh_np.setPos(0, 0, 0)
-        local_vertices_flat, triangles_flat = self.panda_app.extract_vertices_and_triangles(mesh_np)
-        mesh_np.setPos(original_pos)
-
-        # Преобразуем плоский список в список кортежей для удобства
-        local_verts = [(local_vertices_flat[i], local_vertices_flat[i+1], local_vertices_flat[i+2])
-                    for i in range(0, len(local_vertices_flat), 3)]
-
-        # Поиск по сетке
         search_points = [min_z + (max_z - min_z) * i / 10 for i in range(11)]
         search_volumes = []
 
+        # DEBUG: Начальные параметры
         print("=== DEBUG: Начало поиска best_z ===")
-        print(f"Целевой объем: {target_volume}, допуск: {tolerance}")
+        print(f"Целевой объем: {target_volume}")
+        print(f"Допуск: {tolerance}")
+        print(f"Диапазон поиска: [{min_z}, {max_z}]")
+        print(f"Макс. итераций: {max_iterations}")
+        print(f"Начальные точки поиска ({len(search_points)}): {search_points}")
 
         for z in search_points:
-            # Формируем мировые вершины: добавляем смещение по Z
-            world_verts_flat = []
-            for vx, vy, vz in local_verts:
-                world_verts_flat.extend([vx, vy, vz + z])
-
-            # Отправляем запрос на сервер
-            result_vertices, result_triangles = self.tls_client.send_boolean_request(
-                target_model_trimesh.vertices,
-                target_model_trimesh.faces,
-                world_verts_flat,        # мировые вершины
-                triangles_flat,
-                return_volume_only=False
+            mesh_np.setPos(0, 0, z)
+            perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(mesh_np)
+            
+            result_csg = trimesh.boolean.difference(
+                [target_model_trimesh, perlin_model_trimesh_],
+                engine='blender'
             )
-
-            # Создаём временную модель для отображения и расчёта объёма
-            temp_np = self.panda_app.create_nodepath_from_vertices_triangles(
-                result_vertices, result_triangles, compute_normals=True
-            )
-            self._setup_transparent_material(temp_np)
-
-            if self.current_display_model:
+            
+            model_csg_plane_1 = self.panda_app.trimesh_to_panda(result_csg)
+            self._setup_transparent_material(model_csg_plane_1)
+            
+            if self.current_display_model is not None:
                 self.current_display_model.removeNode()
-            self.current_display_model = temp_np
+            
+            self.current_display_model = model_csg_plane_1
             self.current_display_model.reparentTo(self.panda_app.render)
-
+            
             volume = self.panda_app.calculate_mesh_volume(self.current_display_model)
             error = abs(volume - target_volume)
             search_volumes.append((z, volume, error))
-
-            print(f"  z={z:.4f}: объём={volume:.6f}, ошибка={error:.6f}")
+            
+            # DEBUG: Результаты для каждой точки поиска
+            print(f"  z={z:.4f}: объем={volume:.6f}, ошибка={error:.6f}, best_error={best_error:.6f}, best_z={best_z:.4f}")
+            
             if error < best_error:
                 best_error = error
                 best_z = z
                 best_volume = volume
-                print(f"    -> НОВЫЙ ЛУЧШИЙ: z={best_z:.4f}")
-
+                print(f"    -> НОВЫЙ ЛУЧШИЙ! Обновлен best_z={best_z:.4f}, best_error={best_error:.6f}")
+        
+        # DEBUG: Результаты начального поиска
+        print(f"\n=== DEBUG: Результаты начального поиска ===")
+        print(f"Лучшая точка: z={best_z:.4f}, объем={best_volume:.6f}, ошибка={best_error:.6f}")
+        
         if best_error <= tolerance:
             mesh_np.setPos(0, 0, best_z)
-            if self.current_display_model:
+            if self.current_display_model is not None:
                 self.current_display_model.removeNode()
+            print(f"Достигнута требуемая точность! Возвращаем best_z={best_z:.4f}")
             return best_z
 
         search_volumes.sort(key=lambda x: x[2])
@@ -889,70 +872,69 @@ class PerlinMeshGenerator:
         return NodePath(geom_node)
     
     def _prepare_target_model_for_boolean(self, target_model):
-        """Подготавливает целевую модель для boolean операций (только Panda3D, без trimesh)"""
-        # Мировые границы исходной модели (с учётом её текущих трансформаций)
-        original_min, original_max = target_model.getTightBounds()
-        orig_size_x = original_max.x - original_min.x
-        orig_size_y = original_max.y - original_min.y
-        orig_size_z = original_max.z - original_min.z
-        orig_center_x = (original_min.x + original_max.x) * 0.5
-        orig_center_y = (original_min.y + original_max.y) * 0.5
-        orig_center_z = (original_min.z + original_max.z) * 0.5
+        """Подготавливает целевую модель для boolean операций"""
+        original_min_bound, original_max_bound = target_model.getTightBounds()
 
-        # Копия модели – сбрасываем трансформации, чтобы получить локальные границы геометрии
-        model_copy = target_model.copyTo(target_model.getParent())
-        model_copy.setPos(0, 0, 0)
-        model_copy.setScale(1, 1, 1)
-        model_copy.setHpr(0, 0, 0)
+        original_size_x = original_max_bound.x - original_min_bound.x
+        original_size_y = original_max_bound.y - original_min_bound.y
+        original_size_z = original_max_bound.z - original_min_bound.z
 
-        # Локальные границы (геометрия без каких-либо трансформаций)
-        local_min, local_max = model_copy.getTightBounds()
-        local_size_x = local_max.x - local_min.x
-        local_size_y = local_max.y - local_min.y
-        local_size_z = local_max.z - local_min.z
-        local_center_x = (local_min.x + local_max.x) * 0.5
-        local_center_y = (local_min.y + local_max.y) * 0.5
-        local_center_z = (local_min.z + local_max.z) * 0.5
+        original_center_x = (original_min_bound.x + original_max_bound.x) / 2
+        original_center_y = (original_min_bound.y + original_max_bound.y) / 2
+        original_center_z = (original_min_bound.z + original_max_bound.z) / 2
 
-        # Масштаб, приводящий локальные размеры к оригинальным
-        scale_x = orig_size_x / local_size_x if local_size_x != 0 else 1.0
-        scale_y = orig_size_y / local_size_y if local_size_y != 0 else 1.0
-        scale_z = orig_size_z / local_size_z if local_size_z != 0 else 1.0
-        model_copy.setScale(scale_x, scale_y, scale_z)
+        target_model_trimesh = self.panda_app.panda_to_trimesh(target_model)
 
-        # Извлечение геометрических данных из подготовленной копии
-        verts_flat, tris_flat = self.panda_app.extract_vertices_and_triangles(model_copy)
+        self.processed_model = self.panda_app.trimesh_to_panda(target_model_trimesh)
 
-        # Преобразование плоских списков в формат, аналогичный trimesh (списки троек)
-        vertices = [verts_flat[i:i+3] for i in range(0, len(verts_flat), 3)]
-        faces    = [tris_flat[i:i+3]   for i in range(0, len(tris_flat), 3)]
+        target_model_trimesh = None
 
-        # Временная копия больше не нужна
-        model_copy.removeNode()
+        advanced_min_bound, advanced_max_bound = self.processed_model.getTightBounds()
 
-        # Простая обёртка, имитирующая наличие атрибутов .vertices и .faces
-        class DummyTrimesh:
-            def __init__(self, vertices, faces):
-                self.vertices = vertices
-                self.faces = faces
+        advanced_size_x = advanced_max_bound.x - advanced_min_bound.x
+        advanced_size_y = advanced_max_bound.y - advanced_min_bound.y
+        advanced_size_z = advanced_max_bound.z - advanced_min_bound.z
 
-        return DummyTrimesh(vertices, faces)
+        advanced_center_x = (advanced_min_bound.x + advanced_max_bound.x) / 2
+        advanced_center_y = (advanced_min_bound.y + advanced_max_bound.y) / 2
+        advanced_center_z = (advanced_min_bound.z + advanced_max_bound.z) / 2
+
+        scale_x = original_size_x / advanced_size_x
+        scale_y = original_size_y / advanced_size_y
+        scale_z = original_size_z / advanced_size_z
+
+        self.processed_model.setScale(scale_x, scale_y, scale_z)
+
+        new_pos_x = original_center_x - (advanced_center_x * scale_x)
+        new_pos_y = original_center_y - (advanced_center_y * scale_y)
+        new_pos_z = original_center_z - (advanced_center_z * scale_z)
+
+        self.processed_model.setPos(new_pos_x, new_pos_y, new_pos_z)
+
+        target_model_copy = target_model.copyTo(target_model.getParent())
+
+        target_model_copy.setScale(scale_x, scale_y, scale_z)
+        target_model_copy.setPos(new_pos_x, new_pos_y, new_pos_z)
+
+        self.processed_model.hide()
+
+        target_model_trimesh = self.panda_app.panda_to_trimesh(target_model_copy)
+        
+        target_model_copy.removeNode()
+        
+        return target_model_trimesh
     
     def _evaluate_z_position(self, mesh_np, target_model_trimesh, z, target_volume):
-        original_pos = mesh_np.getPos()
-        mesh_np.setPos(0, 0, 0)
-        local_verts_flat, tris_flat = self.panda_app.extract_vertices_and_triangles(mesh_np)
-        mesh_np.setPos(original_pos)
+        """Оценивает объём при заданной Z с помощью сервера (возвращает только объём)"""
+        mesh_np.setPos(0, 0, z)
+        perlin_trimesh = self.panda_app.panda_to_trimesh(mesh_np)
 
-        world_verts_flat = []
-        for i in range(0, len(local_verts_flat), 3):
-            world_verts_flat.extend([local_verts_flat[i], local_verts_flat[i+1], local_verts_flat[i+2] + z])
-
+        # Запрос только объёма
         volume = self.tls_client.send_boolean_request(
             target_model_trimesh.vertices,
             target_model_trimesh.faces,
-            world_verts_flat,
-            tris_flat,
+            perlin_trimesh.vertices,
+            perlin_trimesh.faces,
             return_volume_only=True
         )
         error = abs(volume - target_volume)

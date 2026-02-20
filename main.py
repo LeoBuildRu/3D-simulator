@@ -1,127 +1,3 @@
-# ---------------------------------------------------------------------
-# .dll для билда
-# ---------------------------------------------------------------------
-# import os
-# import sys
-# import ctypes
-# import yaml
-# 
-# if getattr(sys, 'frozen', False):
-#     basedir = os.path.dirname(sys.executable)
-#     internal_dir = os.path.join(basedir, '_internal')
-# 
-#     # Меняем рабочую директорию на папку с exe
-#     os.chdir(basedir)
-#     print(f"[INFO] Рабочая директория изменена на: {os.getcwd()}")
-# 
-#     # Добавляем пути для поиска DLL
-#     if hasattr(os, 'add_dll_directory'):
-#         os.add_dll_directory(basedir)
-#         if os.path.exists(internal_dir):
-#             os.add_dll_directory(internal_dir)
-# 
-#     # Список DLL
-#     dlls_to_try = [
-#         'libpanda.dll',
-#         'libpandaexpress.dll',
-#         'libp3framework.dll',
-#         'libp3dtool.dll',
-#         'libp3direct.dll',
-#         'libp3openal.dll',
-#         'libp3windisplay.dll',
-#         'libpandagl.dll'
-#     ]
-# 
-#     for dll in dlls_to_try:
-#         dll_path = os.path.join(basedir, dll)
-#         if not os.path.exists(dll_path):
-#             dll_path = os.path.join(internal_dir, dll)
-#         try:
-#             if os.path.exists(dll_path):
-#                 ctypes.CDLL(dll_path)
-#                 print(f"[DLL] Successfully loaded {dll_path}")
-#             else:
-#                 print(f"[DLL] {dll} not found")
-#         except Exception as e:
-#             print(f"[DLL] Failed to load {dll_path}: {e}")
-# 
-#     # --- Диагностика и поиск ресурсов ---
-#     print("[DEBUG] Содержимое basedir (первые 20):")
-#     try:
-#         for f in os.listdir(basedir)[:20]:
-#             print("  ", f)
-#     except:
-#         pass
-# 
-#     print("[DEBUG] Содержимое internal_dir (первые 20):")
-#     try:
-#         for f in os.listdir(internal_dir)[:20]:
-#             print("  ", f)
-#     except:
-#         pass
-# 
-#     # Поиск конфигов
-#     models_cfg = None
-#     for loc in [basedir, internal_dir]:
-#         p = os.path.join(loc, 'models_config.yaml')
-#         if os.path.exists(p):
-#             models_cfg = p
-#             break
-# 
-#     textures_cfg = None
-#     for loc in [basedir, internal_dir]:
-#         p = os.path.join(loc, 'textures_config.yaml')
-#         if os.path.exists(p):
-#             textures_cfg = p
-#             break
-# 
-#     print(f"[DEBUG] models_config.yaml найден: {models_cfg}")
-#     print(f"[DEBUG] textures_config.yaml найден: {textures_cfg}")
-# 
-#     # Загружаем конфиги
-#     models_config_data = None
-#     textures_config_data = None
-# 
-#     if models_cfg:
-#         with open(models_cfg, 'r', encoding='utf-8') as f:
-#             models_config_data = yaml.safe_load(f)
-#         print(f"[INFO] Загружен models_config, ключи: {list(models_config_data.keys()) if models_config_data else []}")
-# 
-#     if textures_cfg:
-#         with open(textures_cfg, 'r', encoding='utf-8') as f:
-#             textures_config_data = yaml.safe_load(f)
-#         print(f"[INFO] Загружен textures_config, ключи: {list(textures_config_data.keys()) if textures_config_data else []}")
-# 
-#     # Поиск папок models и textures
-#     models_dir = None
-#     for loc in [basedir, internal_dir]:
-#         d = os.path.join(loc, 'models')
-#         if os.path.isdir(d):
-#             models_dir = d
-#             break
-# 
-#     textures_dir = None
-#     for loc in [basedir, internal_dir]:
-#         d = os.path.join(loc, 'textures')
-#         if os.path.isdir(d):
-#             textures_dir = d
-#             break
-# 
-#     print(f"[DEBUG] Папка models найдена: {models_dir}")
-#     print(f"[DEBUG] Папка textures найдена: {textures_dir}")
-# 
-# else:
-#     # Не frozen (режим разработки)
-#     basedir = os.path.dirname(os.path.abspath(__file__))
-#     os.chdir(basedir)
-#     print("[INFO] Режим разработки, рабочая директория:", os.getcwd())
-# 
-# from panda3d.core import loadPrcFileData
-# loadPrcFileData("", "load-display pandagl")
-# loadPrcFileData("", "aux-display pandagl")
-
-
-
 from gui import CameraControlGUI
 from panda_widget import Panda3DWidget
 from depth_map_renderer import DepthMapRenderer
@@ -779,7 +655,7 @@ class MyApp(ShowBase):
             while not vertex_reader.isAtEnd():
                 pos = vertex_reader.getData3f()
                 pos = transform.xformPoint(pos)
-                vertices.append([pos.x, pos.y, pos.z])
+                vertices.append([pos.x, pos.z, pos.y])
             
             for j in range(geom.getNumPrimitives()):
                 prim = geom.getPrimitive(j)
@@ -817,7 +693,7 @@ class MyApp(ShowBase):
         texcoord_writer = GeomVertexWriter(vdata, "texcoord")
         
         for i, vertex in enumerate(vertices):
-            vertex_writer.addData3f(vertex[0], vertex[1], vertex[2])
+            vertex_writer.addData3f(vertex[0], vertex[2], vertex[1])
             
             if i < len(normals):
                 normal = normals[i]
@@ -886,175 +762,7 @@ class MyApp(ShowBase):
         indices_np = np.array(indices, dtype=np.int32)
 
         return vertices_np, indices_np
-    
-    def extract_vertices_and_triangles(self, node_path):
-        """
-        Извлекает вершины (в локальных координатах) и индексы треугольников из NodePath.
-        Возвращает:
-            vertices_flat: список float [x0,y0,z0, x1,y1,z1, ...]
-            triangles_flat: список int [i0,i1,i2, i3,i4,i5, ...]
-        """
-        geom_node = node_path.node()
-        if not isinstance(geom_node, GeomNode):
-            geom_node = node_path.find("**/+GeomNode").node()
 
-        vertices = []
-        triangles = []
-
-        for i in range(geom_node.getNumGeoms()):
-            geom = geom_node.getGeom(i)
-            vdata = geom.getVertexData()
-            vertex_reader = GeomVertexReader(vdata, "vertex")
-
-            # Собираем локальные вершины
-            local_verts = []
-            while not vertex_reader.isAtEnd():
-                v = vertex_reader.getData3f()
-                local_verts.append((v.x, v.y, v.z))
-            vertices.extend(local_verts)
-
-            # Обрабатываем примитивы
-            for j in range(geom.getNumPrimitives()):
-                prim = geom.getPrimitive(j)
-                prim = prim.decompose()  # приводим к треугольникам
-                if isinstance(prim, GeomTriangles):
-                    for k in range(prim.getNumPrimitives()):
-                        start = prim.getPrimitiveStart(k)
-                        end = prim.getPrimitiveEnd(k)
-                        for idx in range(start, end):
-                            vi = prim.getVertex(idx)
-                            triangles.append(vi)
-
-        # Преобразуем в плоские списки
-        vertices_flat = [coord for v in vertices for coord in v]
-        return vertices_flat, triangles
-
-    def create_nodepath_from_vertices_triangles(self, vertices_flat, triangles, texcoords=None, compute_normals=True):
-        # Преобразуем vertices_flat в плоский список float
-        if isinstance(vertices_flat, np.ndarray):
-            vertices_flat = vertices_flat.flatten().tolist()
-        num_verts = len(vertices_flat) // 3
-        vertices = np.array(vertices_flat, dtype=np.float32).reshape(-1, 3)
-
-        # --- Приведение треугольников к плоскому списку целых чисел ---
-        if isinstance(triangles, np.ndarray):
-            # Если это массив формы (N,3), делаем flatten
-            if triangles.ndim == 2:
-                triangles = triangles.flatten().tolist()
-            else:
-                triangles = triangles.tolist()
-        elif isinstance(triangles, list) and len(triangles) > 0:
-            # Проверяем, не является ли первый элемент списком
-            if isinstance(triangles[0], (list, tuple, np.ndarray)):
-                flat = []
-                for tri in triangles:
-                    flat.extend(tri)
-                triangles = flat
-        # Теперь triangles должен быть плоским списком
-        # Принудительно преобразуем все элементы в int
-        triangles = [int(idx) for idx in triangles]
-
-        # Вычисляем нормали (если требуется)
-        if compute_normals:
-            faces_np = np.array(triangles, dtype=np.int32).reshape(-1, 3)
-            # Используем trimesh для вычисления нормалей (это временно, пока не реализован свой расчёт)
-            temp_mesh = trimesh.Trimesh(vertices=vertices, faces=faces_np, process=False)
-            normals = temp_mesh.vertex_normals.astype(np.float32)
-        else:
-            normals = np.zeros_like(vertices)
-            normals[:, 2] = 1.0
-
-        if texcoords is None:
-            texcoords = np.zeros((num_verts, 2), dtype=np.float32)
-        else:
-            if isinstance(texcoords, np.ndarray):
-                texcoords = texcoords.flatten().tolist()
-            texcoords = np.array(texcoords, dtype=np.float32).reshape(-1, 2)
-            
-            # Проверка соответствия количества UV количеству вершин
-            if texcoords.shape[0] != num_verts:
-                print(f"WARNING: Количество UV ({texcoords.shape[0]}) не равно количеству вершин ({num_verts}).")
-                if texcoords.shape[0] < num_verts:
-                    # Дополняем нулями недостающие строки
-                    padding = np.zeros((num_verts - texcoords.shape[0], 2), dtype=np.float32)
-                    texcoords = np.vstack([texcoords, padding])
-                    print(f"  Добавлено {num_verts - texcoords.shape[0]} UV-пар.")
-                else:
-                    # Обрезаем лишние строки
-                    texcoords = texcoords[:num_verts, :]
-                    print(f"  Обрезано до {num_verts} UV-пар.")
-
-        # Создание геометрии Panda3D
-        format = GeomVertexFormat.getV3n3t2()
-        vdata = GeomVertexData("mesh", format, Geom.UHStatic)
-
-        vertex_writer = GeomVertexWriter(vdata, "vertex")
-        normal_writer = GeomVertexWriter(vdata, "normal")
-        texcoord_writer = GeomVertexWriter(vdata, "texcoord")
-
-        for i in range(num_verts):
-            vertex_writer.addData3f(vertices[i, 0], vertices[i, 1], vertices[i, 2])
-            normal_writer.addData3f(normals[i, 0], normals[i, 1], normals[i, 2])
-            texcoord_writer.addData2f(texcoords[i, 0], texcoords[i, 1])
-
-        # Заполнение треугольников
-        prim = GeomTriangles(Geom.UHStatic)
-        for i in range(0, len(triangles), 3):
-            prim.addVertices(triangles[i], triangles[i+1], triangles[i+2])
-        prim.closePrimitive()
-
-        geom = Geom(vdata)
-        geom.addPrimitive(prim)
-        node = GeomNode("mesh_from_data")
-        node.addGeom(geom)
-
-        return self.render.attachNewNode(node)
-    
-    def extract_world_vertices_and_triangles(self, node_path):
-        """
-        Извлекает вершины (в мировых координатах) и индексы треугольников из NodePath.
-        Возвращает:
-            vertices_flat: список float [x0,y0,z0, x1,y1,z1, ...] в мировых координатах
-            triangles_flat: список int [i0,i1,i2, i3,i4,i5, ...]
-        """
-        geom_node = node_path.node()
-        if not isinstance(geom_node, GeomNode):
-            geom_node = node_path.find("**/+GeomNode").node()
-
-        # Получаем матрицу трансформации узла в мировые координаты
-        transform = node_path.getNetTransform().getMat()
-
-        vertices = []
-        triangles = []
-
-        for i in range(geom_node.getNumGeoms()):
-            geom = geom_node.getGeom(i)
-            vdata = geom.getVertexData()
-            vertex_reader = GeomVertexReader(vdata, "vertex")
-
-            # Читаем локальные вершины и сразу преобразуем в мировые
-            local_verts = []
-            while not vertex_reader.isAtEnd():
-                v = vertex_reader.getData3f()
-                local_verts.append(v)
-
-            world_verts = [transform.xformPoint(v) for v in local_verts]
-            for wv in world_verts:
-                vertices.extend([wv.x, wv.y, wv.z])
-
-            # Треугольники (индексы не меняются)
-            for j in range(geom.getNumPrimitives()):
-                prim = geom.getPrimitive(j)
-                prim = prim.decompose()  # гарантируем треугольники
-                if isinstance(prim, GeomTriangles):
-                    for k in range(prim.getNumPrimitives()):
-                        start = prim.getPrimitiveStart(k)
-                        end = prim.getPrimitiveEnd(k)
-                        for idx in range(start, end):
-                            vi = prim.getVertex(idx)
-                            triangles.append(vi)
-
-        return vertices, triangles
 
     def distribute_meshes(self, geom_node):
         if geom_node.getNumGeoms() > 0:
@@ -1768,9 +1476,6 @@ def main():
     
     panda_app = MyApp()
     
-    # build 
-    # control_panel = CameraControlGUI(panda_app, models_config_data, textures_config_data)
-    # local
     control_panel = CameraControlGUI(panda_app)
     control_panel.setMinimumWidth(380)
     control_panel.setMaximumWidth(380)
