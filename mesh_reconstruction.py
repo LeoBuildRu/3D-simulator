@@ -20,8 +20,9 @@ import pstats
 import io
 
 class MeshReconstruction:
-    def __init__(self, panda_app):
+    def __init__(self, panda_app, tls_client=None):
         self.panda_app = panda_app
+        self.tls_client = tls_client
         self.recon_json_path = ""
 
         # for testing only
@@ -38,7 +39,7 @@ class MeshReconstruction:
         self.extrapolation_enabled = False
         self.target_width = 4.0  # Ширина целевой области в метрах
         self.target_height = 8.0  # Высота целевой области в метрах
-        self.grid_resolution = 1024  # Разрешение сетки экстраполяции
+        self.grid_resolution = 128  # Разрешение сетки экстраполяции
         
         # Параметры шума Перлина
         self.noise_scale = 0.5
@@ -1761,21 +1762,33 @@ class MeshReconstruction:
         
         target_model_trimesh = self._prepare_target_model_for_boolean(target_model)
         self.last_target_model_trimesh = target_model_trimesh
-        
         if target_model_trimesh is None:
             target_model.setScale(1.0, 1.0, 1.0)
             return False
-        
         target_model.setScale(1.0, 1.0, 1.0)
         target_model.setPos(0.0, 0.0, 0.0)
-        
+
         mesh_node_trimesh = self.panda_app.panda_to_trimesh(mesh_node)
-        
-        mesh_node_result_trimesh = trimesh.boolean.difference(
-            [target_model_trimesh, mesh_node_trimesh],
-            engine='blender'
-        )
-        
+
+        # Проверяем доступность клиента
+        if self.tls_client is None:
+            print("[ERROR] TLS client not available. Boolean operation cancelled.")
+            return
+
+        try:
+            # Отправляем запрос на сервер для булевой разности
+            result_verts, result_tris = self.tls_client.send_boolean_request(
+                target_model_trimesh.vertices,
+                target_model_trimesh.faces,
+                mesh_node_trimesh.vertices,
+                mesh_node_trimesh.faces,
+                return_volume_only=False
+            )
+            mesh_node_result_trimesh = trimesh.Trimesh(vertices=result_verts, faces=result_tris)
+        except Exception as e:
+            print(f"[ERROR] Boolean operation via TLS client failed: {e}")
+            return
+
         final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
         
         # ВАЖНО: После boolean операции нужно правильно установить UV-координаты

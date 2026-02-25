@@ -30,15 +30,12 @@ from panda3d.core import (
     Filename  
 )
 
-# Импортируем клиент для связи с C++ сервером
-from TLS_client import TLS_client
-
 NOISE_AVAILABLE = True
 
 class PerlinMeshGenerator:
     """Класс для генерации перлин-мешей и связанных операций"""
     
-    def __init__(self, panda_app, server_host='78.25.191.12', server_port=9999):
+    def __init__(self, panda_app, tls_client=None, server_host='78.25.191.12', server_port=9999):
         self.panda_app = panda_app
         self.last_target_model_trimesh = None
         self.last_best_z = None
@@ -55,7 +52,11 @@ class PerlinMeshGenerator:
         self.last_half_size_y = None
 
         # Создаём клиент для общения с сервером
-        self.tls_client = TLS_client(host=server_host, port=server_port)
+        if tls_client is not None:
+            self.tls_client = tls_client
+        else:
+            # Для обратной совместимости, если клиент не передан
+            self.tls_client = TLS_client(host=server_host, port=server_port)
         
     def generate_perlin_mesh(self, grid_size=48):
         """Генерация перлин-меша с указанным размером сетки через C++ сервер"""
@@ -267,10 +268,14 @@ class PerlinMeshGenerator:
         perlin_model_trimesh = self.panda_app.panda_to_trimesh(perlin_np)
         
         try:
-            final_result_trimesh = trimesh.boolean.difference(
-                [self.last_target_model_trimesh, perlin_model_trimesh],
-                engine='blender'
+            result_vertices, result_triangles = self.tls_client.send_boolean_request(
+                self.last_target_model_trimesh.vertices,
+                self.last_target_model_trimesh.faces,
+                perlin_model_trimesh.vertices,
+                perlin_model_trimesh.faces,
+                return_volume_only=False
             )
+            final_result_trimesh = trimesh.Trimesh(vertices=result_vertices, faces=result_triangles)
             
             if final_result_trimesh.is_empty:
                 print("Boolean разность вернула пустой меш")
@@ -407,7 +412,7 @@ class PerlinMeshGenerator:
         perlin_base_np.removeNode()
 
         # Генерация детального меша (grid_size=128)
-        perlin_detailed_np = self.generate_perlin_mesh(grid_size=48)
+        perlin_detailed_np = self.generate_perlin_mesh(grid_size=512)
         perlin_detailed_np.setPos(0, 0, best_z)
 
         # Получаем trimesh детального меша
@@ -527,7 +532,7 @@ class PerlinMeshGenerator:
         tolerance = 0.2
         min_z = -2
         max_z = 2
-        max_iterations = -1
+        max_iterations = 50
 
         best_z = initial_z
         best_volume = None
@@ -552,11 +557,14 @@ class PerlinMeshGenerator:
             mesh_np.setPos(0, 0, z)
             perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(mesh_np)
             
-            result_csg = trimesh.boolean.difference(
-                [target_model_trimesh, perlin_model_trimesh_],
-                engine='blender'
+            result_vertices, result_triangles = self.tls_client.send_boolean_request(
+                target_model_trimesh.vertices,
+                target_model_trimesh.faces,
+                perlin_model_trimesh_.vertices,
+                perlin_model_trimesh_.faces,
+                return_volume_only=False
             )
-            
+            result_csg = trimesh.Trimesh(vertices=result_vertices, faces=result_triangles)
             model_csg_plane_1 = self.panda_app.trimesh_to_panda(result_csg)
             self._setup_transparent_material(model_csg_plane_1)
             
@@ -892,7 +900,55 @@ class PerlinMeshGenerator:
     
     def _prepare_target_model_for_boolean(self, target_model):
         """Подготавливает целевую модель для boolean операций"""
+        original_min_bound, original_max_bound = target_model.getTightBounds()
+
+        original_size_x = original_max_bound.x - original_min_bound.x
+        original_size_y = original_max_bound.y - original_min_bound.y
+        original_size_z = original_max_bound.z - original_min_bound.z
+
+        original_center_x = (original_min_bound.x + original_max_bound.x) / 2
+        original_center_y = (original_min_bound.y + original_max_bound.y) / 2
+        original_center_z = (original_min_bound.z + original_max_bound.z) / 2
+
         target_model_trimesh = self.panda_app.panda_to_trimesh(target_model)
+
+        self.processed_model = self.panda_app.trimesh_to_panda(target_model_trimesh)
+
+        target_model_trimesh = None
+
+        advanced_min_bound, advanced_max_bound = self.processed_model.getTightBounds()
+
+        advanced_size_x = advanced_max_bound.x - advanced_min_bound.x
+        advanced_size_y = advanced_max_bound.y - advanced_min_bound.y
+        advanced_size_z = advanced_max_bound.z - advanced_min_bound.z
+
+        advanced_center_x = (advanced_min_bound.x + advanced_max_bound.x) / 2
+        advanced_center_y = (advanced_min_bound.y + advanced_max_bound.y) / 2
+        advanced_center_z = (advanced_min_bound.z + advanced_max_bound.z) / 2
+
+        scale_x = original_size_x / advanced_size_x
+        scale_y = original_size_y / advanced_size_y
+        scale_z = original_size_z / advanced_size_z
+
+        self.processed_model.setScale(scale_x, scale_y, scale_z)
+
+        new_pos_x = original_center_x - (advanced_center_x * scale_x)
+        new_pos_y = original_center_y - (advanced_center_y * scale_y)
+        new_pos_z = original_center_z - (advanced_center_z * scale_z)
+
+        self.processed_model.setPos(new_pos_x, new_pos_y, new_pos_z)
+
+        target_model_copy = target_model.copyTo(target_model.getParent())
+
+        target_model_copy.setScale(scale_x, scale_y, scale_z)
+        target_model_copy.setPos(new_pos_x, new_pos_y, new_pos_z)
+
+        self.processed_model.hide()
+
+        target_model_trimesh = self.panda_app.panda_to_trimesh(target_model_copy)
+        
+        target_model_copy.removeNode()
+        
         return target_model_trimesh
     
     def _evaluate_z_position(self, mesh_np, target_model_trimesh, z, target_volume):

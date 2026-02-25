@@ -2,13 +2,16 @@ import sys
 import os
 from cx_Freeze import setup, Executable
 
+# -----------------------------------------------------
+# ПАПКА ПРОЕКТА
+# -----------------------------------------------------
 current_dir = os.path.abspath(os.getcwd())
 sys.path.append(current_dir)
 sys.path.append(os.path.join(current_dir, "render_pipeline"))
 
-# -----------------------------------------------------------------------------
-# INCLUDE FILES — кладём всё в папки рядом с EXE
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------
+# INCLUDE FILES — кладём всё, что нужно EXE
+# -----------------------------------------------------
 include_files = [
     ("models", "models"),
     ("textures", "textures"),
@@ -17,25 +20,27 @@ include_files = [
     ("models_config.yaml", "models_config.yaml"),
     ("textures_config.yaml", "textures_config.yaml"),
 
-    # RenderPipeline целиком (на всякий случай)
+    ("mesh_distribution.py", "mesh_distribution.py"),
+
+    # RenderPipeline целиком
     ("render_pipeline", "render_pipeline"),
 
-    # RenderPipeline для MountManager (ОБЯЗАТЕЛЬНЫЕ ПАПКИ)
+    # RenderPipeline (обязательные папки)
     ("render_pipeline/config", "lib/config"),
     ("render_pipeline/effects", "lib/effects"),
     ("render_pipeline/data", "lib/data"),
     ("render_pipeline/rpplugins", "lib/rpplugins"),
 ]
 
-# ЕСЛИ хочешь копировать rpplugins в lib (необязательно, но можно)
-include_files += [
-    ("render_pipeline/rpplugins", "lib/rpplugins"),
-]
+# 🔥 ВАЖНО: включаем исходники Warp (иначе Inspect ломается)
+# cx_Freeze обычно кладёт только .pyc → Warp не работает без .py
+import warp
+warp_path = os.path.dirname(warp.__file__)
+include_files.append((warp_path, "warp"))
 
-
-# -----------------------------------------------------------------------------
-# PACKAGES — оставляем всё как у тебя
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------
+# PACKAGES
+# -----------------------------------------------------
 packages = [
     "yaml", "trimesh", "numpy", "scipy", "PIL", "tkinter",
     "panda3d", "direct", "noise", "warp", "point_cloud_utils",
@@ -55,10 +60,9 @@ packages = [
     "render_pipeline.rpplugins",
 ]
 
-
-# -----------------------------------------------------------------------------
-# EXCLUDES — оставляем
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------
+# EXCLUDES
+# -----------------------------------------------------
 excludes = [
     "unittest", "test",
     "PyQt5.QtQml", "PyQt5.QtQuick",
@@ -68,23 +72,28 @@ excludes = [
     "render_pipeline.rplibs.yaml.yaml_py3",
 ]
 
-
-# -----------------------------------------------------------------------------
-# OPTIONS
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------
+# BUILD OPTIONS
+# -----------------------------------------------------
 build_exe_options = {
     "packages": packages,
     "excludes": excludes,
     "include_files": include_files,
+
+    # ❗ ВАЖНО: Оставляем .py-файлы, иначе Warp ломается
+    "optimize": 0,
+
+    # ❗ Ничего не упаковываем в ZIP → исходники доступны Warp
     "zip_include_packages": "",
     "zip_exclude_packages": "*",
+
+    # Для Windows (MSVC runtime)
     "include_msvcr": True,
 }
 
-
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------
 # EXECUTABLE
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------
 executables = [
     Executable(
         script="main.py",
@@ -93,10 +102,9 @@ executables = [
     )
 ]
 
-
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------
 # SETUP
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------
 setup(
     name="3D Simulator",
     version="1.0",

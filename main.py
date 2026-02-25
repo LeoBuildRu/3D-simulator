@@ -1,3 +1,17 @@
+import sys
+import os
+
+# Если приложение скомпилировано, базовый путь — каталог с exe,
+# иначе — текущая директория (для разработки)
+if getattr(sys, 'frozen', False):
+    base_path = os.path.dirname(sys.executable)
+else:
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+# Вставляем базовый путь в начало sys.path, чтобы локальные копии модулей имели приоритет
+sys.path.insert(0, base_path)
+
+# Теперь можно импортировать остальные модули
 from gui import CameraControlGUI
 from panda_widget import Panda3DWidget
 from depth_map_renderer import DepthMapRenderer
@@ -5,6 +19,7 @@ from perlin_mesh_generator import PerlinMeshGenerator
 from renderer_utils import RendererUtils
 from mesh_reconstruction import MeshReconstruction
 from mesh_distribution import MeshDistributor
+from TLS_client import TLS_client
 
 import sys
 import os
@@ -285,10 +300,12 @@ class MyApp(ShowBase):
 
         self.mesh_distributions = []
 
-        self.perlin_generator = PerlinMeshGenerator(self)
+        self.tls_client = TLS_client(host='78.25.191.12', port=9999, timeout=300.0)
+
+        self.perlin_generator = PerlinMeshGenerator(self, tls_client=self.tls_client)
         self.renderer_utils = RendererUtils(self)
 
-        self.mesh_reconstruction = MeshReconstruction(self)
+        self.mesh_reconstruction = MeshReconstruction(self, tls_client=self.tls_client)
 
     def setup_window_for_parenting(self, parent_hwnd):
         if hasattr(self, 'win') and self.win:
@@ -567,39 +584,54 @@ class MyApp(ShowBase):
                     break
 
         if target_model is None:
-            if self.loaded_models:
-                for model in self.loaded_models:
-                    model_id = id(model)
             return False
 
         min_point, max_point = target_model.getTightBounds()
         aabb_center = (min_point + max_point) / 2.0
         aabb_size = max_point - min_point
-        
+
         ground_pos = self.ground_plane.getPos()
-        
         plane_thickness = 0.05
-        
+
         full_plane_mesh = trimesh.creation.box(
             extents=[self.plane_size_x, self.plane_size_y, plane_thickness]
         )
-        
+
         aabb_mesh = trimesh.creation.box(
             extents=[aabb_size.x, aabb_size.y, aabb_size.z]
         )
-        
+
         aabb_transform = trimesh.transformations.translation_matrix([
             aabb_center.x - ground_pos.x,
             aabb_center.y - ground_pos.y, 
             aabb_center.z - ground_pos.z
         ])
         aabb_mesh.apply_transform(aabb_transform)
-        
-        result_mesh = full_plane_mesh.intersection(aabb_mesh, engine='blender')
-        
-        if result_mesh.is_empty:
+
+        # --- Замена локальной boolean на удалённый вызов через TLS клиент ---
+        if not hasattr(self, 'tls_client') or self.tls_client is None:
+            print("[ERROR] TLS client not available. Cannot perform intersection.")
             return False
-            
+
+        try:
+            # Отправляем запрос на сервер для пересечения
+            result_verts, result_tris = self.tls_client.send_boolean_intersection(
+                full_plane_mesh.vertices,
+                full_plane_mesh.faces,
+                aabb_mesh.vertices,
+                aabb_mesh.faces,
+                return_volume_only=False
+            )
+            # Создаём меш из полученных данных
+            result_mesh = trimesh.Trimesh(vertices=result_verts, faces=result_tris)
+            if result_mesh.is_empty:
+                print("[WARN] Intersection result is empty.")
+                return False
+        except Exception as e:
+            print(f"[ERROR] Boolean intersection via TLS client failed: {e}")
+            return False
+        # ----------------------------------------------------------------
+
         csg_result_panda = self.trimesh_to_panda(result_mesh)
 
         material = Material()
@@ -625,7 +657,7 @@ class MyApp(ShowBase):
 
         if not hasattr(self, 'csg_results'):
             self.csg_results = []
-        
+
         self.csg_results.append({
             "target_model_path": target_model_path,
             "result_node": csg_result_panda,
@@ -637,70 +669,43 @@ class MyApp(ShowBase):
         return True
 
     def panda_to_trimesh(self, node_path):
-        from panda3d.core import GeomNode, GeomVertexReader, GeomTriangles
-        import numpy as np
-        import trimesh
-
-        # Ensure we have a GeomNodePath
-        if not isinstance(node_path.node(), GeomNode):
-            node_path = node_path.find("**/+GeomNode")
-            if node_path.isEmpty():
-                return None
-
         geom_node = node_path.node()
-
-        # IMPORTANT: use the GeomNode's world transform
+        if not isinstance(geom_node, GeomNode):
+            geom_node_path = node_path.find("**/+GeomNode")
+            geom_node = geom_node_path.node()
+        
         transform = node_path.getNetTransform().getMat()
-
+        
         vertices = []
         faces = []
-        vertex_offset = 0
-
+        
         for i in range(geom_node.getNumGeoms()):
             geom = geom_node.getGeom(i)
             vdata = geom.getVertexData()
-
-            # ---- Read vertices ----
+            
             vertex_reader = GeomVertexReader(vdata, "vertex")
-
-            geom_vertices = []
             while not vertex_reader.isAtEnd():
                 pos = vertex_reader.getData3f()
-
-                # Convert to world-space
-                world_pos = transform.xformPoint(pos)
-
-                geom_vertices.append([world_pos.x, world_pos.y, world_pos.z])
-
-            vertices.extend(geom_vertices)
-
-            # ---- Read faces ----
+                pos = transform.xformPoint(pos)
+                vertices.append([pos.x, pos.y, pos.z])
+            
             for j in range(geom.getNumPrimitives()):
-                prim = geom.getPrimitive(j).decompose()
-
+                prim = geom.getPrimitive(j)
                 if isinstance(prim, GeomTriangles):
                     for k in range(prim.getNumPrimitives()):
-                        s = prim.getPrimitiveStart(k)
-                        e = prim.getPrimitiveEnd(k)
-
+                        start = prim.getPrimitiveStart(k)
+                        end = prim.getPrimitiveEnd(k)
                         face = []
-                        for idx in range(s, e):
+                        for idx in range(start, end):
                             vi = prim.getVertex(idx)
-                            face.append(vi + vertex_offset)
-
+                            face.append(vi)
                         if len(face) == 3:
                             faces.append(face)
-
-            vertex_offset += len(geom_vertices)
-
+        
         if not vertices or not faces:
             return None
-
-        return trimesh.Trimesh(
-            vertices=np.array(vertices, dtype=np.float32),
-            faces=np.array(faces, dtype=np.int64),
-            process=False
-        )
+            
+        return trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(faces))
 
     def trimesh_to_panda(self, trimesh_mesh):
         vertices = trimesh_mesh.vertices
@@ -807,55 +812,6 @@ class MyApp(ShowBase):
                 distrib.distribute(vertices_np, indices_np, data['count'], seed=data['seed'])
                 distrib.start_rendering(model1, data['size'], data['size_var'])
                 self.mesh_distributions.append(distrib)
-
-    def create_panda_mesh_from_data(self, vertices, triangles, texcoords=None):
-        """Создаёт NodePath из массивов numpy с опциональными UV и автоматически вычисленными нормалями"""
-        vertices = np.asarray(vertices, dtype=np.float32)
-        triangles = np.asarray(triangles, dtype=np.uint32)
-
-        # Создаём временный меш для вычисления нормалей
-        temp_mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, process=False)
-        normals = temp_mesh.vertex_normals.astype(np.float32)
-
-        # Если нормали не вычислились (например, меш пустой или некорректный), ставим заглушку
-        if len(normals) != len(vertices):
-            normals = np.zeros_like(vertices)
-            normals[:, 2] = 1.0  # направление вверх
-
-        # Если UV не переданы, заполняем нулями
-        if texcoords is None:
-            texcoords = np.zeros((len(vertices), 2), dtype=np.float32)
-        else:
-            texcoords = np.asarray(texcoords, dtype=np.float32)
-            if texcoords.shape != (len(vertices), 2):
-                print("Предупреждение: неверная размерность texcoords, используются нули")
-                texcoords = np.zeros((len(vertices), 2), dtype=np.float32)
-
-        # Создание геометрии Panda3D
-        format = GeomVertexFormat.getV3n3t2()
-        vdata = GeomVertexData("mesh_data", format, Geom.UHStatic)
-
-        vertex_writer = GeomVertexWriter(vdata, "vertex")
-        normal_writer = GeomVertexWriter(vdata, "normal")
-        texcoord_writer = GeomVertexWriter(vdata, "texcoord")
-
-        for i in range(len(vertices)):
-            vertex_writer.addData3f(vertices[i,0], vertices[i,1], vertices[i,2])
-            normal_writer.addData3f(normals[i,0], normals[i,1], normals[i,2])
-            texcoord_writer.addData2f(texcoords[i,0], texcoords[i,1])
-
-        prim = GeomTriangles(Geom.UHStatic)
-        for tri in triangles:
-            prim.addVertices(int(tri[0]), int(tri[1]), int(tri[2]))
-        prim.closePrimitive()
-
-        geom = Geom(vdata)
-        geom.addPrimitive(prim)
-        node = GeomNode("mesh_with_uv")
-        node.addGeom(geom)
-
-        result_np = self.render.attachNewNode(node)
-        return result_np
 
     def create_ground_plane(self):
         if self.ground_plane:
@@ -1404,7 +1360,8 @@ class MyApp(ShowBase):
             if os.path.exists(napolnitel_path):
                 napolnitel_model = self.load_gltf_model(napolnitel_path)
                 if napolnitel_model:
-                    napolnitel_model.hide()
+                    # napolnitel_model.hide()
+                    # napolnitel_model.set_p(90)
                     models_loaded.append('napolnitel')
                     self.Target_Napolnitel = os.path.basename(napolnitel_path)
                     self.current_napolnitel_path = napolnitel_path
@@ -1482,9 +1439,8 @@ def main():
     
     main_window = QMainWindow()
     main_window.setWindowTitle('3D simulator')
-    
-    main_window.resize(2300, 1080)
-    main_window.setMinimumSize(2300, 1080)
+    main_window.resize(1400, 800)               # начальный размер окна
+    main_window.setMinimumSize(1024, 600)       # минимальный размер
     
     central_widget = QWidget()
     main_layout = QHBoxLayout(central_widget)
@@ -1492,11 +1448,10 @@ def main():
     main_layout.setSpacing(0)
     
     panda_container = QWidget()
-    panda_container.setMinimumSize(1920, 1080)  
-    panda_container.setMaximumSize(1920, 1080)  
+    panda_container.setMinimumSize(640, 480)    # минимальный размер для 3D‑вида
     panda_container.setStyleSheet("background-color: #000000;")
     
-    loadPrcFileData("", "win-size 1920 1080")
+    loadPrcFileData("", "win-size 1024 768")    # начальный размер окна Panda3D
     loadPrcFileData("", "undecorated true")
     loadPrcFileData("", "fullscreen false")
     loadPrcFileData("", "window-type offscreen")
@@ -1504,12 +1459,12 @@ def main():
     panda_app = MyApp()
     
     control_panel = CameraControlGUI(panda_app)
-    control_panel.setMinimumWidth(380)
-    control_panel.setMaximumWidth(380)
-    control_panel.setMinimumHeight(1080)
+    control_panel.setFixedWidth(380)             # ширина панели фиксирована
+    # Панель растягивается по высоте вместе с окном
+    control_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
     
-    main_layout.addWidget(panda_container, 1)
-    main_layout.addWidget(control_panel, 0)
+    main_layout.addWidget(panda_container, 1)    # контейнер занимает всё доступное место
+    main_layout.addWidget(control_panel, 0)      # панель с фиксированной шириной
     
     main_window.setCentralWidget(central_widget)
     
@@ -1520,10 +1475,15 @@ def main():
     timer.timeout.connect(update_panda)
     timer.start(16)
     
+    # Функция обновления размеров встроенного окна Panda3D
+    def update_panda_window():
+        if hasattr(panda_app, 'panda_hwnd') and panda_app.panda_hwnd:
+            rect = panda_container.geometry()
+            win32gui.MoveWindow(panda_app.panda_hwnd, 0, 0, rect.width(), rect.height(), True)
+    
     def initialize_integration():
         if hasattr(panda_app, 'win') and panda_app.win:
-            
-            container_hwnd = panda_container.winId().__int__()
+            container_hwnd = int(panda_container.winId())
             
             def enum_windows_callback(hwnd, results):
                 if win32gui.IsWindowVisible(hwnd):
@@ -1540,33 +1500,30 @@ def main():
                 hwnd = results[0]
                 win32gui.SetParent(hwnd, container_hwnd)
                 
+                # Убираем заголовок и рамки
                 style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
                 style = style & ~(win32con.WS_CAPTION | win32con.WS_THICKFRAME | 
-                                win32con.WS_MINIMIZEBOX | win32con.WS_MAXIMIZEBOX | 
-                                win32con.WS_SYSMENU | win32con.WS_BORDER | 
-                                win32con.WS_DLGFRAME)
+                                 win32con.WS_MINIMIZEBOX | win32con.WS_MAXIMIZEBOX | 
+                                 win32con.WS_SYSMENU | win32con.WS_BORDER | 
+                                 win32con.WS_DLGFRAME)
                 style = style | win32con.WS_CHILD
                 win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
                 
-                win32gui.MoveWindow(hwnd, 0, 0, 1920, 1080, True)
-                
+                # Устанавливаем правильный размер и показываем
+                update_panda_window()
                 win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
                 win32gui.UpdateWindow(hwnd)
                 
                 panda_app.panda_hwnd = hwnd
-                        
-                    
     
     QTimer.singleShot(500, initialize_integration)
     
+    # Таймер для синхронизации размеров при изменении окна
     position_timer = QTimer()
-    position_timer.timeout.connect(lambda: 
-        win32gui.MoveWindow(panda_app.panda_hwnd, 0, 0, 1920, 1080, True) 
-        if hasattr(panda_app, 'panda_hwnd') and panda_app.panda_hwnd else None)
+    position_timer.timeout.connect(update_panda_window)
     position_timer.start(100)
     
     main_window.show()
-    
     sys.exit(app.exec_())
 
 

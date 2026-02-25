@@ -1,0 +1,1710 @@
+<!--VORON--><!--VR37--><!--settings{"cls":"uc-catalog","uid":"160999850272","currency":"₽","pricenumber":"2","second":"false","gpfilts":"undefined","filton":"true","charcon":"true","charcnames":"false","charcalign":"false","autoheighton":"false","gpfavs":"undefined","favon":"true","favimg":"","gppag":"undefined","pagon":"true","pagcls":"uc-paginationBlock","pagpad":"","pagbwidth":"","pagbcolor":"","pagbgact":"","pagcoloract":"","pagbweight":"","pagrad":"","pagbgall":"","pagbcolorall":"","pagobvall":"","pagbfont":"","stocklink":"","stocktext":"","stockop":"","resnums":"","groupmode":"false", "noitemsmessage": ""}settingsend-->
+<style>
+   [class*="vcatimg"] .tn-atom {
+      width: inherit;
+      height: inherit;
+      object-fit: cover;
+      background-size: cover;
+   }
+   [class*="vcatbuy"] .tn-atom *,
+   [class*="vcatbuy"] .t-store__card__imgwrapper {
+      display: none !important;
+   }
+   [class*="vcatbuy"][data-elem-type="button"] .tn-atom,
+   [class*="vcatmore"][data-elem-type="button"] .tn-atom {
+      height: inherit !important;
+   }
+   [class*=" vcatquant"] .tn-form__submit,
+   [class*=" vcatvar"] .tn-form__submit,
+   [class*="vcatmark"] .tn-form__submit {
+      display: none;
+      pointer-events: none;
+   }
+   .vsort [value="Скрыть"],
+   .vsort [value="скрыть"] {
+      display: none !important;
+   }
+   form [name="tovar"] {
+      display: none !important;
+   }
+   [class*=" vsearch"] .tn-form__submit,
+   [class*=" vsort"] .tn-form__submit,
+   [class*="vpricem"] .tn-form__submit {
+      display: none;
+      pointer-events: none;
+   }
+   .vclear {
+      cursor: pointer;
+   }
+   .vclear[style*="display: none"] {
+      pointer-events: none;
+   }
+   .vsort option[value="cкрыть"] {
+      display: none !important;
+   }
+   .vcatpagination {
+      display: flex;
+      justify-content: space-evenly;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 100%;
+   }
+   .vcatpagination > div {
+      padding:;
+      cursor: pointer;
+      background: #;
+      font-family:;
+      border: px solid #;
+      border-radius: px;
+      color: #;
+   }
+   .vpageactive {
+      font-weight:;
+      border: px solid # !important;
+      background: # !important;
+      color: # !important;
+   }
+   .vcatpagprev,
+   .vcatpagnext {
+      opacity: 0;
+      pointer-events: none;
+      cursor: pointer;
+   }
+</style>
+<script>
+   function getResolutionValue(str) {
+      const width = window.innerWidth;
+      const ranges = str
+         .split(",")
+         .map((pair) => {
+            const [breakpoint, value] = pair.split(":");
+            return { breakpoint: Number(breakpoint), value: Number(value) };
+         })
+         .sort((a, b) => a.breakpoint - b.breakpoint);
+      let lastValue = ranges[0].value;
+      for (const { breakpoint, value } of ranges) {
+         if (width < breakpoint) {
+            return lastValue;
+         }
+         lastValue = value;
+      }
+      return lastValue;
+   }
+   function voroncatqueue(object, callBack) {
+      let observer = new MutationObserver(function (mutations) {
+         if (object && Object.keys(object).length > 0) {
+            callBack(object);
+            observer.disconnect();
+         }
+      });
+      observer.observe(document, { childList: true, subtree: true });
+   }
+   let voroncatproducts = {};
+   let voronUpdateOne = (mainclass, product, number) => {
+      let buy = document.querySelector("." + mainclass + " .vcatbuy" + number);
+      let selectedValues = {};
+      let q = document.querySelector(".vcatquant" + number);
+      if (q) {
+         document.querySelector(".vcatquant" + number + " input").value = 1;
+         q.dispatchEvent(new Event("input"));
+      }
+      buy.querySelectorAll(".js-product-edition-option").forEach((element) => {
+         let optionId = element.getAttribute("data-edition-option-id");
+         let selectElement = element.querySelector(
+            ".js-product-edition-option-variants",
+         );
+         let selectedValue = selectElement.value;
+         selectedValues[optionId] = selectedValue;
+      });
+      let filteredItem;
+      let uidToMatch = buy.getAttribute("data-product-uid");
+      voroncatproducts[mainclass].products.forEach((item) => {
+         if (
+            item.editions.some((edition) => String(edition.uid) === uidToMatch)
+         ) {
+            item.editions.forEach((edition) => {
+               if (
+                  Object.entries(selectedValues).every(
+                     ([optionId, selectedValue]) =>
+                        edition[optionId] === selectedValue,
+                  )
+               ) {
+                  filteredItem = edition;
+               }
+            });
+         }
+      });
+      if (!filteredItem) {
+         buy.setAttribute("data-product-inv", 0);
+         buy.setAttribute("data-product-url", "");
+         window.alert(
+            "Товара с такими характеристиками нет в наличии. Измените параметры товара и попробуйте снова.",
+         );
+         return;
+      }
+      let prprice = document.querySelectorAll(
+         "." + mainclass + " .vcatprice" + number + " .tn-atom",
+      );
+      let prvariants = buy.querySelectorAll(".js-product-option-variants");
+      let totalVariantPrice = 0;
+      let replacedPrice;
+      prvariants.forEach((variant) => {
+         let selectedOption = variant.options[variant.selectedIndex];
+         let variantPriceAttribute = selectedOption.getAttribute(
+            "data-product-variant-price",
+         );
+         let variantPrice = 0;
+         if (variantPriceAttribute.startsWith("+")) {
+            variantPrice =
+               parseFloat(variantPriceAttribute.replace("+", "")) || 0;
+            totalVariantPrice += variantPrice;
+         } else {
+            variantPrice = parseFloat(variantPriceAttribute);
+            if (variantPrice > 0) replacedPrice = variantPrice;
+         }
+      });
+      let finalPrice =
+         replacedPrice ||
+         parseFloat(filteredItem.price.replaceAll(" ", "")) + totalVariantPrice;
+      buy.querySelector(".js-product-price").innerText = finalPrice;
+      if (prprice.length > 0)
+         prprice[0].innerHTML =
+            finalPrice
+               .toFixed(2)
+               .toString()
+               .replace(/\B(?=(\d{3})+(?!\d))/g, " ") +
+            " " +
+            "₽";
+      let prpriceold =
+         document.querySelectorAll(
+            "." + mainclass + " .vcatold" + number + " .tn-atom s",
+         ) ||
+         document.querySelectorAll(
+            "." + mainclass + " .vcatold" + number + " .tn-atom",
+         );
+      if (prpriceold.length > 0 && filteredItem.priceold)
+         prpriceold[0].innerHTML =
+            parseFloat(filteredItem.priceold.replaceAll(" ", ""))
+               .toFixed(2)
+               .toString()
+               .replace(/\B(?=(\d{3})+(?!\d))/g, " ") +
+            " " +
+            "₽";
+      let prprsku = document.querySelectorAll(
+         "." + mainclass + " .vcatsku" + number + " .tn-atom",
+      );
+      if (prprsku.length > 0 && filteredItem.sku)
+         prprsku[0].innerHTML = filteredItem.sku;
+      let prprstock = document.querySelectorAll(
+         "." + mainclass + " .vcatstock" + number + " .tn-atom",
+      );
+      if (prprstock.length > 0 && filteredItem.quantity)
+         prprstock[0].innerHTML = "В наличии: " + filteredItem.quantity;
+      let prprgal = document.querySelector(
+         "." + mainclass + " .vcatimg" + number + " .tn-atom",
+      );
+      if (filteredItem.img && prprgal.querySelector(".t-slds__items-wrapper")) {
+         let wrap = prprgal.querySelector(".t-slds__items-wrapper");
+         wrap.setAttribute(
+            "data-slider-pos",
+            prprgal
+               .querySelector('[data-original="' + filteredItem.img + '"]')
+               .closest("[data-slide-index]")
+               .getAttribute("data-slide-index") - 1,
+         );
+         if (wrap.getAttribute("data-slider-pos") > 0) {
+            prprgal.querySelector(".t-slds__arrow-right").click();
+         } else {
+            wrap.setAttribute("data-slider-pos", 2);
+            prprgal.querySelector(".t-slds__arrow-left").click();
+         }
+      }
+      buy.setAttribute("data-product-uid", filteredItem.uid);
+      buy.setAttribute("data-product-inv", filteredItem.quantity);
+      buy.setAttribute("data-product-lid", filteredItem.uid);
+      buy.querySelector(".js-product-img").setAttribute(
+         "style",
+         "background-image: url(" + filteredItem.img + ")",
+      );
+      buy.querySelector(".js-store-prod-sku").innerHTML = filteredItem.sku;
+      buy.querySelector(".js-product-price").innerHTML =
+         finalPrice || filteredItem.price;
+      buy.querySelector(".js-product-price").setAttribute(
+         "data-product-price-def",
+         filteredItem.price,
+      );
+      buy.querySelector(".js-product-price").setAttribute(
+         "data-product-price-def-str",
+         filteredItem.price,
+      );
+   };
+   let voroncatinit = async (mainclass, totalcard, paginclass, uid) => {
+      let getnum = (classString, prefix) => {
+         const re = new RegExp(`\\b${prefix}(\\d+)\\b`);
+         const m = classString.match(re);
+         return m ? Number(m[1]) - 1 : null;
+      };
+      let findNameByValue = (data, searchValue) => {
+         for (const item of data)
+            if (item.values)
+               for (const valueObj of item.values)
+                  if (String(valueObj.value) === String(searchValue))
+                     return item;
+         return null;
+      };
+      let isFormatting = false;
+      let vformatNumber = (input) => {
+         if (isFormatting) return;
+         isFormatting = true;
+         setTimeout(() => {
+            let cursorPosition = input.selectionStart;
+            let value = input.value.replace(/[^\d.]/g, "");
+            let parts = value.split(".");
+            let integerPart = parts[0];
+            let decimalPart = parts.length > 1 ? "." + parts[1] : "";
+            integerPart = integerPart.replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+            input.value = integerPart + decimalPart;
+            input.setSelectionRange(cursorPosition, cursorPosition);
+            isFormatting = false;
+         }, 0);
+      };
+      let firstactivated = document.querySelector(
+         "." + mainclass + " .vcatsectionact [href]",
+      );
+      let filts = [];
+      let checks = [];
+      let linksearch = {};
+      let origfilts;
+      let filtered;
+      let sectn = firstactivated
+         ? firstactivated.getAttribute("href").replace("#", "")
+         : undefined;
+      let sort;
+      let sortadd;
+      let searchedw;
+      let pmax;
+      let pmin;
+      let curpage = 1;
+      let isrefresh;
+      let filtact;
+      let filtdis;
+      let cardstotal = totalcard;
+      let bottomMarg;
+      let vrefreshcat = async (section, size, filter, options, parts) => {
+         let fatherss = document.querySelectorAll("." + mainclass);
+         fatherss.forEach((father) => {
+            father.style.opacity = 0.5;
+            father.style.pointerEvents = "none";
+         });
+         sectn = section;
+         const normalizeFilterChange = (rawFilter) => {
+            if (rawFilter && typeof rawFilter === "object") {
+               return {
+                  value: rawFilter.value || "",
+                  groupValues: rawFilter.groupValues || [],
+               };
+            }
+            return { value: rawFilter, groupValues: [] };
+         };
+         const { value: filterValue, groupValues } =
+            normalizeFilterChange(filter);
+         const rebuildFiltered = () => {
+            if (!origfilts) {
+               filtered = "";
+               return "";
+            }
+            filts = [...new Set(filts)];
+            checks = [...new Set(checks)];
+            const uniqueFilts = filts;
+            const uniqueChecks = checks;
+            let result = "";
+            uniqueFilts.forEach(function (unit) {
+               const meta = findNameByValue(origfilts.filters, unit);
+               if (meta)
+                  result +=
+                     "&filters[" + meta.name + "]=" + encodeURIComponent(unit);
+            });
+            uniqueChecks.forEach(function (unit, idx) {
+               const meta = findNameByValue(origfilts.filters, unit);
+               if (meta)
+                  result +=
+                     "&filters[" +
+                     meta.name +
+                     "][" +
+                     idx +
+                     "]=" +
+                     encodeURIComponent(unit);
+            });
+            filtered = result;
+            return result;
+         };
+         const cleanByGroupValues = () => {
+            if (groupValues && groupValues.length > 0) {
+               filts = filts.filter((item) => !groupValues.includes(item));
+               checks = checks.filter((item) => !groupValues.includes(item));
+            }
+         };
+         if (typeof filter !== "undefined") {
+            if (!filterValue) {
+               cleanByGroupValues();
+            }
+            if (filterValue) {
+               if (!origfilts || window.location.search)
+                  await fetch(
+                     `https://store.tildaapi.${document.querySelector("#allrecords").getAttribute("data-tilda-root-zone") || "com"}/api/getfilters/?storepartuid=${uid}`,
+                  )
+                     .then(function (response) {
+                        if (response.ok) return response.json();
+                        else throw new Error("No filters found");
+                     })
+                     .then(function (recievedf) {
+                        origfilts = recievedf;
+                     });
+               let ischeckbox = origfilts
+                  ? findNameByValue(origfilts.filters, filterValue)
+                  : null;
+               if (!ischeckbox) {
+                  window.alert("");
+                  fatherss.forEach((father) => {
+                     father.style.opacity = 1;
+                     father.style.pointerEvents = "auto";
+                  });
+                  rebuildFiltered();
+                  return;
+               }
+               if (ischeckbox.control === "checkbox") {
+                  checks = checks.includes(filterValue)
+                     ? checks.filter((item) => item !== filterValue)
+                     : [...checks, filterValue];
+               } else {
+                  if (ischeckbox.control === "select") {
+                     filts = filts.filter((item) => {
+                        const meta = origfilts
+                           ? findNameByValue(origfilts.filters, item)
+                           : null;
+                        return !meta || meta.name !== ischeckbox.name;
+                     });
+                  }
+                  let elementsToRemove = ischeckbox.values.map(
+                     (item) => item.value,
+                  );
+                  filts = filts.filter(
+                     (item) => !elementsToRemove.includes(item),
+                  );
+                  filts.push(filterValue);
+               }
+            }
+         }
+         const filteredQuery = rebuildFiltered();
+         if (typeof filtact !== "undefined") {
+            document
+               .querySelectorAll(
+                  "." + mainclass + ' [data-elem-id="' + filtact + '"]',
+               )
+               .forEach((elem) => elem.setAttribute("data-elem-id", filtdis));
+            filts.forEach(function (fil) {
+               let ffs = document.querySelectorAll(
+                  "." +
+                     mainclass +
+                     ' .vfilter:not([data-elem-type="form"]) [href="#' +
+                     fil +
+                     '"]',
+               );
+               ffs.forEach((ff) => {
+                  if (ff)
+                     ff.closest(".vfilter").setAttribute(
+                        "data-elem-id",
+                        filtact,
+                     );
+               });
+            });
+            checks.forEach(function (fil) {
+               let ff = document.querySelector(
+                  "." + mainclass + ' .vfilter [href="#' + fil + '"]',
+               );
+               if (ff)
+                  ff.closest(".vfilter").setAttribute("data-elem-id", filtact);
+            });
+         }
+         switch (sort) {
+            case 0:
+               sortadd = "";
+               break;
+            case 1:
+               sortadd = "&sort[price]=asc";
+               break;
+            case 2:
+               sortadd = "&sort[price]=desc";
+               break;
+            case 3:
+               sortadd = "&sort[title]=asc";
+               break;
+            case 4:
+               sortadd = "&sort[title]=desc";
+               break;
+            case 5:
+               sortadd = "&sort[created]=desc";
+               break;
+            case 6:
+               sortadd = "&sort[created]=asc";
+               break;
+            default:
+               sortadd = "";
+               break;
+         }
+         if (!isrefresh) return;
+         await fetch(
+            `https://store.tildaapi.${document.querySelector("#allrecords").getAttribute("data-tilda-root-zone") || "com"}/api/getproductslist/?storepartuid=${uid}${parts ? "&getparts=true" : ""}${options ? "&getoptions=true" : ""}&slice=1&size=${size}${section ? "&filters[storepartuid][0]=" + section : ""}${filteredQuery || ""}${searchedw ? "&filters[query][0]=" + searchedw : ""}${sortadd}${pmax ? "&filters[price:max]=" + pmax : ""}${pmin ? "&filters[price:min]=" + pmin : ""}${cardstotal ? "&size=" + cardstotal + "&slice=" + curpage : ""}`,
+         )
+            .then(function (response) {
+               if (response.ok) return response.json();
+               else throw new Error("No products found");
+            })
+            .then(function (products) {
+               voroncatproducts[mainclass] = products;
+               if (products.products.length < 1)
+                  window.alert("Товары с такими фильтрами не найдены");
+               if (!origfilts) origfilts = products.filters;
+               let fathers = document.querySelectorAll("." + mainclass);
+               fathers.forEach((father) => {
+                  father.style.opacity = 1;
+                  father.style.pointerEvents = "auto";
+               });
+               document
+                  .querySelectorAll(
+                     "." +
+                        mainclass +
+                        ' [class*=" vcat"]:not([class*="section"]):not([data-elem-type="gallery"])',
+                  )
+                  .forEach(function (all) {
+                     all.style.display = "none";
+                  });
+               document
+                  .querySelectorAll(
+                     "." + mainclass + ' [data-elem-type="gallery"]',
+                  )
+                  .forEach(function (all) {
+                     all.style.opacity = "0";
+                  });
+               let primgs = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatimg"]',
+               );
+               let prnames = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatname"]',
+               );
+               let prbacks = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatbg"]',
+               );
+               let prprices = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatprice"]',
+               );
+               let prmarks = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatmarkbg"]',
+               );
+               let prtexts = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcattext"]',
+               );
+               let prmarktexts = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatmarktext"]',
+               );
+               let prmores = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatmore"]',
+               );
+               let prdescs = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatdesc"]',
+               );
+               let prextras = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatextra"]',
+               );
+               let prcurrency = "₽";
+               primgs.forEach(function (element) {
+                  let el =
+                     products.products[getnum(element.className, "vcatimg")];
+                  if (
+                     el &&
+                     element.getAttribute("data-elem-type") === "gallery"
+                  ) {
+                     element.style.opacity = "1";
+                     setTimeout(() => {
+                        let swrap = element.querySelector(
+                           ".t-slds__items-wrapper",
+                        );
+                        let gal = JSON.parse(el.gallery);
+                        swrap.setAttribute(
+                           "data-slider-totalslides",
+                           gal.length,
+                        );
+                        swrap.innerHTML = "";
+                        for (var i = 0; i < gal.length; i++) {
+                           swrap.innerHTML +=
+                              '<div class="t-slds__item t-slds__item-loaded" style="width: ' +
+                              swrap.closest(".t396__elem").clientWidth +
+                              'px; opacity: 1; display: block;" aria-hidden="false" data-slide-index="' +
+                              (i + 1) +
+                              '"><div class="t-width"><div itemscope="" class="t-null__slds-wrapper t-slds__wrapper t-slds__wrapper_100 t-align_center"><meta itemprop="image" content=""><meta itemprop="caption" content="SEO"><div class="tn-atom__slds-img t-bgimg loaded" data-original="' +
+                              gal[i].img +
+                              '" style="background-image: url(' +
+                              gal[i].img +
+                              "); width: " +
+                              swrap.closest(".t396__elem").clientWidth +
+                              "px; height: " +
+                              swrap.closest(".t396__elem").clientHeight +
+                              'px;" width="100%" data-tu-noclick="yes" data-tu-is-image="yes" data-tu-multiple="no"></div></div></div></div>';
+                        }
+                        let itms = swrap.querySelectorAll(".t-slds__item");
+                        if (element.getAttribute("data-field-zoomable-value")) {
+                           itms.forEach(function (makezoom) {
+                              let it =
+                                 makezoom.querySelector(".tn-atom__slds-img");
+                              it.setAttribute(
+                                 "data-zoom-target",
+                                 makezoom.getAttribute("data-slide-index"),
+                              );
+                              it.setAttribute(
+                                 "data-img-zoom-url",
+                                 it.getAttribute("data-original"),
+                              );
+                              it.classList.add("t-zoomable");
+                              it.setAttribute("data-tu-noclick", "yes");
+                              it.setAttribute("data-tu-is-image", "yes");
+                              it.setAttribute("data-tu-multiple", "yes");
+                              it.setAttribute("data-zoomable", "yes");
+                           });
+                        }
+                        let firstClone = itms[0].cloneNode(true);
+                        firstClone.setAttribute("data-slide-index", 0);
+                        firstClone
+                           .querySelector(".tn-atom__slds-img")
+                           .classList.remove("t-zoomable");
+                        swrap.insertBefore(firstClone, swrap.firstChild);
+                        let lastClone = itms[itms.length - 1].cloneNode(true);
+                        lastClone.setAttribute(
+                           "data-slide-index",
+                           gal.length + 1,
+                        );
+                        swrap.appendChild(lastClone);
+                        itms[0].classList.add("t-slds__item_active");
+                        element.style.display = "table";
+                        t_slds_updateSlider(element);
+                     }, 1000);
+                  } else if (el && el.gallery !== "[]") {
+                     let atom = element.querySelector(".tn-atom");
+                     let zoomer = atom.classList.contains("t-zoomable");
+                     if (zoomer) {
+                        atom.classList.add("t-zoomable");
+                        atom.setAttribute("data-zoomable", "yes");
+                        atom.setAttribute(
+                           "data-img-zoom-url",
+                           JSON.parse(el.gallery)[0].img,
+                        );
+                     }
+                     if (atom.querySelector("img"))
+                        atom
+                           .querySelector("img")
+                           .setAttribute("src", JSON.parse(el.gallery)[0].img);
+                     else
+                        atom.setAttribute(
+                           "style",
+                           "background-image: url(" +
+                              JSON.parse(el.gallery)[0].img +
+                              ")",
+                        );
+                     atom.setAttribute(
+                        "data-original",
+                        JSON.parse(el.gallery)[0].img,
+                     );
+                     element.style.display = "table";
+                  }
+               });
+               prnames.forEach(function (element) {
+                  let numbr = getnum(element.className, "vcatname");
+                  if (
+                     products.products[numbr] &&
+                     products.products[numbr].title
+                  ) {
+                     element.querySelector(".tn-atom").innerHTML =
+                        products.products[numbr].title;
+                     element.style.display = "table";
+                  } else element.querySelector(".tn-atom").innerHTML = "";
+               });
+               prprices.forEach(function (element) {
+                  let pr =
+                     products.products[getnum(element.className, "vcatprice")];
+                  if (pr && pr.price) {
+                     element.querySelector(".tn-atom").innerText =
+                        parseFloat(pr.price)
+                           .toFixed(2)
+                           .toString()
+                           .replace(/\B(?=(\d{3})+(?!\d))/g, " ") +
+                        " " +
+                        prcurrency;
+                     element.style.display = "table";
+                  }
+               });
+               prmarktexts.forEach(function (element) {
+                  let pr =
+                     products.products[
+                        getnum(element.className, "vcatmarktext")
+                     ];
+                  if (pr && pr.mark) {
+                     element.querySelector(".tn-atom").innerText = pr.mark;
+                     element.style.display = "table";
+                  }
+               });
+               prmarks.forEach(function (element) {
+                  let pr =
+                     products.products[getnum(element.className, "vcatmarkbg")];
+                  if (pr && pr.mark) {
+                     element.style.display = "table";
+                  }
+               });
+               prtexts.forEach(function (element) {
+                  let pr =
+                     products.products[getnum(element.className, "vcattext")];
+                  if (pr && pr.text) {
+                     element.querySelector(".tn-atom").innerText = pr.text;
+                     element.style.display = "table";
+                  }
+               });
+               let processedIndices = new Set();
+               for (let index = 1; ; index++) {
+                  let className = `vcatbuy${index}`;
+                  let elements = document.querySelectorAll(
+                     "." + mainclass + ` [class*="${className}"]`,
+                  );
+                  if (elements.length === 0) break;
+                  elements.forEach(function (element) {
+                     let nm = getnum(element.className, "vcatbuy");
+                     let good = products.products[nm];
+                     let att = element
+                        .querySelector(".tn-atom")
+                        .getAttribute("data-buytext");
+                     let text = att ? att : element.innerText;
+                     if (good) {
+                        const nonZeros = good.editions.filter(
+                           (edition) => edition.quantity !== "0",
+                        );
+                        const nonZeroEdition = nonZeros[0];
+                        if (nonZeroEdition) {
+                           let {
+                              sku,
+                              uid,
+                              externalid,
+                              img,
+                              price,
+                              priceold,
+                              quantity,
+                              pack_x,
+                              pack_m,
+                              pack_y,
+                              pack_z,
+                              ...filteredObj
+                           } = nonZeroEdition;
+                           let optstoadd = "";
+                           for (const key in filteredObj) {
+                              if (filteredObj.hasOwnProperty(key)) {
+                                 const value = filteredObj[key];
+                                 optstoadd += ` <div class="js-product-edition-option t-product__option" data-edition-option-id="${key}" data-view-type="select" data-option-type="regular"> <div class="js-product-edition-option-name t-product__option-title t-typography__options t-descr t-descr_xxs">${key}</div> <div class="t-product__option-variants t-product__option-variants_regular"> <select class="js-product-edition-option-variants t-product__option-select t-typography__options t-descr t-descr_xxs"> <option value="${value}">${value}</option> </select> </div> </div>`;
+                              }
+                           }
+                           element.classList.add("js-product");
+                           element.setAttribute(
+                              "data-product-url",
+                              good.buttonlink || good.url,
+                           );
+                           element.setAttribute(
+                              "data-product-inv",
+                              nonZeroEdition.quantity,
+                           );
+                           element.setAttribute(
+                              "data-product-lid",
+                              nonZeroEdition.uid,
+                           );
+                           element.setAttribute(
+                              "data-product-uid",
+                              nonZeroEdition.uid,
+                           );
+                           element.setAttribute("data-product-unit", good.unit);
+                           if (good.portion > 0)
+                              element.setAttribute(
+                                 "data-product-portion",
+                                 good.portion,
+                              );
+                           let nest = element.querySelector(
+                              ".t-store__card__imgwrapper",
+                           );
+                           if (nest) nest.remove();
+                           element.querySelector(".tn-atom").outerHTML =
+                              ` <a class="tn-atom" data-buytext="${text}" href="#order">${text} <div class="js-product-controls-wrapper t-store__card__prod-controls-wrapper"></div> <div class="t-store__prod__quantity"><div class="t-store__prod__quantity__minus-wrapper"></div><input class="t-store__prod__quantity-input t-descr t-descr_xxs" type="number" min="1" max="${nonZeroEdition.quantity}" step="1" value="1" size="4" maxlength="4"><div class="t-store__prod__quantity__plus-wrapper"></div></div> <div class="t-store__card__textwrapper"> <div class="js-store-prod-name js-product-name t-store__card__title t-typography__title t-name t-name_md">${good.title}</div> <div class="t-store__card__sku t-descr t-descr_xxs"> Артикул: <span class="js-store-prod-sku js-product-sku" translate="no">${nonZeroEdition.sku}</span> </div> <div class="js-store-prod-descr t-store__card__descr t-typography__descr t-descr t-descr_xxs"> ${good.descr} </div> ${optstoadd} <div class="js-store-price-wrapper t-store__card__price-wrapper"> <div class="t-store__card__price t-store__card__price-item t-name t-name_xs"> <div class="js-product-price js-store-prod-price-val t-store__card__price-value" translate="no" data-product-price-def="${nonZeroEdition.price}" data-product-price-def-str="${nonZeroEdition.price}"> ${nonZeroEdition.price} </div> <div class="t-store__card__price-currency" translate="no">${prcurrency}</div> </div> <div class="t-store__card__price_old t-store__card__price-item t-name t-name_xs"> <div class="t-store__card__price-currency" translate="no">${prcurrency}</div> </div> </div> </div> <div class="t-store__card__imgwrapper"><a href="#order"> <div style="background-image: url('${good.gallery !== "[]" ? JSON.parse(good.gallery)[0].img : ""}')" class="js-product-img"></div> </a><a href="#addtofavorites" class="t1002__addBtn">a</a> </div></a> `;
+                           element.style.display = "table";
+                           element.style.opacity = "1";
+                           nonZeros.forEach((edition) => {
+                              let {
+                                 sku,
+                                 uid,
+                                 externalid,
+                                 img,
+                                 price,
+                                 priceold,
+                                 quantity,
+                                 pack_x,
+                                 pack_m,
+                                 pack_y,
+                                 pack_z,
+                                 ...cleanedEd
+                              } = edition;
+                              Object.keys(cleanedEd).forEach((key, index) => {
+                                 document
+                                    .querySelectorAll(
+                                       "." +
+                                          mainclass +
+                                          ` [class*="vcatbuy${nm + 1} "] [data-edition-option-id="${key}"] select`,
+                                    )
+                                    .forEach(function (switcher) {
+                                       if (
+                                          !switcher.querySelector(
+                                             'option[value="' +
+                                                Object.values(cleanedEd)[
+                                                   index
+                                                ] +
+                                                '"]',
+                                          )
+                                       )
+                                          switcher.insertAdjacentHTML(
+                                             "beforeEnd",
+                                             `<option value="${Object.values(cleanedEd)[index]}">${Object.values(cleanedEd)[index]}</option>`,
+                                          );
+                                    });
+                              });
+                           });
+                           if (good.properties) {
+                              function vtransformString(inputString) {
+                                 let lines = inputString.split("\n");
+                                 let transformedLines = lines.map((line) => {
+                                    let [variantName, price = ""] =
+                                       line.split("=");
+                                    return `<option value="${variantName}" data-product-variant-price="${price}">${variantName}</option>`;
+                                 });
+                                 return transformedLines.join("");
+                              }
+                              good.properties.forEach((prop) => {
+                                 document.querySelector(
+                                    "." +
+                                       mainclass +
+                                       ` [class*="vcatbuy${nm + 1} "] .t-store__card__textwrapper`,
+                                 ).innerHTML +=
+                                    `<div class="js-product-option t-product__option"><div class="js-product-option-name t-product__option-title t-typography__options t-descr t-descr_xxs">${prop.title}</div><div class="t-product__option-variants t-product__option-variants_regular"> <select class="js-product-option-variants t-product__option-select t-typography__options t-descr t-descr_xxs"> ${vtransformString(prop.values)} </select> </div></div>`;
+                              });
+                           }
+                           let vcatvarElements = document.querySelectorAll(
+                              `.${mainclass} [class*="vcatvar"]`,
+                           );
+                           document
+                              .querySelectorAll(
+                                 "." +
+                                    mainclass +
+                                    ` [class*="vcatvar${nm + 1} "]`,
+                              )
+                              .forEach((vcatvar, index) => {
+                                 let switcher = document.querySelectorAll(
+                                    "." +
+                                       mainclass +
+                                       ' [class*="vcatbuy' +
+                                       (nm + 1) +
+                                       '"] .js-product-edition-option, .' +
+                                       mainclass +
+                                       ' [class*="vcatbuy' +
+                                       (nm + 1) +
+                                       '"] .t-product__option:not([data-edition-option-id]) .t-product__option-variants',
+                                 )[index];
+                                 if (switcher) {
+                                    vcatvar.style.display = "table";
+                                    let switcherSelect =
+                                       switcher.querySelector("select");
+                                    let vcatSelect =
+                                       vcatvar.querySelector("select");
+                                    let vcatFieldset =
+                                       vcatvar.querySelector("fieldset");
+                                    if (vcatSelect && switcherSelect) {
+                                       vcatSelect.innerHTML =
+                                          switcherSelect.innerHTML;
+                                    } else if (vcatFieldset && switcherSelect) {
+                                       vcatFieldset
+                                          .querySelectorAll(
+                                             'input[type="radio"]',
+                                          )
+                                          .forEach((input) => {
+                                             input.checked = false;
+                                             input.removeAttribute("checked");
+                                          });
+                                       const optionValues = Array.from(
+                                          switcherSelect.options,
+                                       ).map(
+                                          (opt) =>
+                                             opt.value ||
+                                             opt.textContent.trim(),
+                                       );
+                                       let labels = Array.from(
+                                          vcatFieldset.querySelectorAll(
+                                             "label.t-radio__control",
+                                          ),
+                                       );
+                                       if (
+                                          labels.length > optionValues.length
+                                       ) {
+                                          labels
+                                             .slice(optionValues.length)
+                                             .forEach((label) =>
+                                                label.remove(),
+                                             );
+                                       }
+                                       if (
+                                          labels.length < optionValues.length
+                                       ) {
+                                          const template =
+                                             labels[labels.length - 1] ||
+                                             vcatFieldset.querySelector(
+                                                "label.t-radio__control",
+                                             );
+                                          if (template) {
+                                             const templateInput =
+                                                template.querySelector(
+                                                   'input[type="radio"]',
+                                                );
+                                             const groupName = templateInput
+                                                ? templateInput.name
+                                                : "";
+                                             for (
+                                                let i = labels.length;
+                                                i < optionValues.length;
+                                                i++
+                                             ) {
+                                                const clone =
+                                                   template.cloneNode(true);
+                                                const input =
+                                                   clone.querySelector(
+                                                      'input[type="radio"]',
+                                                   );
+                                                if (input) {
+                                                   input.checked = false;
+                                                   if (groupName)
+                                                      input.name = groupName;
+                                                }
+                                                const span =
+                                                   clone.querySelector("span");
+                                                if (span) span.textContent = "";
+                                                vcatFieldset.appendChild(clone);
+                                             }
+                                             labels = Array.from(
+                                                vcatFieldset.querySelectorAll(
+                                                   "label.t-radio__control",
+                                                ),
+                                             );
+                                          }
+                                       }
+                                       labels
+                                          .slice(0, optionValues.length)
+                                          .forEach((label, idx) => {
+                                             const val = optionValues[idx];
+                                             const input = label.querySelector(
+                                                'input[type="radio"]',
+                                             );
+                                             if (input) {
+                                                input.value = val;
+                                                input.setAttribute(
+                                                   "value",
+                                                   val,
+                                                );
+                                                input.setAttribute(
+                                                   "aria-label",
+                                                   val,
+                                                );
+                                             }
+                                             const span =
+                                                label.querySelector("span");
+                                             if (span) span.textContent = val;
+                                          });
+                                    }
+                                    const fieldLabel = vcatvar.querySelector(
+                                       "label:not(.t-radio__control)",
+                                    );
+                                    if (switcher && fieldLabel)
+                                       fieldLabel.innerText =
+                                          switcher.getAttribute(
+                                             "data-edition-option-id",
+                                          ) ||
+                                          (switcher.previousElementSibling
+                                             ? switcher.previousElementSibling
+                                                  .innerText
+                                             : "");
+                                 } else vcatvar.style.display = "none";
+                              });
+                           if (!processedIndices.has(nm)) {
+                              if (nonZeroEdition.img) {
+                                 document
+                                    .querySelectorAll(
+                                       "." +
+                                          mainclass +
+                                          ` [class*="vcatimg${nm + 1} "]`,
+                                    )
+                                    .forEach(function (non) {
+                                       if (
+                                          non.getAttribute("data-elem-type") !==
+                                          "gallery"
+                                       ) {
+                                          let at =
+                                             non.querySelector(".tn-atom");
+                                          if (at.querySelector("img"))
+                                             at.querySelector(
+                                                "img",
+                                             ).setAttribute(
+                                                "src",
+                                                nonZeroEdition.img,
+                                             );
+                                          else
+                                             at.setAttribute(
+                                                "style",
+                                                "background-image: url(" +
+                                                   nonZeroEdition.img +
+                                                   ")",
+                                             );
+                                          at.setAttribute(
+                                             "data-original",
+                                             nonZeroEdition.img,
+                                          );
+                                          non.style.display = "table";
+                                       } else {
+                                          non.querySelector(
+                                             ".t-slds__items-wrapper",
+                                          ).setAttribute("data-slider-pos", 1);
+                                          t_slds_updateSlider(non);
+                                       }
+                                    });
+                              }
+                              if (nonZeroEdition.priceold) {
+                                 document
+                                    .querySelectorAll(
+                                       "." +
+                                          mainclass +
+                                          ` [class*="vcatold${nm + 1} "]`,
+                                    )
+                                    .forEach(function (non) {
+                                       if (non.querySelector(".tn-atom *"))
+                                          non.querySelector(
+                                             ".tn-atom *",
+                                          ).innerText =
+                                             parseFloat(
+                                                nonZeroEdition.priceold.replaceAll(
+                                                   " ",
+                                                   "",
+                                                ),
+                                             )
+                                                .toFixed(2)
+                                                .toString()
+                                                .replace(
+                                                   /\B(?=(\d{3})+(?!\d))/g,
+                                                   " ",
+                                                ) +
+                                             " " +
+                                             prcurrency;
+                                       else
+                                          non.querySelector(
+                                             ".tn-atom",
+                                          ).innerText =
+                                             parseFloat(
+                                                nonZeroEdition.priceold.replaceAll(
+                                                   " ",
+                                                   "",
+                                                ),
+                                             )
+                                                .toFixed(2)
+                                                .toString()
+                                                .replace(
+                                                   /\B(?=(\d{3})+(?!\d))/g,
+                                                   " ",
+                                                ) +
+                                             " " +
+                                             prcurrency;
+                                       non.style.display = "table";
+                                    });
+                              }
+                              if (nonZeroEdition.sku) {
+                                 document
+                                    .querySelectorAll(
+                                       "." +
+                                          mainclass +
+                                          ` [class*="vcatsku${nm + 1} "]`,
+                                    )
+                                    .forEach(function (non) {
+                                       non.querySelector(".tn-atom").innerText =
+                                          nonZeroEdition.sku;
+                                       non.style.display = "table";
+                                    });
+                              }
+                              document
+                                 .querySelectorAll(
+                                    "." +
+                                       mainclass +
+                                       ` [class*="vcatstock${nm + 1} "]`,
+                                 )
+                                 .forEach(function (non) {
+                                    non.querySelector(".tn-atom").innerText =
+                                       "В наличии: " + nonZeroEdition.quantity;
+                                    non.style.display = "table";
+                                 });
+                              document
+                                 .querySelectorAll(
+                                    "." +
+                                       mainclass +
+                                       ` [class*="vcatquant${nm + 1} "]`,
+                                 )
+                                 .forEach(function (non) {
+                                    non.style.display = "table";
+                                 });
+                              document
+                                 .querySelectorAll(
+                                    "." +
+                                       mainclass +
+                                       ` [class*="vcatfav${nm + 1} "]`,
+                                 )
+                                 .forEach(function (non) {
+                                    non.style.display = "table";
+                                 });
+                              if (nonZeroEdition.price) {
+                                 document
+                                    .querySelectorAll(
+                                       "." +
+                                          mainclass +
+                                          ` [class*="vcatprice${nm + 1} "]`,
+                                    )
+                                    .forEach(function (non) {
+                                       non.querySelector(".tn-atom").innerText =
+                                          parseFloat(
+                                             nonZeroEdition.price.replaceAll(
+                                                " ",
+                                                "",
+                                             ),
+                                          )
+                                             .toFixed(2)
+                                             .toString()
+                                             .replace(
+                                                /\B(?=(\d{3})+(?!\d))/g,
+                                                " ",
+                                             ) +
+                                          " " +
+                                          prcurrency;
+                                       non.style.display = "table";
+                                    });
+                              }
+                              processedIndices.add(nm);
+                           }
+                        } else {
+                           element.querySelector(".tn-atom").outerHTML =
+                              `<a class="tn-atom" href="" data-name="${good.title}"data-buytext="${text}">${text ? "" : ""}</a>`;
+                           element.style.display = "table";
+                           element.style.opacity = "";
+                        }
+                     } else {
+                        element.querySelector(".tn-atom").outerHTML =
+                           `<a class="tn-atom" data-buytext="${text}">${text}</a>`;
+                     }
+                  });
+               }
+               prmores.forEach(function (element) {
+                  let numbr = getnum(element.className, "vcatmore");
+                  if (products.products[numbr]) {
+                     element.querySelector(".tn-atom").outerHTML =
+                        `<a class="tn-atom" ${products.products[numbr].buttontarget ? 'target="_blank"' : ""} href="${products.products[numbr].buttonlink || products.products[numbr].url}">${element.innerText}</a>`;
+                     element.style.display = "table";
+                  } else
+                     element.querySelector(".tn-atom").outerHTML =
+                        `<a class="tn-atom" style="display:none;">${element.innerText}</a>`;
+               });
+               prdescs.forEach(function (element) {
+                  let ds =
+                     products.products[getnum(element.className, "vcatdesc")];
+                  if (ds && ds.descr) {
+                     element.querySelector(".tn-atom").innerHTML = ds.descr;
+                     element.style.display = "table";
+                  }
+               });
+               prextras.forEach(function (element) {
+                  let es =
+                     products.products[getnum(element.className, "vcatextra")];
+                  if (es) {
+                     element.style.display = "table";
+                  }
+               });
+               prbacks.forEach(function (element) {
+                  let bs =
+                     products.products[getnum(element.className, "vcatbg")];
+                  if (bs) {
+                     element.style.display = "table";
+                  }
+               });
+               let prcharcs = document.querySelectorAll(
+                  "." + mainclass + ' [class*="vcatchar"]',
+               );
+               prcharcs.forEach(function (element) {
+                  let nu =
+                     products.products[getnum(element.className, "vcatchar")];
+                  if (nu && nu.characteristics) {
+                     for (let i = 0; i < nu.characteristics.length; i++) {
+                        let ob = document.querySelectorAll(
+                           "." +
+                              mainclass +
+                              " .vcatchar" +
+                              (getnum(element.className, "vcatchar") + 1) +
+                              " .tn-atom",
+                        )[i];
+                        if (ob) {
+                           ob.innerText = nu.characteristics[i].value;
+                           ob.closest(".tn-elem").style.display = "table";
+                        }
+                     }
+                  }
+               });
+               let fixedfavs = window.localStorage.twishlist
+                  ? JSON.parse(window.localStorage.twishlist).products
+                  : [];
+               document
+                  .querySelectorAll("." + mainclass + " .faved")
+                  .forEach((fav) => {
+                     fav.classList.toggle("faved");
+                  });
+               fixedfavs.forEach((item) => {
+                  let names = document.querySelectorAll(
+                     "." + mainclass + ' [class*="vcatname"]',
+                  );
+                  names.forEach((element) => {
+                     if (element.textContent.includes(item.name))
+                        document
+                           .querySelector(
+                              "." +
+                                 mainclass +
+                                 " .vcatfav" +
+                                 element.className
+                                    .split("vcatname")[1]
+                                    .split(" ")[0],
+                           )
+                           .classList.toggle("faved");
+                  });
+               });
+               let pagwrap = document.querySelector(
+                  "." + paginclass + " .vcatpagination",
+               );
+               pagwrap.innerHTML = "";
+               let prevButton = document.querySelector(
+                  "." + paginclass + " .vcatpagprev",
+               );
+               if (!prevButton.classList.contains("ladded")) {
+                  prevButton.addEventListener("click", () => {
+                     curpage = curpage - 1;
+                     vrefreshcat(sectn, cardstotal, false);
+                  });
+                  prevButton.classList.add("ladded");
+               }
+               let totalPages = Math.ceil(products.total / cardstotal);
+               let startPage = Math.max(1, curpage - 2);
+               let endPage = Math.min(totalPages, curpage + 2);
+               document.querySelector(
+                  "." + paginclass + " .vcatpagprev",
+               ).style.opacity = "0";
+               document.querySelector(
+                  "." + paginclass + " .vcatpagprev",
+               ).style.pointerEvents = "none";
+               document.querySelector(
+                  "." + paginclass + " .vcatpagnext",
+               ).style.opacity = "0";
+               document.querySelector(
+                  "." + paginclass + " .vcatpagnext",
+               ).style.pointerEvents = "none";
+               if (curpage > 1) {
+                  document.querySelector(
+                     "." + paginclass + " .vcatpagprev",
+                  ).style.opacity = "1";
+                  document.querySelector(
+                     "." + paginclass + " .vcatpagprev",
+                  ).style.pointerEvents = "auto";
+               }
+               for (let i = startPage; i <= endPage; i++) {
+                  pagwrap.insertAdjacentHTML(
+                     "beforeEnd",
+                     '<div class="vcatpage' + i + '">' + i + "</div>",
+                  );
+                  pagwrap
+                     .querySelector(".vcatpage" + i)
+                     .addEventListener("click", function (e) {
+                        curpage = parseFloat(
+                           e.target.className.split("vcatpage")[1],
+                        );
+                        vrefreshcat(sectn, cardstotal, false);
+                     });
+               }
+               let nextButton = document.querySelector(
+                  "." + paginclass + " .vcatpagnext",
+               );
+               if (!nextButton.classList.contains("ladded")) {
+                  nextButton.addEventListener("click", () => {
+                     curpage = curpage + 1;
+                     vrefreshcat(sectn, cardstotal, false);
+                  });
+                  nextButton.classList.add("ladded");
+               }
+               if (curpage < totalPages) {
+                  document.querySelector(
+                     "." + paginclass + " .vcatpagnext",
+                  ).style.opacity = "1";
+                  document.querySelector(
+                     "." + paginclass + " .vcatpagnext",
+                  ).style.pointerEvents = "auto";
+               }
+               document
+                  .querySelectorAll("." + paginclass + " .vpageactive")
+                  .forEach(function (ac) {
+                     ac.classList.remove("vpageactive");
+                  });
+               document
+                  .querySelectorAll("." + paginclass + " .vcatpage" + curpage)
+                  .forEach(function (element) {
+                     element.classList.add("vpageactive");
+                  });
+            });
+      };
+      let prfavs = document.querySelectorAll(
+         "." + mainclass + ' [class*="vcatfav"]',
+      );
+      prfavs.forEach(function (element) {
+         element.addEventListener("click", function (e) {
+            let buy = document.querySelector(
+               "." +
+                  mainclass +
+                  " .vcatbuy" +
+                  (getnum(element.className, "vcatfav") + 1) +
+                  " .t1002__addBtn",
+            );
+            buy.click();
+            if (element.className.indexOf("faved") !== -1) {
+               let tifavs = JSON.parse(window.localStorage.twishlist);
+               let name = document.querySelector(
+                  "." +
+                     mainclass +
+                     " .vcatname" +
+                     (getnum(element.className, "vcatfav") + 1) +
+                     " .tn-atom",
+               ).innerText;
+               tifavs.products = tifavs.products.filter(
+                  (item) => item.name !== name,
+               );
+               window.localStorage.twishlist = JSON.stringify(tifavs);
+            }
+            e.target.closest(".tn-elem").classList.toggle("faved");
+         });
+      });
+      let prsections = document.querySelectorAll(
+         "." + mainclass + ' [class*="vcatsection"]',
+      );
+      if (prsections.length > 0) {
+         let activeid = document
+            .querySelector("." + mainclass + " .vcatsectionact")
+            .getAttribute("data-elem-id");
+         let def = document
+            .querySelector("." + mainclass + " .vcatsection")
+            .getAttribute("data-elem-id");
+         prsections.forEach(function (element) {
+            element.addEventListener("click", function (e) {
+               let href =
+                  e.target.getAttribute("href") ||
+                  e.target.closest("[href]").getAttribute("href");
+               e.preventDefault();
+               prsections.forEach(function (bt) {
+                  bt.setAttribute("data-elem-id", def);
+               });
+               e.target
+                  .closest(".tn-elem")
+                  .setAttribute("data-elem-id", activeid);
+               curpage = 1;
+               vrefreshcat(href.replace("#", ""), cardstotal);
+            });
+         });
+      }
+      let prclear = document.querySelectorAll(
+         "." + mainclass + ' [class*="vclear"]',
+      );
+      if (prclear.length > 0) {
+         prclear.forEach(function (clearing) {
+            clearing.style.display = "none";
+         });
+         prclear.forEach(function (element) {
+            element.addEventListener("click", function (e) {
+               filts = [];
+               checks = [];
+               searchedw = "";
+               sort = "";
+               pmin = "";
+               pmax = "";
+               sectn = "";
+               let vsearchInput = document.querySelector(
+                  "." + mainclass + " .vsearch .t-input",
+               );
+               let vsearchButtn = document.querySelector(
+                  "." + mainclass + " .vsearchbtn",
+               );
+               if (vsearchInput) vsearchInput.value = "";
+               let vsortSelect = document.querySelector(
+                  "." + mainclass + " .vsort select",
+               );
+               if (vsortSelect) vsortSelect.selectedIndex = 0;
+               let pricesres = document.querySelectorAll(
+                  "." +
+                     mainclass +
+                     ' [class*="vpricem"] [data-input-lid] input',
+               );
+               if (pricesres.length > 0)
+                  pricesres.forEach(function (oldp) {
+                     oldp.value = "";
+                  });
+               let actfiltsres = document.querySelectorAll(
+                  "." + mainclass + ' [data-elem-id="' + filtact + '"]',
+               );
+               if (actfiltsres.length > 0)
+                  actfiltsres.forEach((elem) =>
+                     elem.setAttribute("data-elem-id", filtdis),
+                  );
+               let allSection = document.querySelector(
+                  "." + mainclass + ' [class*="vcatsection"] [href="#"]',
+               );
+               if (allSection) allSection.click();
+               else if (vsearchButtn) vsearchButtn.click();
+               else if (pricesres.length > 0)
+                  pricesres[0]
+                     .closest(".tn-elem")
+                     .dispatchEvent(new Event("change"));
+               else vrefreshcat("", cardstotal);
+               document
+                  .querySelectorAll("." + mainclass + " .vfilter select")
+                  .forEach(function (selectElement) {
+                     selectElement.selectedIndex = 0;
+                  });
+               e.preventDefault();
+               e.target.closest(".tn-elem").style.display = "none";
+            });
+         });
+      }
+      let prfilters = document.querySelectorAll(
+         "." + mainclass + ' [class*="vfilter"]:not(.vfilteract)',
+      );
+      let startact = document.querySelector("." + mainclass + " .vfilteract");
+      filtdis = prfilters[1] ? prfilters[1].getAttribute("data-elem-id") : "";
+      if (startact) {
+         filtact = startact.getAttribute("data-elem-id");
+         startact.setAttribute("data-elem-id", filtdis);
+         startact.className = startact.className.replace(
+            "vfilteract",
+            "vfilter",
+         );
+      }
+      if (prfilters.length > 0) {
+         prfilters.forEach(function (element) {
+            if (element.getAttribute("data-elem-type") !== "form")
+               element.addEventListener("click", function (e) {
+                  prclear.forEach(function (clearing) {
+                     clearing.style.display = "block";
+                  });
+                  vrefreshcat(
+                     sectn,
+                     cardstotal,
+                     e.target.getAttribute("href").replace("#", "") ||
+                        e.target
+                           .closest("[href]")
+                           .getAttribute("href")
+                           .replace("#", ""),
+                  );
+               });
+            else
+               element.addEventListener("change", function () {
+                  curpage = 1;
+                  prclear.forEach(function (clearing) {
+                     clearing.style.display = "block";
+                  });
+                  let sl = this.querySelector("select");
+                  let vl = Array.from(
+                     sl.querySelectorAll('[value]:not([value=""])'),
+                  ).map((v) => v.value.trim());
+                  vrefreshcat(sectn, cardstotal, {
+                     value: sl.value.trim(),
+                     groupValues: vl,
+                  });
+               });
+         });
+      }
+      setTimeout(() => {
+         document
+            .querySelectorAll("." + mainclass + " .vsearch .tn-form__submit")
+            .forEach(function (sbtorem) {
+               sbtorem.remove();
+            });
+         document
+            .querySelectorAll(
+               "." + mainclass + ' [class*="vfilter"] .tn-form__submit',
+            )
+            .forEach(function (sbtorem) {
+               sbtorem.remove();
+            });
+         document
+            .querySelectorAll("." + mainclass + " .vsort .tn-form__submit")
+            .forEach(function (sbtorem) {
+               sbtorem.remove();
+            });
+         document
+            .querySelectorAll(
+               "." + mainclass + ' [class*="vpricem"] .tn-form__submit',
+            )
+            .forEach(function (sbtorem) {
+               sbtorem.remove();
+            });
+      }, 500);
+      let srt = document.querySelector("." + mainclass + " .vsort");
+      if (srt) {
+         srt.addEventListener("change", function (e) {
+            sort = e.target.selectedIndex;
+            vrefreshcat(sectn, cardstotal, false);
+         });
+      }
+      let prmax = document.querySelector("." + mainclass + " .vpricemax");
+      if (prmax) {
+         prmax.addEventListener("change", function (e) {
+            if (e.target.value) {
+               prclear.forEach(function (clearing) {
+                  clearing.style.display = "block";
+               });
+               pmax = e.target.value.replaceAll(" ", "");
+            }
+            vrefreshcat(sectn, cardstotal, false);
+         });
+         let prmin = document.querySelector("." + mainclass + " .vpricemin");
+         if (prmin) {
+            prmin.addEventListener("change", function (e) {
+               if (e.target.value) {
+                  prclear.forEach(function (clearing) {
+                     clearing.style.display = "block";
+                  });
+                  pmin = e.target.value.replaceAll(" ", "");
+               }
+               vrefreshcat(sectn, cardstotal, false);
+            });
+         }
+      }
+      document
+         .querySelectorAll("." + mainclass + ' [class*="vpricem"] input')
+         .forEach(function (oldp) {
+            oldp.addEventListener("input", function (e) {
+               vformatNumber(e.target);
+            });
+         });
+      let vsearchbtn = document.querySelector("." + mainclass + " .vsearchbtn");
+      if (vsearchbtn) {
+         vsearchbtn.addEventListener("click", () => {
+            prclear.forEach(function (clearing) {
+               clearing.style.display = "block";
+            });
+            searchedw = document.querySelector(
+               "." + mainclass + " .vsearch .t-input",
+            ).value;
+            vrefreshcat(sectn, cardstotal, false);
+         });
+      }
+      let vsearchInput = document.querySelector(
+         "." + mainclass + " .vsearch .t-input",
+      );
+      if (vsearchInput) {
+         vsearchInput.addEventListener("keydown", function (event) {
+            if (event.key === "Enter") {
+               event.preventDefault();
+               prclear.forEach(function (clearing) {
+                  clearing.style.display = "block";
+               });
+               searchedw = vsearchInput.value;
+               vrefreshcat(sectn, cardstotal, false);
+            }
+         });
+      }
+      isrefresh = false;
+      if (window.location.search) {
+         window.location.search
+            .replace("?", "")
+            .split("&")
+            .forEach((item) => {
+               const [key, value] = item.split("=");
+               linksearch[key] = isNaN(value) ? value : Number(value);
+               if (linksearch.vcatsection) {
+                  let targ = document.querySelector(
+                     "." +
+                        mainclass +
+                        ' .vcatsection [href="#' +
+                        decodeURIComponent(linksearch.vcatsection) +
+                        '"]',
+                  );
+                  targ.click();
+                  document
+                     .querySelector(".vcatsectionact")
+                     .classList.remove("vcatsectionact");
+                  targ.classList.add("vcatsectionact");
+               }
+               if (linksearch.vfilter)
+                  document
+                     .querySelector(
+                        "." +
+                           mainclass +
+                           ' .vfilter [href="#' +
+                           decodeURIComponent(linksearch.vfilter) +
+                           '"]',
+                     )
+                     .click();
+               if (linksearch.vpricemax) {
+                  document.querySelector(
+                     "." + mainclass + " .vpricemax input",
+                  ).value = linksearch.vpricemax;
+                  pmax = linksearch.vpricemax;
+               }
+               if (linksearch.vpricemin) {
+                  document.querySelector(
+                     "." + mainclass + " .vpricemin input",
+                  ).value = linksearch.vpricemin;
+                  pmin = linksearch.vpricemin;
+               }
+               prclear.forEach(function (clearing) {
+                  clearing.style.display = "block";
+               });
+               if (linksearch.vsearch) {
+                  searchedw = linksearch.vsearch;
+                  document.querySelector(
+                     "." + mainclass + " .vsearch .t-input",
+                  ).value = decodeURIComponent(linksearch.vsearch);
+               }
+            });
+         isrefresh = true;
+         await vrefreshcat(linksearch.vcatsection, cardstotal);
+      } else {
+         isrefresh = true;
+         await vrefreshcat(`${sectn ? sectn : ""}`, cardstotal);
+      }
+      document
+         .querySelectorAll("." + mainclass + ` [class*="vcatbuy"]`)
+         .forEach(function (element) {
+            element.addEventListener("click", function (e) {
+               let quant = document.querySelector(
+                  "." +
+                     mainclass +
+                     " .vcatquant" +
+                     (getnum(element.className, "vcatbuy") + 1) +
+                     " input",
+               );
+               if (quant) quant.value = 1;
+            });
+         });
+      document
+         .querySelectorAll("." + mainclass + ' [class*="vcatquant"]')
+         .forEach(function (element) {
+            if (element) {
+               let submitButton = element.querySelector(".tn-form__submit");
+               if (submitButton) {
+                  submitButton.remove();
+               }
+               element.addEventListener("input", function (e) {
+                  let buyElement = document.querySelector(
+                     "." +
+                        mainclass +
+                        " .vcatbuy" +
+                        (getnum(element.className, "vcatquant") + 1),
+                  );
+                  if (e.target.value < 1) e.target.value = 1;
+                  else if (
+                     buyElement &&
+                     parseFloat(e.target.value) >
+                        parseFloat(buyElement.getAttribute("data-product-inv"))
+                  ) {
+                     let maxInput = buyElement.querySelector(
+                        ".t-store__prod__quantity input",
+                     );
+                     if (maxInput) {
+                        e.target.value = maxInput.max;
+                     }
+                  } else if (buyElement) {
+                     let quantityInput = buyElement.querySelector(
+                        ".t-store__prod__quantity input",
+                     );
+                     if (quantityInput) {
+                        quantityInput.value = e.target.value || 1;
+                     }
+                  }
+               });
+            }
+         });
+      document
+         .querySelector("." + mainclass)
+         .addEventListener("click", function (e) {
+            if (
+               e.target &&
+               e.target.hash === "" &&
+               document.querySelector(
+                  '[data-tooltip-hook=""] form [name="tovar"]',
+               )
+            )
+               document.querySelector(
+                  '[data-tooltip-hook=""] form [name="tovar"]',
+               ).value =
+                  e.target.getAttribute("data-name") ||
+                  e.target.closest("[href]").getAttribute("data-name");
+         });
+      document
+         .querySelectorAll("." + mainclass + ' [class*="vcatvar"]')
+         .forEach(function (element) {
+            element.addEventListener("change", function (e) {
+               let cl = getnum(element.className, "vcatvar") + 1;
+               let id = parseFloat(
+                  document
+                     .querySelector("." + mainclass + " .vcatbuy" + cl)
+                     .getAttribute("data-product-uid"),
+               );
+               let trg = document.querySelector(
+                  "." +
+                     mainclass +
+                     " .vcatbuy" +
+                     cl +
+                     ' select [value="' +
+                     e.target.value +
+                     '"]',
+               );
+               if (trg) {
+                  trg.selected = true;
+                  voronUpdateOne(
+                     mainclass,
+                     voroncatproducts[mainclass].products.find((item) =>
+                        item.editions.some((edition) => edition.uid === id),
+                     ),
+                     cl,
+                  );
+               } else {
+                  window.alert(
+                     "Товара с такими характеристиками нет в наличии. Пожалуйста, выберите другие характеристики.",
+                  );
+               }
+            });
+         });
+   };
+   window.addEventListener(
+      "load",
+      function () {
+         voroncatinit(
+            "uc-catalog",
+            getResolutionValue(""),
+            "uc-paginationBlock",
+            160999850272,
+         );
+      },
+      { once: true },
+   );
+</script>

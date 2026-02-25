@@ -9,7 +9,7 @@ class TLS_client:
     Клиент для взаимодействия с сервером перлин-генерации и булевых операций через REST API.
     """
 
-    def __init__(self, host='78.25.191.12', port=9999, timeout=300.0):
+    def __init__(self, host='192.168.123.53', port=9999, timeout=300.0):
         """
         :param host: IP-адрес сервера
         :param port: порт сервера
@@ -111,6 +111,51 @@ class TLS_client:
             raise RuntimeError(f"Ошибка преобразования данных: {e}")
 
         return vertices, normals, texcoords
+
+    def send_boolean_intersection(self,
+                                mesh1_vertices: np.ndarray,
+                                mesh1_triangles: np.ndarray,
+                                mesh2_vertices: np.ndarray,
+                                mesh2_triangles: np.ndarray,
+                                return_volume_only: bool = False) -> Union[float, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Запрос на булево пересечение двух сеток.
+        Если return_volume_only=True, возвращает объём (float).
+        Иначе возвращает кортеж (vertices, triangles) как numpy массивы.
+        """
+        v1 = np.asarray(mesh1_vertices, dtype=np.float32)
+        t1 = np.asarray(mesh1_triangles, dtype=np.uint32)
+        v2 = np.asarray(mesh2_vertices, dtype=np.float32)
+        t2 = np.asarray(mesh2_triangles, dtype=np.uint32)
+
+        payload = {
+            "type": "boolean_intersection",  # опционально
+            "mesh1_vertices": base64.b64encode(v1.tobytes()).decode('ascii'),
+            "mesh1_triangles": base64.b64encode(t1.tobytes()).decode('ascii'),
+            "mesh2_vertices": base64.b64encode(v2.tobytes()).decode('ascii'),
+            "mesh2_triangles": base64.b64encode(t2.tobytes()).decode('ascii'),
+            "return_volume_only": "true" if return_volume_only else "false"
+        }
+
+        response = self._post("boolean_intersection", payload)
+
+        if response.get("status") != "success":
+            raise RuntimeError(f"Ошибка сервера: {response.get('error', 'Неизвестная ошибка')}")
+
+        if return_volume_only:
+            try:
+                return float(response["volume"])
+            except (KeyError, ValueError):
+                raise RuntimeError("Сервер не вернул объём")
+        else:
+            try:
+                verts_b64 = response["vertices"]
+                tris_b64 = response["triangles"]
+                verts = np.frombuffer(base64.b64decode(verts_b64), dtype=np.float32).reshape(-1, 3)
+                tris = np.frombuffer(base64.b64decode(tris_b64), dtype=np.uint32).reshape(-1, 3)
+                return verts, tris
+            except (KeyError, ValueError) as e:
+                raise RuntimeError(f"Ошибка декодирования результата: {e}")
 
     def send_boolean_request(self,
                              mesh1_vertices: np.ndarray,

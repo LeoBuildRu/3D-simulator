@@ -14,7 +14,23 @@ from panda3d.core import (
     GeomTriangles, NodePath, Vec3, TextureStage, Texture,
     Material, TransparencyAttrib, Shader, GeomVertexReader
 )
+include_files = [
+    ("models", "models"),
+    ("textures", "textures"),
+    ("lidar_example", "lidar_example"),
 
+    ("models_config.yaml", "models_config.yaml"),
+    ("textures_config.yaml", "textures_config.yaml"),
+
+    # RenderPipeline целиком (на всякий случай)
+    ("render_pipeline", "render_pipeline"),
+
+    # RenderPipeline для MountManager (ОБЯЗАТЕЛЬНЫЕ ПАПКИ)
+    ("render_pipeline/config", "lib/config"),
+    ("render_pipeline/effects", "lib/effects"),
+    ("render_pipeline/data", "lib/data"),
+    ("render_pipeline/rpplugins", "lib/rpplugins"),
+]
 from panda_widget import Panda3DWidget
 
 if getattr(sys, 'frozen', False):
