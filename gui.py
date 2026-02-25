@@ -17,7 +17,7 @@ from panda3d.core import (
 include_files = [
     ("models", "models"),
     ("textures", "textures"),
-    ("lidar_example", "lidar_example"),
+    ("PLY_examples", "PLY_examples"),
 
     ("models_config.yaml", "models_config.yaml"),
     ("textures_config.yaml", "textures_config.yaml"),
@@ -492,7 +492,7 @@ class CameraControlGUI(QWidget):
         from datetime import datetime
         from PyQt5.QtCore import Qt, QDate
 
-        self.json_folder = os.path.join(os.getcwd(), "lidar_example")
+        self.json_folder = os.path.join(os.getcwd(), "PLY_examples")
         self.recon_all_files = []
 
         # === ФИЛЬТРЫ ===

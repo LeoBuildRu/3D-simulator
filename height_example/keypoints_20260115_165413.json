@@ -2,12 +2,12 @@
   "metadata": {
     "timestamp": "2026-01-15T16:54:14.006792",
     "image_path": "corrected_20260115_165413.jpg",
-    "mask_path": "mask.png",
+    "heightmap_path": "height_map_20260115_165413.png",
     "image_size": {
       "width": 2560,
       "height": 1440
     },
-    "total_keypoints": 11
+    "total_keypoints": 4
   },
 "points_3d": [
     [

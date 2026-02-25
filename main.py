@@ -1360,7 +1360,7 @@ class MyApp(ShowBase):
             if os.path.exists(napolnitel_path):
                 napolnitel_model = self.load_gltf_model(napolnitel_path)
                 if napolnitel_model:
-                    # napolnitel_model.hide()
+                    napolnitel_model.hide()
                     # napolnitel_model.set_p(90)
                     models_loaded.append('napolnitel')
                     self.Target_Napolnitel = os.path.basename(napolnitel_path)

@@ -29,17 +29,21 @@ class MeshReconstruction:
         self.alpha_threshold = 0.5
 
         self.adaptive_lift_enabled = True
-        self.lift_intensity = 1.0
+        self.lift_intensity = 0.0
         self.lift_smoothing_sigma = 20.0
-        self.lift_blur_radius = 12
+        self.lift_blur_radius = 10
         self.boundary_zone_width = 10
-        self.smoothing_iterations = 2
+        self.smoothing_iterations = -28
+
+        # радиус поиска точек в облаке (для сглаживания)
+        self.search_radius = 0.1
 
         # Параметры экстраполяции
         self.extrapolation_enabled = False
         self.target_width = 4.0  # Ширина целевой области в метрах
         self.target_height = 8.0  # Высота целевой области в метрах
-        self.grid_resolution = 128  # Разрешение сетки экстраполяции
+        self.grid_resolution = 256  # Разрешение сетки экстраполяции
+        self.grid_resolution_main = 512  # Разрешение основной сетки
         
         # Параметры шума Перлина
         self.noise_scale = 0.5
@@ -946,7 +950,7 @@ class MeshReconstruction:
         
         return node
     
-    def create_mesh_from_point_cloud(self, size=512, n_samples=200):
+    def create_mesh_from_point_cloud(self, size=512):
         """
         Создаёт единый меш с плоской базой и адаптивным подъёмом вершин,
         используя точки из self.trs_points в качестве источника высот.
@@ -1010,27 +1014,47 @@ class MeshReconstruction:
         height_grid = np.zeros((grid_res, grid_res), dtype=np.float32)
         source_mask = np.zeros((grid_res, grid_res), dtype=bool)
 
-        # Заполняем ячейки, ближайшие к каждой исходной точке
-        # (прореживание не требуется, т.к. точек обычно немного)
-        for i in range(len(source_points)):
-            x_2d, y_2d = source_xy[i]
-            # локальные координаты относительно центра плоскости
-            local_x = x_2d - plane_center[0]
-            local_y = y_2d - plane_center[1]
+        epsilon = 1e-6  # защита от деления на 0
 
-            idx_x = np.argmin(np.abs(x_vals - local_x))
-            idx_y = np.argmin(np.abs(y_vals - local_y))
+        # Проходим по каждой ячейке сетки
+        for iy in range(grid_res):
+            for ix in range(grid_res):
 
-            if 0 <= idx_x < grid_res and 0 <= idx_y < grid_res:
-                # Если несколько точек попадают в один узел – берём максимум (можно и среднее)
-                if not source_mask[idx_y, idx_x] or source_z[i] > height_grid[idx_y, idx_x]:
-                    height_grid[idx_y, idx_x] = source_z[i]
-                    source_mask[idx_y, idx_x] = True
+                # координаты точки сетки в локальной системе
+                local_x = x_vals[ix]
+                local_y = y_vals[iy]
 
-        print(f"[DEBUG] Ячеек с прямыми значениями: {np.sum(source_mask)}")
+                # перевод в глобальные координаты
+                global_x = local_x + plane_center[0]
+                global_y = local_y + plane_center[1]
+
+                query_point = [global_x, global_y]
+
+                # --- 1. Поиск точек в радиусе ---
+                idxs = source_tree.query_ball_point(query_point, r=self.search_radius)
+
+                if len(idxs) == 0:
+                    continue
+
+                sampled_xy = source_xy[idxs]
+                sampled_z = source_z[idxs]
+
+                # --- 3. Расчёт расстояний ---
+                distances = np.linalg.norm(sampled_xy - query_point, axis=1)
+
+                # --- 4. Веса (ближе = больше вес) ---
+                weights = 1.0 / (distances + epsilon)
+
+                # --- 5. Взвешенное среднее Z ---
+                weighted_avg_z = np.sum(sampled_z * weights) / np.sum(weights)
+
+                height_grid[iy, ix] = weighted_avg_z
+                source_mask[iy, ix] = True
+
+        print(f"[DEBUG] Ячеек с рассчитанными значениями: {np.sum(source_mask)}")
 
         if np.sum(source_mask) == 0:
-            print("[ERROR] Ни одна исходная точка не попала в плоскую сетку")
+            print("[ERROR] Ни одна точка не попала в радиус поиска")
             return None
 
         # ------------------------------------------------------------
@@ -1740,7 +1764,7 @@ class MeshReconstruction:
         # self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
 
         if self.using_ply:
-            node = self.create_mesh_from_point_cloud()
+            node = self.create_mesh_from_point_cloud(self.grid_resolution_main)
         else:
             node = self.create_unified_perlin_mesh_with_lift()
 
