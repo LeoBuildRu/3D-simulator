@@ -9,6 +9,9 @@ from PyQt5.QtGui import *
 import yaml
 import trimesh
 
+import json 
+from datetime import datetime
+
 from panda3d.core import (
     Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
     GeomTriangles, NodePath, Vec3, TextureStage, Texture,
@@ -60,6 +63,10 @@ class CameraControlGUI(QWidget):
         self.status_timer = QTimer()
         self.status_timer.setSingleShot(True)
         self.status_timer.timeout.connect(self.clear_status)
+
+        default_combo = self.textures_config["default"]
+        self.on_texture_set_changed(default_combo)
+        self.textures_combo.setCurrentText(default_combo)
 
     def load_models_config(self):
         config_path = os.path.join(PROJECT_ROOT, "models_config.yaml")
@@ -437,7 +444,8 @@ class CameraControlGUI(QWidget):
             self.textures_combo = QComboBox()
             self.textures_combo.setMinimumHeight(25)
             for texture_set_name in self.textures_config.keys():
-                self.textures_combo.addItem(texture_set_name)
+                if(texture_set_name != "default"):
+                    self.textures_combo.addItem(texture_set_name)
             self.textures_combo.currentTextChanged.connect(self.on_texture_set_changed)
             texture_combo_layout.addWidget(self.textures_combo)
             texture_layout.addWidget(texture_combo_group)
@@ -488,53 +496,74 @@ class CameraControlGUI(QWidget):
         recon_layout = QVBoxLayout()
         recon_layout.setSpacing(8)
 
-        import json
-        from datetime import datetime
-        from PyQt5.QtCore import Qt, QDate
+                # --- Папки (всегда читаем обе) ---
+        self.recon_base_folders = {
+            "ply": os.path.join(os.getcwd(), "PLY_examples"),
+            "height": os.path.join(os.getcwd(), "height_examples")
+        }
 
-        self.json_folder = os.path.join(os.getcwd(), "PLY_examples")
         self.recon_all_files = []
 
-        # === ФИЛЬТРЫ ===
-        filter_layout = QHBoxLayout()
+        # ======================
+        # ФИЛЬТРЫ (2 строки)
+        # ======================
 
-        # Фильтр по имени
-        filter_layout.addWidget(QLabel("Имя:"))
+        # ---- Первая строка ----
+        filter_row_1 = QHBoxLayout()
+
+        # Тип данных
+        filter_row_1.addWidget(QLabel("Тип данных:"))
+        self.recon_data_type_filter = QComboBox()
+        self.recon_data_type_filter.addItem("Все типы", userData="all")
+        self.recon_data_type_filter.addItem("PLY", userData="ply")
+        self.recon_data_type_filter.addItem("Height", userData="height")
+        filter_row_1.addWidget(self.recon_data_type_filter)
+
+        # Имя
+        filter_row_1.addWidget(QLabel("Имя:"))
         self.recon_name_filter = QLineEdit()
         self.recon_name_filter.setPlaceholderText("Фильтр по имени файла...")
-        filter_layout.addWidget(self.recon_name_filter)
+        filter_row_1.addWidget(self.recon_name_filter)
 
-        # Фильтр по модели
-        filter_layout.addWidget(QLabel("Модель:"))
+        # Модель
+        filter_row_1.addWidget(QLabel("Модель:"))
         self.recon_model_filter = QComboBox()
         self.recon_model_filter.addItem("Все модели")
-        filter_layout.addWidget(self.recon_model_filter)
+        filter_row_1.addWidget(self.recon_model_filter)
 
-        # Фильтр по дате
-        filter_layout.addWidget(QLabel("С:"))
+        recon_layout.addLayout(filter_row_1)
+
+        # ---- Вторая строка ----
+        filter_row_2 = QHBoxLayout()
+
+        filter_row_2.addWidget(QLabel("С:"))
         self.recon_date_from = QDateEdit()
         self.recon_date_from.setCalendarPopup(True)
         self.recon_date_from.setDisplayFormat("dd.MM.yyyy")
         self.recon_date_from.setDate(QDate(2000, 1, 1))
-        filter_layout.addWidget(self.recon_date_from)
+        filter_row_2.addWidget(self.recon_date_from)
 
-        filter_layout.addWidget(QLabel("По:"))
+        filter_row_2.addWidget(QLabel("По:"))
         self.recon_date_to = QDateEdit()
         self.recon_date_to.setCalendarPopup(True)
         self.recon_date_to.setDisplayFormat("dd.MM.yyyy")
         self.recon_date_to.setDate(QDate.currentDate())
-        filter_layout.addWidget(self.recon_date_to)
+        filter_row_2.addWidget(self.recon_date_to)
 
-        recon_layout.addLayout(filter_layout)
+        filter_row_2.addStretch()
 
-        # === СПИСОК JSON ===
+        recon_layout.addLayout(filter_row_2)
+
+        # ======================
+        # СПИСОК
+        # ======================
         self.recon_json_list = QListWidget()
         self.recon_json_list.setMinimumHeight(250)
         recon_layout.addWidget(self.recon_json_list)
 
 
         # ======================
-        # ЗАГРУЗКА JSON ФАЙЛОВ
+        # ЗАГРУЗКА ФАЙЛОВ
         # ======================
         def load_recon_jsons():
             self.recon_all_files.clear()
@@ -544,34 +573,56 @@ class CameraControlGUI(QWidget):
 
             models = set()
 
-            if not os.path.exists(self.json_folder):
-                return
-
-            for file in os.listdir(self.json_folder):
-                if not file.endswith(".json"):
+            for folder_key, folder_path in self.recon_base_folders.items():
+                if not os.path.exists(folder_path):
                     continue
 
-                full_path = os.path.join(self.json_folder, file)
+                for file in os.listdir(folder_path):
+                    if not file.lower().endswith(".json"):
+                        continue
 
-                try:
-                    with open(full_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
+                    full_path = os.path.join(folder_path, file)
+
+                    try:
+                        with open(full_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    except Exception:
+                        continue
+
+                    # --- Определение типа ---
+                    data_type = "ply"
+                    #lower_keys = {k.lower() for k in data.keys()}
+                    if "heightmap_path" in data:
+                        data_type = "height"
 
                     model = data.get("model", "Unknown")
-                    time_str = data.get("time", "")
-                    dt = datetime.strptime(time_str, "%d.%m.%Y %H:%M")
+
+                    # --- Дата ---
+                    dt = None
+                    time_str = data.get("time")
+
+                    if isinstance(time_str, str):
+                        try:
+                            dt = datetime.strptime(time_str, "%d.%m.%Y %H:%M")
+                        except Exception:
+                            try:
+                                dt = datetime.fromisoformat(time_str)
+                            except Exception:
+                                pass
+
+                    if dt is None:
+                        dt = datetime.fromtimestamp(os.path.getmtime(full_path))
 
                     self.recon_all_files.append({
                         "name": file,
                         "path": full_path,
                         "model": model,
-                        "datetime": dt
+                        "datetime": dt,
+                        "data_type": data_type,
+                        "source_folder": os.path.basename(folder_path)
                     })
 
                     models.add(model)
-
-                except Exception:
-                    continue
 
             for m in sorted(models):
                 self.recon_model_filter.addItem(m)
@@ -588,6 +639,7 @@ class CameraControlGUI(QWidget):
 
             name_text = self.recon_name_filter.text().lower()
             selected_model = self.recon_model_filter.currentText()
+            selected_data_type = self.recon_data_type_filter.currentData()
 
             from_date = self.recon_date_from.date().toPyDate()
             to_date = self.recon_date_to.date().toPyDate()
@@ -599,37 +651,58 @@ class CameraControlGUI(QWidget):
             )
 
             for file in sorted_files:
+
                 if name_text and name_text not in file["name"].lower():
                     continue
 
                 if selected_model != "Все модели" and file["model"] != selected_model:
                     continue
 
+                if selected_data_type != "all" and file["data_type"] != selected_data_type:
+                    continue
+
                 file_date = file["datetime"].date()
                 if not (from_date <= file_date <= to_date):
                     continue
 
-                item = QListWidgetItem(
-                    f'{file["name"]} | {file["model"]} | {file["datetime"].strftime("%d.%m.%Y %H:%M")}'
-                )
+                if file["data_type"] == "height":
+                    display_text = f'[HEIGHT] {file["name"]} | {file["model"]} | {file["datetime"].strftime("%d.%m.%Y %H:%M")}'
+                else:
+                    display_text = f'[PLY] {file["name"]} | {file["model"]} | {file["datetime"].strftime("%d.%m.%Y %H:%M")}'
+
+                item = QListWidgetItem(display_text)
                 item.setData(Qt.UserRole, file)
+
+                if file["data_type"] == "height":
+                    item.setForeground(QBrush(QColor("#0b84ff")))
+                else:
+                    item.setForeground(QBrush(QColor("#ff6600")))
+
                 self.recon_json_list.addItem(item)
 
 
         # ======================
-        # КЛИК ПО ФАЙЛУ
+        # КЛИК
         # ======================
         def on_recon_file_clicked(item):
             file_data = item.data(Qt.UserRole)
+            if not file_data:
+                return
 
             model = file_data["model"]
             path = file_data["path"]
+            data_type = file_data["data_type"]
 
-            # 1️⃣ Сначала обновляем модель
             self.load_model_set(model)
 
-            # 2️⃣ Затем запускаем реконструкцию
-            self.panda_app.mesh_reconstruction.run_2d_to_3d_reconstruction_from(path)
+            recon_module = getattr(self.panda_app, "mesh_reconstruction", None)
+            if not recon_module:
+                return
+
+            if data_type == "height" and hasattr(recon_module, "run_height_to_3d_reconstruction_from"):
+                recon_module.run_height_to_3d_reconstruction_from(path)
+            else:
+                recon_module.run_2d_to_3d_reconstruction_from(path)
 
 
         # ======================
@@ -639,6 +712,7 @@ class CameraControlGUI(QWidget):
         self.recon_model_filter.currentIndexChanged.connect(apply_recon_filters)
         self.recon_date_from.dateChanged.connect(apply_recon_filters)
         self.recon_date_to.dateChanged.connect(apply_recon_filters)
+        self.recon_data_type_filter.currentIndexChanged.connect(apply_recon_filters)
         self.recon_json_list.itemClicked.connect(on_recon_file_clicked)
 
         load_recon_jsons()

@@ -1,13 +1,11 @@
 {
-  "metadata": {
-    "timestamp": "2026-01-15T16:54:14.006792",
-    "image_path": "corrected_20260115_165413.jpg",
-    "heightmap_path": "height_map_20260115_165413.png",
-    "image_size": {
-      "width": 2560,
-      "height": 1440
-    },
-    "total_keypoints": 4
+  "time": "15.01.2026 16:54:13",
+  "model": "Kamaz",
+  "image_path": "corrected_20260115_165413.jpg",
+  "heightmap_path": "height_map_20260115_165413.png",
+  "image_size": {
+    "width": 2560,
+    "height": 1440
   },
 "points_3d": [
     [

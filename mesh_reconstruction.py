@@ -162,9 +162,9 @@ class MeshReconstruction:
         fromvec = Vec3(farPoint - nearPoint)   
         fromvec.normalize()
 
-        # mult = 1 / fromvec[1]
-        # for i in range(3):
-        #     fromvec[i] = fromvec[i] * mult
+        mult = 1 / fromvec[1]
+        for i in range(3):
+            fromvec[i] = fromvec[i] * mult
 
         dir_world = self.panda_app.render.get_relative_vector(camera, fromvec)
 
@@ -176,6 +176,7 @@ class MeshReconstruction:
 
     def correct_depth(self, depth):
         return depth
+        return 1 / depth
         return math.sqrt(depth) 
 
     
@@ -234,7 +235,7 @@ class MeshReconstruction:
             depth = self.correct_depth(self.height_map[y, x])
             z = depth * (max_depth - min_depth) + min_depth
 
-            point = self.viewport_to_world_point(camera, u, v, z)
+            point = self.viewport_to_world_point_geometric(camera, u, v, z)
             proj_3d.append(self.panda_vec3_to_np(point))
 
         M = self.compute_transform_np(
@@ -256,7 +257,7 @@ class MeshReconstruction:
             depth = self.correct_depth(self.height_map[y, x])
             z = depth * (max_depth - min_depth) + min_depth
 
-            point = self.viewport_to_world_point(camera, u, v, z)
+            point = self.viewport_to_world_point_geometric(camera, u, v, z)
             diff = point - scene_3d[i]
             distance = math.sqrt(diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2])
             if(debug):
@@ -304,7 +305,7 @@ class MeshReconstruction:
         scene_3d = [np.array(p, dtype=float) for p in data["points_3d"]]
         self.scene_3d = scene_3d
 
-        if "keypoints_3d" in data:
+        if self.using_ply:
             print("Using 3d keypoints")
 
             min_scale = 0.0001
@@ -366,13 +367,13 @@ class MeshReconstruction:
                     if scaleStep == 0:
                         break
 
-                    scale = scaleStart - scaleStep
-                    while scale < scaleEnd:
-                        scale += scaleStep
-                        error = ApplyScale(scale)
+                    max_depth = scaleStart - scaleStep
+                    while max_depth < scaleEnd:
+                        max_depth += scaleStep
+                        error = ApplyScale(max_depth)
                         if error < best_scale_error:
                             best_scale_error = error
-                            best_scale = scale
+                            best_scale = max_depth
 
                     scaleStart = self.lerp(best_scale, scaleStart, lerpT)
                     scaleEnd = self.lerp(best_scale, scaleEnd, lerpT)
@@ -385,11 +386,9 @@ class MeshReconstruction:
             self.trs_points = trs_points
 
             return
-        else:
-            print("WARNING: No 3D keypoints! behaviour is undefined, results may be inaccurate. Please provide 3d keypoints for better reconstruction.")
 
-        img_w = data["metadata"]["image_size"]["width"]
-        img_h = data["metadata"]["image_size"]["height"]
+        img_w = data["image_size"]["width"]
+        img_h = data["image_size"]["height"]
 
         self.aspect_ratio = img_w/img_h
 
@@ -411,8 +410,8 @@ class MeshReconstruction:
         # 99-55 для стационарного решения
         # 0-41 для блендера
         fov_known = True
-        known_fov_x = 0
-        known_fov_y = 41.1
+        known_fov_x = 99
+        known_fov_y = 55
 
         self.matching_points = 4
 
@@ -425,11 +424,12 @@ class MeshReconstruction:
 
         bestError = 10**10
 
-        bestMinDepth = 0
-        bestMaxDepth = 0
-        bestFOV = 0
+        bestMinDepth = 1
+        bestMaxDepth = 2
+        bestFOV = 3
 
-        render_depth_known = True
+        render_depth_known = False
+        min_can_be_larger_than_max = True
 
         # из блендера
         render_min_depth = 3
@@ -472,25 +472,25 @@ class MeshReconstruction:
                 if scaleStep == 0 or maxDepthStep == 0:
                     break
                 
-                scale = localMaxDepthStart - maxDepthStep
-                while scale < localMaxDepthEnd:
-                    scale += maxDepthStep
+                max_depth = localMaxDepthStart - maxDepthStep
+                while max_depth < localMaxDepthEnd:
+                    max_depth += maxDepthStep
                     min_depth = scaleStart - scaleStep
-                    while min_depth < scaleEnd:
+                    while min_depth < scaleEnd and (min_depth < max_depth or min_can_be_larger_than_max):
                         min_depth += scaleStep
 
                         if(render_depth_known):
-                            min_depth = scale * ratio
+                            min_depth = max_depth * ratio
 
                         try:
-                            error = self.resolve_keypoints(scene_3d, points_2d, camera, min_depth, scale, False)
+                            error = self.resolve_keypoints(scene_3d, points_2d, camera, min_depth, max_depth, False)
                             if(error < localBest):
                                 localBest = error
                             if(error < bestError):
                                 bestError = error
                                 bestFOV = fov
                                 bestMinDepth = min_depth
-                                bestMaxDepth = scale
+                                bestMaxDepth = max_depth
                         except:
                             continue
 
@@ -508,8 +508,11 @@ class MeshReconstruction:
             print(f"local best for FOV {fov} is {localBest}")
 
 
+        #self.min_depth = bestMinDepth
+        #self.max_depth = bestMaxDepth + (bestMaxDepth - bestMinDepth) * 0.3 # чтобы насыпь сходилась с дном, некий магический коэффицент коррекции
+
         self.min_depth = bestMinDepth
-        self.max_depth = bestMaxDepth + (bestMaxDepth - bestMinDepth) * 0.3 # чтобы насыпь сходилась с дном, некий магический коэффицент коррекции
+        self.max_depth = bestMaxDepth
 
         fov = bestFOV
         self.fov_y = fov
@@ -1753,15 +1756,14 @@ class MeshReconstruction:
             self.using_ply = True
             self.point_cloud = pcu.load_mesh_v(self.ply_path)
         else:
-            self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["image_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
+            self.using_ply = False
+            self.heightmap_path = os.path.dirname(json_path) + "/" + data["heightmap_path"]
             if not self.load_height_map(): 
                 return
         
         self.cam_node = self.panda_app.cam.node()
 
         self.reconstruct_camera_pos_hpr_fov_depth(data)
-
-        # self.heightmap_path = os.path.dirname(json_path) + "/" + data["metadata"]["mask_path"].replace("corrected_", "height_map_").replace(".jpg", ".png")
 
         if self.using_ply:
             node = self.create_mesh_from_point_cloud(self.grid_resolution_main)

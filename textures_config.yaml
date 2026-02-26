@@ -135,3 +135,5 @@ Rock_texture_1:
     size: 0.05
     size_var: 0.03
     seed: 234
+
+default: "stones_8k"
