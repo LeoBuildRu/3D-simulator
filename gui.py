@@ -42,9 +42,10 @@ else:
     PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 class CameraControlGUI(QWidget):
-    def __init__(self, panda_app):
+    def __init__(self, panda_app, main_window=None):
         super().__init__()
         self.panda_app = panda_app
+        self.main_window = main_window
         self.panda_widget = Panda3DWidget()
         
         # Фиксированные значения поворота камеры
@@ -67,6 +68,68 @@ class CameraControlGUI(QWidget):
         default_combo = self.textures_config["default"]
         self.on_texture_set_changed(default_combo)
         self.textures_combo.setCurrentText(default_combo)
+
+        self.hide_overlay_timer = QTimer()
+        self.hide_overlay_timer.setSingleShot(True)
+        self.hide_overlay_timer.timeout.connect(self.hide_overlay)
+
+        self.overlay = None
+
+    def show_overlay(self, message="подождите"):
+        """Показать полупрозрачный overlay с логом поверх всего окна"""
+        parent = self.main_window if self.main_window is not None else self.window()
+        if parent is None:
+            return
+
+        if self.overlay is None:
+            self.overlay = QWidget(parent)
+            self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 200);")
+            self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+            self.overlay.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+
+            layout = QVBoxLayout(self.overlay)
+            layout.setAlignment(Qt.AlignCenter)
+
+            # Заголовок
+            title = QLabel("Выполняется операция...")
+            title.setAlignment(Qt.AlignCenter)
+            title.setStyleSheet("color: white; font-size: 18px; font-weight: bold; margin-bottom: 20px;")
+            layout.addWidget(title)
+
+            # Метка для текущего сообщения (вместо QTextEdit)
+            self.overlay_label = QLabel(message)
+            self.overlay_label.setAlignment(Qt.AlignCenter)
+            self.overlay_label.setWordWrap(True)
+            self.overlay_label.setStyleSheet("""
+                color: white;
+                font-size: 14pt;
+                font-weight: 500;
+                padding: 20px;
+            """)
+            layout.addWidget(self.overlay_label)
+
+            self.overlay.hide()
+
+        # Очищаем и устанавливаем начальное сообщение
+        self.overlay_label.setText(message)
+        # Устанавливаем размер равным родительскому окну
+        self.overlay.setGeometry(parent.rect())
+        self.overlay.show()
+        self.overlay.raise_()
+        QApplication.processEvents()
+
+    def log_message(self, message):
+        """Обновить текст в центре оверлея"""
+        if hasattr(self, 'overlay_label') and self.overlay_label is not None:
+            self.overlay_label.setText(message)
+            QApplication.processEvents()
+
+
+    def hide_overlay(self):
+        """Скрыть overlay"""
+        if self.overlay is not None:
+            self.overlay.hide()
+            QApplication.processEvents()
 
     def load_models_config(self):
         config_path = os.path.join(PROJECT_ROOT, "models_config.yaml")
@@ -491,6 +554,19 @@ class CameraControlGUI(QWidget):
         process_section.setLayout(process_layout)
         layout.addWidget(process_section)
 
+        # === НОВАЯ СЕКЦИЯ: ПАРАМЕТРЫ ЧАСТИЦ ===
+        particle_section = QGroupBox("ПАРАМЕТРЫ ЧАСТИЦ")
+        particle_layout = QVBoxLayout()
+        particle_layout.setSpacing(8)
+
+        self.particle_flag_checkbox = QCheckBox("Распределять частицы (particle_flag)")
+        self.particle_flag_checkbox.setChecked(self.panda_app.particle_flag)  # синхронизация с текущим состоянием
+        self.particle_flag_checkbox.stateChanged.connect(self.on_particle_flag_changed)
+
+        particle_layout.addWidget(self.particle_flag_checkbox)
+        particle_section.setLayout(particle_layout)
+        layout.addWidget(particle_section)
+
         # === Секция: 2D в 3D реконструкция ===
         recon_section = QGroupBox("2D В 3D РЕКОНСТРУКЦИЯ")
         recon_layout = QVBoxLayout()
@@ -685,6 +761,7 @@ class CameraControlGUI(QWidget):
         # КЛИК
         # ======================
         def on_recon_file_clicked(item):
+            self.panda_app.clear_scene()
             file_data = item.data(Qt.UserRole)
             if not file_data:
                 return
@@ -693,16 +770,33 @@ class CameraControlGUI(QWidget):
             path = file_data["path"]
             data_type = file_data["data_type"]
 
-            self.load_model_set(model)
+            # Показываем оверлей
+            self.show_overlay("🚀 Запуск реконструкции...")
+            try:
+                self.log_message(f"📁 Загружается модель: {model}")
+                self.load_model_set(model)
+                self.log_message("✅ Модель загружена")
 
-            recon_module = getattr(self.panda_app, "mesh_reconstruction", None)
-            if not recon_module:
-                return
+                recon_module = getattr(self.panda_app, "mesh_reconstruction", None)
+                if not recon_module:
+                    self.log_message("❌ Модуль реконструкции не найден")
+                    return
 
-            if data_type == "height" and hasattr(recon_module, "run_height_to_3d_reconstruction_from"):
-                recon_module.run_height_to_3d_reconstruction_from(path)
-            else:
-                recon_module.run_2d_to_3d_reconstruction_from(path)
+                # Запускаем реконструкцию в зависимости от типа
+                if data_type == "height" and hasattr(recon_module, "run_height_to_3d_reconstruction_from"):
+                    self.log_message("🌄 Запуск реконструкции по карте высот...")
+                    recon_module.run_height_to_3d_reconstruction_from(path)
+                else:
+                    self.log_message("📊 Запуск реконструкции по облаку точек...")
+                    recon_module.run_2d_to_3d_reconstruction_from(path)
+
+                self.log_message("✅ Реконструкция завершена")
+            except Exception as e:
+                self.log_message(f"❌ Ошибка: {str(e)}")
+                print(f"Ошибка реконструкции: {e}")
+            finally:
+                # Скрываем оверлей через 2 секунды, чтобы пользователь увидел финальное сообщение
+                self.hide_overlay_timer.start(2000)
 
 
         # ======================
@@ -721,6 +815,11 @@ class CameraControlGUI(QWidget):
         layout.addWidget(recon_section)
         
         layout.addStretch()
+
+    def on_particle_flag_changed(self, state):
+        """Обработчик изменения состояния чекбокса particle_flag."""
+        self.panda_app.particle_flag = (state == Qt.Checked)
+        self.set_status(f"Распределение частиц: {'включено' if self.panda_app.particle_flag else 'выключено'}")
 
     def setup_scene_control_tab(self):
         layout = QVBoxLayout(self.scene_control_tab)
@@ -1387,43 +1486,63 @@ class CameraControlGUI(QWidget):
         self.panda_app.Target_Volume = value
     
     def run_full_process(self):
-        target_volume = self.target_volume_spinbox.value()
-        self.panda_app.Target_Volume = target_volume
-        
-        current_model_set = self.model_set_combo.currentText()
-        current_texture_set = self.textures_combo.currentText() if hasattr(self, 'textures_combo') else None
+        self.show_overlay()
+        if self.hide_overlay_timer.isActive():
+            self.hide_overlay_timer.stop()
+        try:
+            self.log_message("🔄 Запуск полного процесса построения наполнения...")
+            target_volume = self.target_volume_spinbox.value()
+            self.panda_app.Target_Volume = target_volume
+            self.log_message(f"✅ Целевой объём установлен: {target_volume}")
 
-        if current_model_set and current_model_set in self.models_config:
-            config = self.models_config[current_model_set]
-            ground_plane_z = config.get('ground_plane', 0)
-            
-            if current_texture_set and current_texture_set in self.textures_config:
-                try:
-                    self.textures_combo.currentTextChanged.disconnect(self.on_texture_set_changed)
-                    texture_config = self.textures_config[current_texture_set]
-                    self.panda_app.set_texture_set(texture_config)
-                    self.textures_combo.setCurrentText(current_texture_set)
-                finally:
-                    self.textures_combo.currentTextChanged.connect(self.on_texture_set_changed)
-            
-            self.panda_app.create_ground_plane()
-            self.panda_app.ground_plane.setPos(0, 0, ground_plane_z)
-            self.plane_pos_z_spinbox.setValue(ground_plane_z)
-            
-            success_aabb = self.panda_app.perform_AABB_plane()
-            
-            if success_aabb:
-                success_perlin = self.panda_app.perlin_generator.generate_perlin_mesh_from_csg()
-                
-                if success_perlin:
-                    self.set_status(
-                        f"✅ Полный процесс выполнен успешно!\n"
-                        f"Target Volume: {target_volume}\n"
-                        f"Позиция ground_plane: Z={ground_plane_z}"
-                    )
+            current_model_set = self.model_set_combo.currentText()
+            current_texture_set = self.textures_combo.currentText() if hasattr(self, 'textures_combo') else None
+
+            if current_model_set and current_model_set in self.models_config:
+                config = self.models_config[current_model_set]
+                ground_plane_z = config.get('ground_plane', 0)
+
+                if current_texture_set and current_texture_set in self.textures_config:
+                    try:
+                        self.textures_combo.currentTextChanged.disconnect(self.on_texture_set_changed)
+                        texture_config = self.textures_config[current_texture_set]
+                        self.panda_app.set_texture_set(texture_config)
+                        self.textures_combo.setCurrentText(current_texture_set)
+                        self.log_message(f"✅ Набор текстур '{current_texture_set}' загружен")
+                    finally:
+                        self.textures_combo.currentTextChanged.connect(self.on_texture_set_changed)
+                    QApplication.processEvents()
+
+                self.log_message("🛠️ Создание плоскости земли...")
+                self.panda_app.create_ground_plane()
+                self.panda_app.ground_plane.setPos(0, 0, ground_plane_z)
+                self.plane_pos_z_spinbox.setValue(ground_plane_z)
+                QApplication.processEvents()
+
+                self.log_message("📐 Выполнение AABB plane...")
+                success_aabb = self.panda_app.perform_AABB_plane()
+                QApplication.processEvents()
+
+                if success_aabb:
+                    self.log_message("🌄 Генерация Perlin mesh...")
+                    success_perlin = self.panda_app.perlin_generator.generate_perlin_mesh_from_csg()
+                    QApplication.processEvents()
+
+                    if success_perlin:
+                        self.log_message("✅ Все операции завершены успешно!")
+                        self.set_status(
+                            f"✅ Полный процесс выполнен успешно!\n"
+                            f"Target Volume: {target_volume}\n"
+                            f"Позиция ground_plane: Z={ground_plane_z}"
+                        )
+                    else:
+                        self.log_message("❌ Ошибка генерации Perlin mesh")
+                        self.set_status("⚠️ Не удалось сгенерировать перлин-меш", True)
                 else:
-                    self.set_status("⚠️ Не удалось сгенерировать перлин-меш", True)
+                    self.log_message("❌ Ошибка выполнения AABB plane")
+                    self.set_status("⚠️ Не удалось выполнить AABB plane", True)
             else:
-                self.set_status("⚠️ Не удалось выполнить AABB plane", True)
-        else:
-            self.set_status("❌ Не выбран набор моделей или набор не найден", True)
+                self.log_message("❌ Не выбран набор моделей")
+                self.set_status("❌ Не выбран набор моделей или набор не найден", True)
+        finally:
+            self.hide_overlay_timer.start(10)

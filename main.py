@@ -11,6 +11,12 @@ else:
 # Вставляем базовый путь в начало sys.path, чтобы локальные копии модулей имели приоритет
 sys.path.insert(0, base_path)
 
+# --- Добавлено: настройка путей поиска моделей для Panda3D ---
+from panda3d.core import get_model_path
+get_model_path().prepend_directory(base_path)
+get_model_path().prepend_directory(os.path.join(base_path, "models"))
+# -------------------------------------------------------------
+
 # Теперь можно импортировать остальные модули
 from gui import CameraControlGUI
 from panda_widget import Panda3DWidget
@@ -19,7 +25,11 @@ from perlin_mesh_generator import PerlinMeshGenerator
 from renderer_utils import RendererUtils
 from mesh_reconstruction import MeshReconstruction
 from mesh_distribution import MeshDistributor
+from crash_reporter import TelegramCrashReporter
 from TLS_client import TLS_client
+
+BOT_TOKEN = "8773064116:AAEiJdyHYysLpSnAx-gbDHG0DMbvV92IpsA"
+CHAT_ID = "-5295757150"
 
 import sys
 import os
@@ -100,7 +110,8 @@ class MainWindowManager:
             border: 1px solid #2a2a35;
         """)
         
-        self.control_panel = CameraControlGUI(panda_app)
+        self.control_panel = CameraControlGUI(panda_app, main_window=self.main_window)
+        panda_app.gui = self.control_panel
         self.control_panel.setMinimumWidth(380)
         self.control_panel.setMaximumWidth(380)
         
@@ -181,6 +192,30 @@ class MainWindowManager:
     def run(self):
         self.show()
         return self.qt_app.exec_()
+    
+class CrashReportingApplication(QApplication):
+    """QApplication с перехватом исключений в слотах."""
+    def notify(self, receiver, event):
+        try:
+            return super().notify(receiver, event)
+        except Exception:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            reporter = TelegramCrashReporter(BOT_TOKEN, CHAT_ID)
+            reporter.report_exception(exc_type, exc_value, exc_traceback)
+            sys.exit(1)  # завершаем приложение после краша
+            return False
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    """Глобальный обработчик неперехваченных исключений."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    reporter = TelegramCrashReporter(BOT_TOKEN, CHAT_ID)
+    reporter.report_exception(exc_type, exc_value, exc_traceback)
+    sys.exit(1)
+
+# Устанавливаем глобальный обработчик
+sys.excepthook = global_exception_handler
 
 class MyApp(ShowBase):
     def __init__(self):
@@ -207,6 +242,8 @@ class MyApp(ShowBase):
             'textureRepeatU': 160.0,
             'textureRepeatV': 160.0
         }
+
+        self.gui = None
         
         self.last_target_model_trimesh = None
         self.last_best_z = None
@@ -217,14 +254,15 @@ class MyApp(ShowBase):
         self.model_paths = {}
 
         self.setup_scene()
+        self.create_top_overlay()
 
         self.next_model_x = 0
 
         self.current_model_set = None
 
         # временный флаг:
-        self.particle_flag = False
-        self.canDistributeMeshes = False
+        self.particle_flag = True
+        self.canDistributeMeshes = True
 
         self.Target_Cuzov = "Scania-Cuzov.gltf"
         self.Target_Y_offset = 0
@@ -286,6 +324,7 @@ class MyApp(ShowBase):
         self.current_z = 0
 
         self.final_model = None
+        self.final_mesh_node = None
 
         self.ground_plane = None
         self.plane_size_x = 100.0
@@ -306,6 +345,58 @@ class MyApp(ShowBase):
         self.renderer_utils = RendererUtils(self)
 
         self.mesh_reconstruction = MeshReconstruction(self, tls_client=self.tls_client)
+
+    def create_top_overlay(self):
+        """Создаёт панель, прижатую к верхнему левому углу."""
+        from direct.gui.DirectFrame import DirectFrame
+        from direct.gui.DirectLabel import DirectLabel
+        from panda3d.core import TextNode
+        import os
+
+        r, g, b = 0x25 / 255.0, 0x25 / 255.0, 0x32 / 255.0
+
+        # Размеры панели в пикселях
+        panel_width = 500
+        panel_height = 100
+        
+        # Отступы от угла экрана
+        margin_x = 20
+        margin_z = -20 # В pixel2d вниз — это минус
+
+        self.top_overlay = DirectFrame(
+            parent=pixel2d, 
+            frameColor=(r, g, b, 1.0),
+            frameSize=(0, panel_width, -panel_height, 0),
+            pos=(margin_x, 0, margin_z), # Фиксированная позиция в углу
+            sortOrder=100,
+            suppressMouse=True
+        )
+
+        label_options = {
+            "parent": self.top_overlay,
+            "text_scale": 16,               
+            "text_fg": (1, 1, 1, 1),
+            "text_align": TextNode.ALeft,
+            "frameColor": (0, 0, 0, 0),
+            "relief": None
+        }
+
+        # Позиции текста внутри панели
+        text_margin = 20
+        self.model_label = DirectLabel(text="Model: —", pos=(text_margin, 0, -25), **label_options)
+        self.texture_label = DirectLabel(text="Texture: —", pos=(text_margin, 0, -50), **label_options)
+        self.volume_label = DirectLabel(text="Volume: —", pos=(text_margin, 0, -75), **label_options)
+
+    def update_overlay_info(self, model=None, texture=None, volume=None):
+        if model is not None:
+            self.model_label['text'] = f"Model: {model}"
+        if texture is not None:
+            import os
+            tex_name = os.path.basename(texture) if texture else "—"
+            self.texture_label['text'] = f"Texture: {tex_name}"
+        if volume is not None:
+            self.volume_label['text'] = f"Volume: {volume:.2f}"
+
 
     def setup_window_for_parenting(self, parent_hwnd):
         if hasattr(self, 'win') and self.win:
@@ -348,6 +439,8 @@ class MyApp(ShowBase):
             new_texture_set['displacement'] = new_texture_set['height']
         
         self.current_texture_set = new_texture_set
+        tex_path = new_texture_set.get('diffuse') or new_texture_set.get('albedo')
+        self.update_overlay_info(texture=tex_path)
         
         if('mesh_distributions' in new_texture_set):
             self.mesh_distributions_data = new_texture_set["mesh_distributions"]
@@ -572,6 +665,9 @@ class MyApp(ShowBase):
         return volume
     
     def perform_AABB_plane(self):
+        if self.gui:
+            self.gui.log_message("Начало perform_AABB_plane...")
+
         target_model = None
         target_model_path = None
         for model in self.loaded_models:
@@ -586,6 +682,8 @@ class MyApp(ShowBase):
         if target_model is None:
             return False
 
+        if self.gui:
+            self.gui.log_message("📦 Вычисление AABB модели...")
         min_point, max_point = target_model.getTightBounds()
         aabb_center = (min_point + max_point) / 2.0
         aabb_size = max_point - min_point
@@ -613,6 +711,8 @@ class MyApp(ShowBase):
             print("[ERROR] TLS client not available. Cannot perform intersection.")
             return False
 
+        if self.gui:
+            self.gui.log_message("✂️ Выполнение boolean операции через TLS-сервер...")
         try:
             # Отправляем запрос на сервер для пересечения
             result_verts, result_tris = self.tls_client.send_boolean_intersection(
@@ -632,6 +732,8 @@ class MyApp(ShowBase):
             return False
         # ----------------------------------------------------------------
 
+        if self.gui:
+            self.gui.log_message("✅ Boolean операция завершена, создание меша...")
         csg_result_panda = self.trimesh_to_panda(result_mesh)
 
         material = Material()
@@ -653,6 +755,9 @@ class MyApp(ShowBase):
         csg_result_panda.setHpr(old_hpr)
         csg_result_panda.setScale(old_scale)
 
+        if self.gui:
+            self.gui.log_message("🔄 Замена ground_plane на результат CSG")
+
         self.ground_plane = csg_result_panda
 
         if not hasattr(self, 'csg_results'):
@@ -666,7 +771,9 @@ class MyApp(ShowBase):
 
         self.ground_plane.hide()
 
-        return True
+        if self.gui:
+            self.gui.log_message("✅ AABB plane успешно выполнено")
+        return True   
 
     def panda_to_trimesh(self, node_path):
         geom_node = node_path.node()
@@ -908,28 +1015,33 @@ class MyApp(ShowBase):
             light_mgr = self.render_pipeline.light_manager
 
     def create_perlin_noise_mesh(self):
+        import os
+        from panda3d.core import Texture, TextureStage, Material, GeomVertexFormat, GeomVertexData, \
+            GeomVertexWriter, GeomTriangles, Geom, GeomNode, LPoint3f
+
         size_x = 2000.0
         size_y = 2000.0
         size_z = 2.0
         position = LPoint3f(0.0, 0.0, -1.0)
-        
+
+        # Коэффициенты повторения текстур по-прежнему могут браться из current_texture_set
         texture_repeat_u = self.current_texture_set.get('textureRepeatU', 160.0)
         texture_repeat_v = self.current_texture_set.get('textureRepeatV', 160.0)
-        
-        format = GeomVertexFormat.getV3n3t2() 
+
+        format = GeomVertexFormat.getV3n3t2()
         format = GeomVertexFormat.registerFormat(format)
         vdata = GeomVertexData("simplified_perlin_data", format, Geom.UHStatic)
         vertex = GeomVertexWriter(vdata, "vertex")
         normal = GeomVertexWriter(vdata, "normal")
         texcoord = GeomVertexWriter(vdata, "texcoord")
-        
+
         grid_size = 64
         step_x = size_x / (grid_size - 1) if grid_size > 1 else 0
         step_y = size_y / (grid_size - 1) if grid_size > 1 else 0
         half_size_x = size_x / 2.0
         half_size_y = size_y / 2.0
         pos_z = position.getZ() + (size_z / 2.0)
-        
+
         for y in range(grid_size):
             for x in range(grid_size):
                 world_x = x * step_x - half_size_x
@@ -939,10 +1051,10 @@ class MyApp(ShowBase):
                 normal.addData3f(0, 0, 1)
                 normalized_u = x / (grid_size - 1) if grid_size > 1 else 0.0
                 normalized_v = y / (grid_size - 1) if grid_size > 1 else 0.0
-                u = normalized_u * texture_repeat_u  
-                v = normalized_v * texture_repeat_v  
+                u = normalized_v * texture_repeat_u
+                v = -normalized_u * texture_repeat_v
                 texcoord.addData2f(u, v)
-        
+
         prim = GeomTriangles(Geom.UHStatic)
         for y in range(grid_size - 1):
             for x in range(grid_size - 1):
@@ -953,41 +1065,106 @@ class MyApp(ShowBase):
                 prim.addVertices(i1, i2, i3)
                 prim.addVertices(i2, i4, i3)
         prim.closePrimitive()
-        
+
         geom = Geom(vdata)
         geom.addPrimitive(prim)
         node = GeomNode("simplified_perlin_noise_mesh")
         node.addGeom(geom)
-        
+
         self.perlin_model = self.render.attachNewNode(node)
         self.perlin_model.setPos(0, 0, 0)
-        
+
         if not hasattr(self, 'loaded_models'):
             self.loaded_models = []
         self.loaded_models.append(self.perlin_model)
-        
+
         if not hasattr(self, 'model_paths'):
             self.model_paths = {}
         self.model_paths[id(self.perlin_model)] = "perlin_noise_mesh"
-        
-        diffuse_texture_path = "textures/groundPerlin_8k/aerial_beach_03_diff_8k.jpg"
-        texture = self.loader.loadTexture(diffuse_texture_path)
-        if texture:
-            texture.setMinfilter(Texture.FTLinearMipmapLinear)
-            texture.setMagfilter(Texture.FTLinear)
-            texture.setWrapU(Texture.WMRepeat) 
-            texture.setWrapV(Texture.WMRepeat) 
-            self.perlin_model.setTexture(texture, 1)
-        
-        material = Material("simplified_perlin_material")
-        material.setDiffuse((1.0, 1.0, 1.0, 1.0))
-        material.setAmbient((0.3, 0.3, 0.3, 1.0))
-        material.setSpecular((0.5, 0.5, 0.5, 1.0))
-        material.setShininess(10.0)
-        self.perlin_model.setMaterial(material, 1)
-        
-        self.perlin_model.setShaderAuto()
-        self.perlin_model.setTwoSided(True)
+
+        # ===== НОВЫЙ КОД ПРИМЕНЕНИЯ ТЕКСТУР (ФИКСИРОВАННЫЕ ПУТИ) =====
+        # ------------------------------------------------------------------
+        # Прямое указание путей к текстурам в папке groundPerlin_8k
+        # ------------------------------------------------------------------
+        diffuse_path = "textures/groundPerlin_8k/aerial_beach_03_diff_8k.jpg"
+        normal_path = "textures/groundPerlin_8k/aerial_beach_03_nor_dx_8k.jpg"
+        roughness_path = "textures/groundPerlin_8k/aerial_beach_03_rough_8k.jpg"
+        metallic_path = None  # металличность не используется, будет заглушка
+
+        # ------------------------------------------------------------------
+        # Материал, совместимый с RP
+        # ------------------------------------------------------------------
+        mat = Material()
+        mat.set_base_color((1, 1, 1, 1))          # обязательно белый для PBR
+        mat.set_emission((0, 1, 0, 0))             # активирует карту нормалей (RP)
+        self.perlin_model.set_material(mat)
+
+        # ------------------------------------------------------------------
+        # Вспомогательная функция настройки текстур
+        # ------------------------------------------------------------------
+        def setup_tex(tex, srgb=False):
+            if srgb:
+                tex.set_format(Texture.F_srgb)
+            tex.set_minfilter(Texture.FTLinearMipmapLinear)
+            tex.set_magfilter(Texture.FTLinear)
+            tex.set_wrap_u(Texture.WMRepeat)
+            tex.set_wrap_v(Texture.WMRepeat)
+
+        # ------------------------------------------------------------------
+        # Текстурные стадии (строгий порядок для RP)
+        # ------------------------------------------------------------------
+        ts_color = TextureStage("0-color")
+        ts_color.set_sort(0)
+        ts_color.set_priority(0)
+
+        ts_normal = TextureStage("1-normal")
+        ts_normal.set_sort(1)
+        ts_normal.set_priority(1)
+
+        ts_metal = TextureStage("2-metallic")
+        ts_metal.set_sort(2)
+        ts_metal.set_priority(2)
+
+        ts_rough = TextureStage("3-roughness")
+        ts_rough.set_sort(3)
+        ts_rough.set_priority(3)
+
+        # ------------------------------------------------------------------
+        # Загрузка и назначение текстур
+        # ------------------------------------------------------------------
+
+        # Диффузная (albedo)
+        diffuse_tex = self.loader.loadTexture(diffuse_path)
+        if diffuse_tex:
+            setup_tex(diffuse_tex, srgb=True)
+            self.perlin_model.set_texture(ts_color, diffuse_tex)
+
+        # Нормалей
+        normal_tex = self.loader.loadTexture(normal_path)
+        if normal_tex:
+            setup_tex(normal_tex)
+            self.perlin_model.set_texture(ts_normal, normal_tex)
+
+        # Металличность (заглушка, т.к. metallic_path = None)
+        metal_tex = Texture("dummy_metal")
+        metal_tex.setup2dTexture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+        metal_tex.setRamImage(b"\x00")
+        setup_tex(metal_tex)
+        self.perlin_model.set_texture(ts_metal, metal_tex)
+
+        # Шероховатость
+        rough_tex = self.loader.loadTexture(roughness_path)
+        if rough_tex:
+            setup_tex(rough_tex)
+            self.perlin_model.set_texture(ts_rough, rough_tex)
+
+        # ------------------------------------------------------------------
+        # Обязательные флаги для RP
+        # ------------------------------------------------------------------
+        self.perlin_model.set_shader_auto()
+        self.perlin_model.set_two_sided(True)
+
+        # Дополнительные настройки из оригинального метода
         self.perlin_model.setBin("fixed", 0)
         self.perlin_model.setDepthOffset(1)
 
@@ -1373,6 +1550,7 @@ class MyApp(ShowBase):
             self.current_ground_plane_z = config['ground_plane']
         
         self.current_model_set = model_set_name
+        self.update_overlay_info(model=model_set_name)
         
         if hasattr(self, 'perlin_model') and self.perlin_model:
             if self.perlin_model.isHidden():
@@ -1395,6 +1573,19 @@ class MyApp(ShowBase):
                 self.loaded_models.remove(self.dynamic_perlin_model)
             self.dynamic_perlin_model.removeNode()
             self.dynamic_perlin_model = None
+
+        if hasattr(self, 'mesh_reconstruction'):
+            if hasattr(self.mesh_reconstruction, 'final_mesh_node') and self.mesh_reconstruction.final_mesh_node:
+                if self.mesh_reconstruction.final_mesh_node in self.loaded_models:
+                    self.loaded_models.remove(self.mesh_reconstruction.final_mesh_node)
+                self.mesh_reconstruction.final_mesh_node.removeNode()
+                self.mesh_reconstruction.final_mesh_node = None
+
+            if hasattr(self.mesh_reconstruction, 'mesh_node') and self.mesh_reconstruction.mesh_node:
+                if self.mesh_reconstruction.mesh_node in self.loaded_models:
+                    self.loaded_models.remove(self.mesh_reconstruction.mesh_node)
+                self.mesh_reconstruction.mesh_node.removeNode()
+                self.mesh_reconstruction.mesh_node = None
         
         if hasattr(self, 'final_model') and self.final_model:
             if self.final_model in self.loaded_models:
@@ -1435,7 +1626,7 @@ class MyApp(ShowBase):
         self.loaded_models = models_to_keep
         
 def main():
-    app = QApplication(sys.argv)
+    app = CrashReportingApplication(sys.argv)
     
     main_window = QMainWindow()
     main_window.setWindowTitle('3D simulator')
@@ -1458,7 +1649,10 @@ def main():
     
     panda_app = MyApp()
     
-    control_panel = CameraControlGUI(panda_app)
+    control_panel = CameraControlGUI(panda_app, main_window=main_window)
+    panda_app.gui = control_panel
+    if hasattr(panda_app, 'perlin_generator'):
+        panda_app.perlin_generator.gui = control_panel
     control_panel.setFixedWidth(380)             # ширина панели фиксирована
     # Панель растягивается по высоте вместе с окном
     control_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
@@ -1478,8 +1672,9 @@ def main():
     # Функция обновления размеров встроенного окна Panda3D
     def update_panda_window():
         if hasattr(panda_app, 'panda_hwnd') and panda_app.panda_hwnd:
-            rect = panda_container.geometry()
-            win32gui.MoveWindow(panda_app.panda_hwnd, 0, 0, rect.width(), rect.height(), True)
+            if win32gui.IsWindow(panda_app.panda_hwnd):
+                rect = panda_container.geometry()
+                win32gui.MoveWindow(panda_app.panda_hwnd, 0, 0, rect.width(), rect.height(), True)
     
     def initialize_integration():
         if hasattr(panda_app, 'win') and panda_app.win:

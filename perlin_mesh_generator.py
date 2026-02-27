@@ -46,6 +46,8 @@ class PerlinMeshGenerator:
         self.processed_model = None
         self.current_display_model = None
 
+        self.gui = panda_app.gui
+
         self.last_size_x = None
         self.last_size_y = None
         self.last_half_size_x = None
@@ -61,6 +63,8 @@ class PerlinMeshGenerator:
     def generate_perlin_mesh(self, grid_size=48):
         """Генерация перлин-меша с указанным размером сетки через C++ сервер"""
         base_vertex_count = grid_size * grid_size
+        if self.gui:
+            self.gui.log_message(f"🔄 Отправка запроса на сервер для генерации перлин-меша (grid_size={grid_size})...")
         self.last_grid_size = grid_size
         
         # Получаем размеры из последней CSG операции
@@ -155,6 +159,9 @@ class PerlinMeshGenerator:
         if result is None:
             raise RuntimeError("Не удалось получить данные от сервера генерации")
         
+        if self.gui:
+            self.gui.log_message("✅ Данные от сервера получены, применение falloff...")
+        
         vertices, normals_from_server, texcoords = result
         
         # Преобразуем списки в удобный формат: список кортежей (x,y,z)
@@ -167,6 +174,9 @@ class PerlinMeshGenerator:
         
         # Пересчитываем нормали после falloff
         normals_list = self._calculate_normals(vertices_list, grid_size)
+
+        if self.gui:
+            self.gui.log_message("✅ Falloff применён")
         
         # Строим геометрию Panda3D
         perlin_np = self._create_geom_from_vertices(
@@ -177,6 +187,9 @@ class PerlinMeshGenerator:
         # ВНИМАНИЕ: здесь сохраняются уже вершины после displacement и falloff
         self.perlin_vertices_before_displace = vertices_list.copy()
         self.perlin_texcoords_before_displace = texcoords_list.copy()
+
+        if self.gui:
+            self.gui.log_message("✅ Геометрия создана")
         
         return perlin_np
     
@@ -227,6 +240,9 @@ class PerlinMeshGenerator:
             print("Нет сохраненной target_model_trimesh")
             return False
         
+        if self.gui:
+            self.gui.log_message("🔄 Создание меша из сохранённых данных перлина...")
+        
         texture_repeatX = self.panda_app.current_texture_set.get('textureRepeatX', 1.35)
         texture_repeatY = self.panda_app.current_texture_set.get('textureRepeatY', 3.2)
         strength = self.panda_app.current_texture_set.get('strength', 0.14)
@@ -256,12 +272,24 @@ class PerlinMeshGenerator:
         
         vertices = self._apply_displacement(vertices, texcoords_list, height_array, tex_width, tex_height, strength)
         
+        if self.gui:
+            self.gui.log_message("✅ Displacement применён")
+
         falloff_config = self._get_falloff_config()
         vertices = self._apply_falloff(vertices, size_x, size_y, vertices[0][2] if vertices else 0, falloff_config)
         
+        if self.gui:
+            self.gui.log_message("✅ Falloff применён")
+
         normals = self._calculate_normals(vertices, grid_size)
+
+        if self.gui:
+            self.gui.log_message("✅ Нормали пересчитаны")
         
         perlin_np = self._create_geom_from_vertices(vertices, normals, texcoords_list, grid_size, "recreated_perlin_mesh")
+        
+        if self.gui:
+            self.gui.log_message("✅ Геометрия создана, выполнение булевой разности...")
         
         perlin_np.setPos(0, 0, self.last_best_z if hasattr(self, 'last_best_z') else 0)
         
@@ -284,6 +312,9 @@ class PerlinMeshGenerator:
                 
             self.panda_app.final_model = self.panda_app.trimesh_to_panda(final_result_trimesh)
             perlin_np.removeNode()
+
+            if self.gui:
+                self.gui.log_message("✅ Булева разность выполнена, обновление UV...")
             
         except Exception as e:
             print(f"Ошибка при выполнении boolean разности: {e}")
@@ -344,12 +375,23 @@ class PerlinMeshGenerator:
             self.panda_app.final_model.removeNode()
             self.panda_app.final_model = self.panda_app.render.attachNewNode(new_geom_node)
             self.panda_app.final_model.setPos(0, 0, 0)
+
+        if self.gui:
+            self.gui.log_message("✅ UV-координаты обновлены")
         
         self._apply_textures_and_material(self.panda_app.final_model)
+
+        if self.gui:
+            self.gui.log_message("✅ Текстуры применены")
+
+        if self.gui:
+            self.gui.log_message("✅ Меш успешно создан")
         
         return True
     
     def generate_perlin_mesh_from_csg(self):
+        if self.gui:
+            self.gui.log_message("🌄 Начало генерации Perlin mesh...")
         """Генерация перлин-меша на основе CSG операции с использованием сервера для булевой разности"""
         # Очистка предыдущих моделей (как в оригинале)
         if hasattr(self.panda_app, 'test_perlin_mesh') and self.panda_app.test_perlin_mesh is not None:
@@ -379,8 +421,15 @@ class PerlinMeshGenerator:
             print("Целевая модель не найдена")
             return False
 
+        if self.gui:
+            self.gui.log_message("✅ Целевая модель найдена")
+        
         # Подготовка target_model для boolean (без изменений)
         target_model_trimesh = self._prepare_target_model_for_boolean(target_model)
+        
+        if self.gui:
+            self.gui.log_message("✅ Модель подготовлена для булевых операций")
+
         self.last_target_model_trimesh = target_model_trimesh
         if target_model_trimesh is None:
             target_model.setScale(1.0, 1.0, 1.0)
@@ -389,12 +438,19 @@ class PerlinMeshGenerator:
         target_model.setPos(0.0, 0.0, 0.0)
 
         # Генерация базового перлин-меша (grid_size=48)
+        if self.gui:
+            self.gui.log_message("🔄 Генерация базового перлин-меша (размер сетки 48)...")
         perlin_base_np = self.generate_perlin_mesh(grid_size=48)
+        if self.gui:
+            self.gui.log_message("✅ Базовый перлин-меш создан")
         ground_pos = self.panda_app.ground_plane.getPos()
         perlin_base_np.setPos(ground_pos.x, ground_pos.y, ground_pos.z - 2.25)
         self.panda_app.loaded_models.append(perlin_base_np)
 
         target_volume = self.panda_app.Target_Volume
+
+        if self.gui:
+            self.gui.log_message("🔍 Поиск оптимальной высоты...")
 
         # Поиск оптимальной Z (использует обновлённый _evaluate_z_position)
         best_z = self.find_best_z_position(
@@ -404,6 +460,9 @@ class PerlinMeshGenerator:
             initial_z=perlin_base_np.getZ()
         )
         self.last_best_z = best_z
+
+        if self.gui:
+            self.gui.log_message(f"✅ Оптимальная высота найдена: {best_z:.4f}")
 
         if self.current_display_model is not None:
             self.current_display_model.removeNode()
@@ -415,8 +474,14 @@ class PerlinMeshGenerator:
         perlin_detailed_np = self.generate_perlin_mesh(grid_size=512)
         perlin_detailed_np.setPos(0, 0, best_z)
 
+        if self.gui:
+            self.gui.log_message("✅ Детальный перлин-меш создан")
+
         # Получаем trimesh детального меша
         perlin_trimesh = self.panda_app.panda_to_trimesh(perlin_detailed_np)
+
+        if self.gui:
+            self.gui.log_message("✂️ Выполнение булевой разности на сервере...")
 
         # Отправляем запрос на сервер для булевой разности (получаем геометрию)
         result_vertices, result_triangles = self.tls_client.send_boolean_request(
@@ -428,12 +493,17 @@ class PerlinMeshGenerator:
         )
         print(f"[DEBUG] Boolean request completed: vertices={len(result_vertices)}, triangles={len(result_triangles)}")
 
+        if self.gui:
+            self.gui.log_message(f"✅ Булева разность выполнена, получено {len(result_vertices)} вершин")
+
         result_trimesh = trimesh.Trimesh(vertices=result_vertices, faces=result_triangles)
 
         self.panda_app.particle_flag = True
         self.panda_app.final_model = self.panda_app.trimesh_to_panda(result_trimesh)
         self.panda_app.particle_flag = False
 
+        if self.gui:
+            self.gui.log_message("🔄 Пересчёт UV-координат...")
 
         # ---- НОВЫЙ КОД ВМЕСТО СТАРОГО ПЕРЕСЧЁТА UV ----
         # Используем сохранённые размеры перлин-меша
@@ -515,17 +585,34 @@ class PerlinMeshGenerator:
                 # Заменяем старую модель
                 self.panda_app.final_model.removeNode()
                 self.panda_app.final_model = self.panda_app.render.attachNewNode(new_geom_node)
+
+                if self.gui:
+                    self.gui.log_message("✅ UV-координаты обновлены")
             else:
                 print("[WARN] final_model не содержит геометрии")
         except Exception as e:
             print(f"[ERROR] Ошибка при пересчёте UV: {e}")
             traceback.print_exc()
 
+        if self.gui:
+            self.gui.log_message("🎨 Применение текстур и материала...")
+
         # Применение текстур и материала (как было)
         self._apply_textures_and_material(self.panda_app.final_model)
+        print(self.panda_app.calculate_mesh_volume(self.panda_app.final_model))
+
+        if self.gui:
+            self.gui.log_message("✅ Текстуры применены")
 
         target_model.hide()
         perlin_detailed_np.hide()
+
+        if self.gui:
+            self.gui.log_message("✅ Perlin mesh успешно сгенерирован!")
+
+        if hasattr(self.panda_app, 'final_model') and self.panda_app.final_model:
+            volume = self.panda_app.calculate_mesh_volume(self.panda_app.final_model)
+            self.panda_app.update_overlay_info(volume=volume)
     
     def find_best_z_position(self, mesh_np, target_model_trimesh, target_volume, initial_z=0):
         """Поиск оптимальной Z-позиции меша для достижения целевого объема"""
@@ -553,10 +640,15 @@ class PerlinMeshGenerator:
         print(f"Макс. итераций: {max_iterations}")
         print(f"Начальные точки поиска ({len(search_points)}): {search_points}")
 
+        if self.gui:
+            self.gui.log_message("🔍 Поиск оптимальной высоты (начальный перебор)...")
+
         for z in search_points:
             mesh_np.setPos(0, 0, z)
             perlin_model_trimesh_ = self.panda_app.panda_to_trimesh(mesh_np)
             
+            if self.gui:
+                self.gui.log_message(f"Проверка z={z:.4f}...")
             result_vertices, result_triangles = self.tls_client.send_boolean_request(
                 target_model_trimesh.vertices,
                 target_model_trimesh.faces,
@@ -576,6 +668,8 @@ class PerlinMeshGenerator:
             
             volume = self.panda_app.calculate_mesh_volume(self.current_display_model)
             error = abs(volume - target_volume)
+            if self.gui:
+                self.gui.log_message(f"  объём={volume:.4f}, ошибка={error:.4f}")
             search_volumes.append((z, volume, error))
             
             # DEBUG: Результаты для каждой точки поиска
@@ -685,6 +779,9 @@ class PerlinMeshGenerator:
         if self.current_display_model is not None:
             self.current_display_model.removeNode()
             self.current_display_model = None
+
+        if self.gui:
+            self.gui.log_message(f"✅ Поиск завершён, выбрана высота {best_z:.4f}")
         
         return best_z
     
@@ -1037,97 +1134,114 @@ class PerlinMeshGenerator:
         model.setPos(0, 0, 0)
     
     def _apply_textures_and_material(self, model_np):
-        """Применяет текстуры и материал к модели"""
-        # Диффузная текстура
-        if 'diffuse' in self.panda_app.current_texture_set:
-            diffuse_rel = self.panda_app.current_texture_set['diffuse']
-        elif 'albedo' in self.panda_app.current_texture_set:
-            diffuse_rel = self.panda_app.current_texture_set['albedo']
-        else:
-            diffuse_rel = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        
-        diffuse_path = get_resource_path(diffuse_rel)
-        print(f"[DEBUG] Попытка загрузить диффузную текстуру: {diffuse_path}")
+        """Apply PBR textures correctly for tobspr RenderPipeline"""
+
+        import os
+        from panda3d.core import Texture, TextureStage, Material
+
+        texset = self.panda_app.current_texture_set
+
+        # ------------------------------------------------------------------
+        # Resolve paths
+        # ------------------------------------------------------------------
+        diffuse_path = (
+            texset.get("diffuse")
+            or texset.get("albedo")
+            or "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
+        )
+
+        normal_path = texset.get(
+            "normal",
+            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
+        )
+
+        roughness_path = texset.get("roughness")
+        metallic_path  = texset.get("metallic")   # optional
+
         if not os.path.exists(diffuse_path):
-            print(f"[ERROR] Файл не существует: {diffuse_path}")
-            # Попробуем заменить 4k на 8k как fallback
-            alt_path = diffuse_path.replace('_4k.jpg', '_8k.jpg')
-            if os.path.exists(alt_path):
-                diffuse_path = alt_path
-                print(f"[INFO] Использую альтернативный файл: {alt_path}")
-            else:
-                print("[ERROR] Нет доступной текстуры, пропускаем")
-                return
-        else:
-            print(f"[INFO] Файл найден, размер: {os.path.getsize(diffuse_path)} байт")
+            diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
 
-        # Нормал текстура
-        normal_rel = self.panda_app.current_texture_set.get('normal', 
-            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg")
-        normal_path = get_resource_path(normal_rel)
-        print(f"[DEBUG] Normal текстура: {normal_path}")
         if not os.path.exists(normal_path):
-            alt_normal = normal_path.replace('_4k.jpg', '_8k.jpg')
-            if os.path.exists(alt_normal):
-                normal_path = alt_normal
+            normal_path = "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
 
-        # Roughness текстура
-        roughness_rel = self.panda_app.current_texture_set.get('roughness', None)
-        roughness_path = None
-        if roughness_rel:
-            roughness_path = get_resource_path(roughness_rel)
-            if not os.path.exists(roughness_path):
-                alt_rough = roughness_path.replace('_4k.jpg', '_8k.jpg')
-                if os.path.exists(alt_rough):
-                    roughness_path = alt_rough
-                else:
-                    roughness_path = None
+        # ------------------------------------------------------------------
+        # Create RP-compatible material
+        # ------------------------------------------------------------------
+        mat = Material()
 
-        # Загрузка через Filename для корректной обработки путей
-        diffuse_tex = self.panda_app.loader.loadTexture(Filename.from_os_specific(diffuse_path))
-        if diffuse_tex:
-            diffuse_tex.set_format(Texture.F_srgb)
-            diffuse_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-            diffuse_tex.setMagfilter(Texture.FTLinear)
-            diffuse_tex.setWrapU(Texture.WMRepeat)
-            diffuse_tex.setWrapV(Texture.WMRepeat)
-            model_np.setTexture(diffuse_tex, 1)
+        # MUST be white for PBR
+        mat.set_base_color((1, 1, 1, 1))
+
+        # enable normal map strength (RP trick)
+        mat.set_emission((0, 1, 0, 0))
+
+        model_np.set_material(mat)
+
+        # ------------------------------------------------------------------
+        # Helper to configure textures
+        # ------------------------------------------------------------------
+        def setup_tex(tex, srgb=False):
+            if srgb:
+                tex.set_format(Texture.F_srgb)
+
+            tex.set_minfilter(Texture.FTLinearMipmapLinear)
+            tex.set_magfilter(Texture.FTLinear)
+            tex.set_wrap_u(Texture.WMRepeat)
+            tex.set_wrap_v(Texture.WMRepeat)
+
+        # ------------------------------------------------------------------
+        # Texture stages (STRICT ORDER)
+        # ------------------------------------------------------------------
+        ts_color = TextureStage("0-color")
+        ts_color.set_sort(0)
+        ts_color.set_priority(0)
+
+        ts_normal = TextureStage("1-normal")
+        ts_normal.set_sort(1)
+        ts_normal.set_priority(1)
+
+        ts_metal = TextureStage("2-metallic")
+        ts_metal.set_sort(2)
+        ts_metal.set_priority(2)
+
+        ts_rough = TextureStage("3-roughness")
+        ts_rough.set_sort(3)
+        ts_rough.set_priority(3)
+
+        # ------------------------------------------------------------------
+        # Load + assign textures
+        # ------------------------------------------------------------------
+
+        # Albedo
+        diffuse_tex = self.panda_app.loader.loadTexture(diffuse_path)
+        setup_tex(diffuse_tex, srgb=True)
+        model_np.set_texture(ts_color, diffuse_tex)
+
+        # Normal
+        normal_tex = self.panda_app.loader.loadTexture(normal_path)
+        setup_tex(normal_tex)
+        model_np.set_texture(ts_normal, normal_tex)
+
+        # Metallic (REQUIRED SLOT even if dummy)
+        if metallic_path and os.path.exists(metallic_path):
+            metal_tex = self.panda_app.loader.loadTexture(metallic_path)
         else:
-            print(f"[ERROR] Не удалось загрузить текстуру: {diffuse_path}")
+            # dummy white metallic map
+            metal_tex = Texture("dummy_metal")
+            metal_tex.setup2dTexture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+            metal_tex.setRamImage(b"\x00")
 
-        normal_tex = self.panda_app.loader.loadTexture(Filename.from_os_specific(normal_path))
-        if normal_tex:
-            normal_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-            normal_tex.setMagfilter(Texture.FTLinear)
-            normal_tex.setWrapU(Texture.WMRepeat)
-            normal_tex.setWrapV(Texture.WMRepeat)
-            normal_stage = TextureStage('normal')
-            normal_stage.setMode(TextureStage.MNormal)
-            model_np.setTexture(normal_stage, normal_tex)
+        setup_tex(metal_tex)
+        model_np.set_texture(ts_metal, metal_tex)
 
-        if roughness_path:
-            roughness_tex = self.panda_app.loader.loadTexture(Filename.from_os_specific(roughness_path))
-            if roughness_tex:
-                roughness_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-                roughness_tex.setMagfilter(Texture.FTLinear)
-                roughness_tex.setWrapU(Texture.WMRepeat)
-                roughness_tex.setWrapV(Texture.WMRepeat)
-                roughness_stage = TextureStage('roughness')
-                roughness_stage.setMode(TextureStage.MModulate)
-                model_np.setTexture(roughness_stage, roughness_tex)
+        # Roughness
+        if roughness_path and os.path.exists(roughness_path):
+            rough_tex = self.panda_app.loader.loadTexture(roughness_path)
+            setup_tex(rough_tex)
+            model_np.set_texture(ts_rough, rough_tex)
 
-        # Материал (без изменений)
-        base_material = Material("perlin_base_material_with_displacement")
-        base_material.setDiffuse((0.4, 0.4, 0.4, 1.0))
-        base_material.setAmbient((0.7, 0.7, 0.7, 1.0))
-        base_material.setSpecular((0.1, 0.1, 0.1, 1.0))
-        base_material.setShininess(5.0)
-        base_material.setRoughness(0.85)
-        base_material.setMetallic(0.0)
-        base_material.setRefractiveIndex(1.5)
-        model_np.setMaterial(base_material, 1)
-
-        model_np.setShaderAuto()
-        model_np.setTwoSided(True)
-        model_np.setBin("fixed", 0)
-        model_np.setDepthOffset(1)
+        # ------------------------------------------------------------------
+        # RP required flags
+        # ------------------------------------------------------------------
+        model_np.set_shader_auto()
+        model_np.set_two_sided(True)

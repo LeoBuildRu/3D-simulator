@@ -15,12 +15,14 @@ sys.path.append(os.path.join(current_dir, "render_pipeline"))
 include_files = [
     ("models", "models"),
     ("textures", "textures"),
-    ("lidar_example", "lidar_example"),
+    ("PLY_examples", "PLY_examples"),
+    ("height_examples", "height_examples"),
 
     ("models_config.yaml", "models_config.yaml"),
     ("textures_config.yaml", "textures_config.yaml"),
 
     ("mesh_distribution.py", "mesh_distribution.py"),
+    ("falling_particles.py", "falling_particles.py"),
 
     # RenderPipeline целиком
     ("render_pipeline", "render_pipeline"),

@@ -23,6 +23,7 @@ class MeshReconstruction:
     def __init__(self, panda_app, tls_client=None):
         self.panda_app = panda_app
         self.tls_client = tls_client
+        self.gui = getattr(panda_app, 'gui', None)  # <-- ДОБАВЛЕНО
         self.recon_json_path = ""
 
         # for testing only
@@ -59,12 +60,22 @@ class MeshReconstruction:
         self.texture_repeatX = 1.5
         self.texture_repeatY = 2.1
         self.use_displacement = True
+
+        self.gui = panda_app.gui
         
         # Для хранения мешей
         self.source_mesh_node = None
         self.mesh_node = None
         
         print(f"[DEBUG] Инициализирован MeshReconstruction")
+
+    # <-- НОВЫЙ МЕТОД
+    def log(self, message):
+        """Отправляет сообщение в GUI, если доступно, иначе печатает в консоль."""
+        if self.gui:
+            self.gui.log_message(message)
+        else:
+            print(message)  # для режима без GUI
 
     def browse_recon_json(self):
         file_path = filedialog.askopenfilename(
@@ -529,6 +540,7 @@ class MeshReconstruction:
 
     def load_height_map(self):
         try:
+            self.log(f"🖼️ Загрузка карты высот: {self.heightmap_path}")  # <-- ДОБАВЛЕНО
             print(f"[DEBUG] Начало загрузки height map: {self.heightmap_path}")
             img = Image.open(self.heightmap_path)
             print(f"[DEBUG] Изображение загружено: {img.size}, mode: {img.mode}")
@@ -561,9 +573,11 @@ class MeshReconstruction:
             # Закрываем изображение для освобождения памяти
             img.close()
             print(f"[DEBUG] Загрузка height map завершена успешно")
+            self.log("✅ Карта высот загружена")  # <-- ДОБАВЛЕНО
             return True
             
         except Exception as e:
+            self.log(f"❌ Ошибка загрузки карты высот: {e}")  # <-- ДОБАВЛЕНО
             print(f"[ERROR] Ошибка загрузки height map: {e}")
             return False
     
@@ -614,6 +628,7 @@ class MeshReconstruction:
             print("[DEBUG] Displacement отключен")
             return height_grid
         
+        self.log("🌀 Применение displacement карты...")  # <-- ДОБАВЛЕНО
         print("[DEBUG] Применение displacement map к сетке...")
         
         # Загружаем текстуру высот
@@ -666,9 +681,11 @@ class MeshReconstruction:
                 height_grid[i, j] += displacement
         
         print(f"[DEBUG] Displacement map применен к {grid_res}x{grid_res} вершинам")
+        self.log("✅ Displacement применён")  # <-- ДОБАВЛЕНО
         return height_grid
 
     def create_unified_perlin_mesh_with_lift(self):
+        self.log("🏗️ Создание расширенного меша с адаптивным подъёмом...")  # <-- ДОБАВЛЕНО
         print(f"[DEBUG] Загрузка height map...")
         if not self.load_height_map():
             print(f"[ERROR] Не удалось загрузить height map")
@@ -677,6 +694,7 @@ class MeshReconstruction:
         h, w = self.height_map.shape
         
         # ВОЗВРАЩАЕМ ГАУССОВО СГЛАЖИВАНИЕ
+        self.log("🌀 Применение гауссова сглаживания к карте высот...")  # <-- ДОБАВЛЕНО
         print("[DEBUG] Применение гауссова сглаживания...")
         from scipy.ndimage import gaussian_filter
         import numpy as np
@@ -747,10 +765,12 @@ class MeshReconstruction:
         print(f"[DEBUG] Собрано {len(original_vertices_3d)} вершин исходного меша")
         
         if len(original_vertices_3d) == 0:
+            self.log("❌ Нет вершин исходного меша")  # <-- ДОБАВЛЕНО
             print("[ERROR] Нет вершин исходного меша")
             return None
         
         # 3. СОЗДАЕМ KD-ДЕРЕВО ДЛЯ БЫСТРОГО ПОИСКА БЛИЖАЙШИХ ВЕРШИН
+        self.log("🌲 Построение KD-дерева...")  # <-- ДОБАВЛЕНО
         print("[DEBUG] Создание KD-дерева для вершин исходного меша...")
         original_tree = KDTree(original_vertices_2d)
         
@@ -800,6 +820,7 @@ class MeshReconstruction:
         
         # 6. ПРИМЕНЯЕМ АДАПТИВНЫЙ ПОДЪЕМ ВЕРШИН
         if len(boundary_points) > 0:
+            self.log("⬆️ Адаптивный подъём вершин...")  # <-- ДОБАВЛЕНО
             print("[DEBUG] Применение адаптивного подъема вершин...")
             lifted_mask = np.zeros((grid_res, grid_res), dtype=bool)
             
@@ -869,18 +890,22 @@ class MeshReconstruction:
             
             # 7. СГЛАЖИВАНИЕ ПОДНЯТОЙ ОБЛАСТИ
             if np.any(lifted_mask):
+                self.log("🌀 Сглаживание поднятой области...")  # <-- ДОБАВЛЕНО
                 print("[DEBUG] Сглаживание поднятой области...")
                 height_grid = self._smooth_lifted_area(height_grid, lifted_mask)
             
             # 8. РАЗМЫТИЕ ГРАНИЦ ПЕРЕХОДА
+            self.log("🌀 Размытие границ перехода...")  # <-- ДОБАВЛЕНО
             print("[DEBUG] Размытие границ перехода...")
             height_grid = self._blur_lift_boundary(height_grid, source_mask, boundary_points)
         
         # 9. ПОСТОБРАБОТКА ГРАНИЧНОЙ ЗОНЫ
+        self.log("🌀 Постобработка граничной зоны...")  # <-- ДОБАВЛЕНО
         print("[DEBUG] Постобработка граничной зоны...")
         height_grid = self._postprocess_boundary_zone(height_grid, source_mask)
         
         # 10. ОБЩЕЕ СГЛАЖИВАНИЕ СЕТКИ
+        self.log("🌀 Общее сглаживание сетки...")  # <-- ДОБАВЛЕНО
         print("[DEBUG] Общее сглаживание сетки...")
         height_grid = self._smooth_heightfield(height_grid)
         
@@ -951,6 +976,7 @@ class MeshReconstruction:
         print(f"[DEBUG] Всего вершин: {total_vertex_count}")
         print(f"[DEBUG] Всего треугольников: {triangle_count}")
         
+        self.log("✅ Расширенный меш создан")  # <-- ДОБАВЛЕНО
         return node
     
     def create_mesh_from_point_cloud(self, size=512):
@@ -958,6 +984,7 @@ class MeshReconstruction:
         Создаёт единый меш с плоской базой и адаптивным подъёмом вершин,
         используя точки из self.trs_points в качестве источника высот.
         """
+        self.log("🏗️ Создание меша из облака точек...")  # <-- ДОБАВЛЕНО
         import numpy as np
         from scipy.ndimage import gaussian_filter
         from scipy.spatial import KDTree
@@ -969,6 +996,7 @@ class MeshReconstruction:
         # ------------------------------------------------------------
         if not hasattr(self, 'trs_points') or len(self.trs_points) == 0:
             print("[ERROR] Нет точек для построения меша (self.trs_points пуст)")
+            self.log("❌ Нет точек для построения меша")  # <-- ДОБАВЛЕНО
             return None
 
         source_points = np.array(self.trs_points, dtype=np.float32)  # (N, 3)
@@ -1007,6 +1035,7 @@ class MeshReconstruction:
         # ------------------------------------------------------------
         # 3. KD-дерево для исходных точек (2D проекции)
         # ------------------------------------------------------------
+        self.log("🌲 Построение KD-дерева...")  # <-- ДОБАВЛЕНО
         source_xy = source_points[:, :2]
         source_z = source_points[:, 2]
         source_tree = KDTree(source_xy)
@@ -1058,6 +1087,7 @@ class MeshReconstruction:
 
         if np.sum(source_mask) == 0:
             print("[ERROR] Ни одна точка не попала в радиус поиска")
+            self.log("❌ Ни одна точка не попала в радиус поиска")  # <-- ДОБАВЛЕНО
             return None
 
         # ------------------------------------------------------------
@@ -1093,6 +1123,7 @@ class MeshReconstruction:
         # ------------------------------------------------------------
         lifted_mask = np.zeros((grid_res, grid_res), dtype=bool)
         if len(boundary_points) > 0:
+            self.log("⬆️ Адаптивный подъём вершин...")  # <-- ДОБАВЛЕНО
             boundary_array = np.array(boundary_points)
             boundary_tree = KDTree(boundary_array[:, :2])
 
@@ -1156,6 +1187,7 @@ class MeshReconstruction:
         # 7. Сглаживание поднятой области
         # ------------------------------------------------------------
         if np.any(lifted_mask):
+            self.log("🌀 Сглаживание поднятой области...")  # <-- ДОБАВЛЕНО
             print("[DEBUG] Сглаживание поднятой области...")
             height_grid = self._smooth_lifted_area(height_grid, lifted_mask)
   
@@ -1163,18 +1195,21 @@ class MeshReconstruction:
         # 8. Размытие границ перехода
         # ------------------------------------------------------------
         if len(boundary_points) > 0:
+            self.log("🌀 Размытие границ перехода...")  # <-- ДОБАВЛЕНО
             print("[DEBUG] Размытие границ перехода...")
             height_grid = self._blur_lift_boundary(height_grid, source_mask, boundary_points)
   
         # ------------------------------------------------------------
         # 9. Постобработка граничной зоны
         # ------------------------------------------------------------
+        self.log("🌀 Постобработка граничной зоны...")  # <-- ДОБАВЛЕНО
         print("[DEBUG] Постобработка граничной зоны...")
         height_grid = self._postprocess_boundary_zone(height_grid, source_mask)
   
         # ------------------------------------------------------------
         # 10. Общее сглаживание сетки
         # ------------------------------------------------------------
+        self.log("🌀 Общее сглаживание сетки...")  # <-- ДОБАВЛЕНО
         print("[DEBUG] Общее сглаживание сетки...")
         height_grid = self._smooth_heightfield(height_grid)
   
@@ -1243,6 +1278,7 @@ class MeshReconstruction:
         node.addGeom(geom)
 
         print(f"[DEBUG] Единый меш успешно создан")
+        self.log("✅ Меш из облака точек создан")  # <-- ДОБАВЛЕНО
         return node
 
     def _smooth_lifted_area(self, height_grid, lifted_mask, sigma=2.0):
@@ -1473,15 +1509,18 @@ class MeshReconstruction:
         Настраивает UV-координаты для меша после boolean операции
         с использованием мировых координат для правильного повторения текстуры
         """
+        self.log("🔄 Настройка UV-координат после булевой операции...")  # <-- ДОБАВЛЕНО
         print(f"[DEBUG] Настройка UV-координат после boolean операции с использованием мировых координат")
         
         if not boolean_mesh_np or not boolean_mesh_np.node():
             print(f"[ERROR] Boolean mesh не существует")
+            self.log("❌ Boolean mesh не существует")  # <-- ДОБАВЛЕНО
             return None
         
         geom_node = boolean_mesh_np.node()
         if geom_node.getNumGeoms() == 0:
             print(f"[ERROR] В boolean mesh нет геометрии")
+            self.log("❌ В boolean mesh нет геометрии")  # <-- ДОБАВЛЕНО
             return None
         
         # Получаем параметры повторения текстур
@@ -1618,10 +1657,12 @@ class MeshReconstruction:
         new_mesh_np.reparentTo(self.panda_app.render)
         
         print(f"[DEBUG] Создан новый NodePath с UV на основе мировых координат")
+        self.log("✅ UV-координаты настроены")  # <-- ДОБАВЛЕНО
         return new_mesh_np
     
     def _apply_textures_and_material(self, model_np):
         """Применяет текстуры и материал к модели"""
+        self.log("🎨 Применение текстур...")  # <-- ДОБАВЛЕНО
         if 'diffuse' in self.panda_app.current_texture_set:
             diffuse_path = self.panda_app.current_texture_set['diffuse']
         elif 'albedo' in self.panda_app.current_texture_set:
@@ -1686,6 +1727,7 @@ class MeshReconstruction:
         model_np.setTwoSided(True)
         model_np.setBin("fixed", 0)
         model_np.setDepthOffset(1)
+        self.log("✅ Текстуры применены")  # <-- ДОБАВЛЕНО
 
     def _prepare_target_model_for_boolean(self, target_model):
         """Подготавливает целевую модель для boolean операций"""
@@ -1744,17 +1786,31 @@ class MeshReconstruction:
         self.run_2d_to_3d_reconstruction_from(self.recon_json_path)
     
     def run_2d_to_3d_reconstruction_from(self, json_path):
+        if hasattr(self, 'final_mesh_node') and self.final_mesh_node:
+            self.final_mesh_node.removeNode()
+            self.final_mesh_node = None
+
+        # Удаляем предыдущий промежуточный меш (на случай ошибки)
+        if hasattr(self, 'mesh_node') and self.mesh_node:
+            self.mesh_node.removeNode()
+            self.mesh_node = None
+
+        self.log("🚀 Запуск 2D-3D реконструкции...")  # <-- ДОБАВЛЕНО
         if not json_path or not os.path.isfile(json_path):
+            self.log("❌ Не выбран JSON-файл или файл не существует")  # <-- ДОБАВЛЕНО
             #QMessageBox.warning(self.panda_app, "Ошибка", "Пожалуйста, выберите корректный JSON-файл.")
             return
         
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
+        self.log(f"✅ JSON загружен: {json_path}")  # <-- ДОБАВЛЕНО
 
         self.ply_path =  json_path.replace(".json", ".ply")
         if(os.path.exists(self.ply_path)):
             self.using_ply = True
+            self.log("📁 Загрузка облака точек...")  # <-- ДОБАВЛЕНО
             self.point_cloud = pcu.load_mesh_v(self.ply_path)
+            self.log("✅ Облако точек загружено")  # <-- ДОБАВЛЕНО
         else:
             self.using_ply = False
             self.heightmap_path = os.path.dirname(json_path) + "/" + data["heightmap_path"]
@@ -1764,6 +1820,7 @@ class MeshReconstruction:
         self.cam_node = self.panda_app.cam.node()
 
         self.reconstruct_camera_pos_hpr_fov_depth(data)
+        self.log("🎥 Позиция камеры восстановлена")  # <-- ДОБАВЛЕНО
 
         if self.using_ply:
             node = self.create_mesh_from_point_cloud(self.grid_resolution_main)
@@ -1784,12 +1841,14 @@ class MeshReconstruction:
             if self.panda_app.loaded_models:
                 for model in self.panda_app.loaded_models:
                     model_id = id(model)
+            self.log("❌ Целевая модель не найдена")  # <-- ДОБАВЛЕНО
             return False
         
         target_model_trimesh = self._prepare_target_model_for_boolean(target_model)
         self.last_target_model_trimesh = target_model_trimesh
         if target_model_trimesh is None:
             target_model.setScale(1.0, 1.0, 1.0)
+            self.log("❌ Не удалось подготовить целевую модель")  # <-- ДОБАВЛЕНО
             return False
         target_model.setScale(1.0, 1.0, 1.0)
         target_model.setPos(0.0, 0.0, 0.0)
@@ -1799,9 +1858,11 @@ class MeshReconstruction:
         # Проверяем доступность клиента
         if self.tls_client is None:
             print("[ERROR] TLS client not available. Boolean operation cancelled.")
+            self.log("❌ Клиент TLS недоступен, булева операция отменена")  # <-- ДОБАВЛЕНО
             return
 
         try:
+            self.log("✂️ Выполнение булевой разности на сервере...")  # <-- ДОБАВЛЕНО
             # Отправляем запрос на сервер для булевой разности
             result_verts, result_tris = self.tls_client.send_boolean_request(
                 target_model_trimesh.vertices,
@@ -1811,26 +1872,33 @@ class MeshReconstruction:
                 return_volume_only=False
             )
             mesh_node_result_trimesh = trimesh.Trimesh(vertices=result_verts, faces=result_tris)
+            self.log(f"✅ Булева разность выполнена, получено {len(result_verts)} вершин") 
         except Exception as e:
             print(f"[ERROR] Boolean operation via TLS client failed: {e}")
+            self.log(f"❌ Ошибка булевой разности: {e}")  
             return
 
-        final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
+        self.final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
         
         # ВАЖНО: После boolean операции нужно правильно установить UV-координаты
         print(f"[DEBUG] Настройка UV-координат после boolean операции...")
-        final_mesh_node = self._setup_uv_coordinates_after_boolean(final_mesh_node, mesh_node)
+        self.final_mesh_node = self._setup_uv_coordinates_after_boolean(self.final_mesh_node, mesh_node)
         
-        if final_mesh_node is None or final_mesh_node.is_empty():
+        if self.final_mesh_node is None or self.final_mesh_node.is_empty():
             print(f"[ERROR] Не удалось создать меш с UV-координатами")
+            self.log("❌ Не удалось создать меш с UV-координатами") 
             return
         
-        print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={final_mesh_node.is_empty()}")
+        print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={self.final_mesh_node.is_empty()}")
         
         # Применяем текстуры и материал
         print(f"[DEBUG] Применение текстур к финальному мешу...")
-        self._apply_textures_and_material(final_mesh_node)
-        print(self.panda_app.calculate_mesh_volume(final_mesh_node))
-        # final_mesh_node.setPos(0, 0, 4)
+        self._apply_textures_and_material(self.final_mesh_node)
+        print(self.panda_app.calculate_mesh_volume(self.final_mesh_node))
+
+        # Обновляем объём в оверлее
+        volume = self.panda_app.calculate_mesh_volume(self.final_mesh_node)
+        self.panda_app.update_overlay_info(volume=volume)
         
         mesh_node.removeNode()
+        self.log("✅ Реконструкция завершена!")  
