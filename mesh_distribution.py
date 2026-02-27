@@ -29,7 +29,7 @@ def compute_tri_areas(
     normal = cross / len
     target = wp.vec3(0.0, 0.0, 1.0)
 
-    if wp.dot(normal, target) < 0.000001:
+    if wp.dot(normal, target) < 0.5:
         area = 0.0
 
     # Store the result.
