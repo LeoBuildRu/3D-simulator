@@ -10,6 +10,7 @@ import yaml
 import trimesh
 
 import json 
+import tempfile
 from datetime import datetime
 
 from panda3d.core import (
@@ -40,6 +41,81 @@ if getattr(sys, 'frozen', False):
     PROJECT_ROOT = os.path.dirname(sys.executable)
 else:
     PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false"
+
+class ReconListItemWidget(QWidget):
+    def __init__(self, car_number, time_str, parent=None):
+        super().__init__(parent)
+        self.car_number = car_number
+        self.time_str = time_str
+        
+        # Основной горизонтальный layout
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(10)
+        
+        # QLabel для иконки фиксированного размера
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(32, 26)
+        self.icon_label.setAlignment(Qt.AlignCenter)
+        self.icon_label.setStyleSheet("background-color: #2a2a35; border-radius: 3px;")
+        # Устанавливаем временную заглушку
+        self.icon_label.setText("⏳")
+        layout.addWidget(self.icon_label)
+        
+        # Вертикальный layout для текста
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(2)
+        
+        # Номер автомобиля (жирный шрифт)
+        self.car_label = QLabel(car_number)
+        self.car_label.setStyleSheet("font-weight: bold; color: #ffffff;")
+        text_layout.addWidget(self.car_label)
+        
+        # Время (менее яркое)
+        self.time_label = QLabel(time_str)
+        self.time_label.setStyleSheet("color: #a0a0b0; font-size: 10px;")
+        text_layout.addWidget(self.time_label)
+        
+        layout.addLayout(text_layout)
+        layout.addStretch()
+        
+    def set_icon_pixmap(self, pixmap):
+        """Установить загруженное изображение в иконку"""
+        if not pixmap.isNull():
+            # Масштабируем под размер, сохраняя пропорции
+            pixmap = pixmap.scaled(32, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.icon_label.setPixmap(pixmap)
+            self.icon_label.setText("")  # убираем заглушку
+        else:
+            self.icon_label.setText("❌")  # ошибка загрузки
+
+class ImageDownloadTask(QRunnable):
+    class Signals(QObject):
+        downloaded = pyqtSignal(QPixmap)
+
+    def __init__(self, client, img_filename, item_widget, temp_dir):
+        super().__init__()
+        self.client = client
+        self.img_filename = img_filename
+        self.item_widget = item_widget
+        self.temp_dir = temp_dir
+        self.signals = self.Signals()
+        # Подключаем сигнал к слоту виджета
+        self.signals.downloaded.connect(self.item_widget.set_icon_pixmap)
+
+    def run(self):
+        if not self.img_filename:
+            return
+        local_path = os.path.join(self.temp_dir, self.img_filename)
+        try:
+            self.client.download_file(self.img_filename, local_path)
+            pixmap = QPixmap(local_path)
+        except Exception as e:
+            print(f"Ошибка загрузки изображения {self.img_filename}: {e}")
+            pixmap = QPixmap()
+        self.signals.downloaded.emit(pixmap)
 
 class CameraControlGUI(QWidget):
     def __init__(self, panda_app, main_window=None):
@@ -581,56 +657,6 @@ class CameraControlGUI(QWidget):
         self.recon_all_files = []
 
         # ======================
-        # ФИЛЬТРЫ (2 строки)
-        # ======================
-
-        # ---- Первая строка ----
-        filter_row_1 = QHBoxLayout()
-
-        # Тип данных
-        filter_row_1.addWidget(QLabel("Тип данных:"))
-        self.recon_data_type_filter = QComboBox()
-        self.recon_data_type_filter.addItem("Все типы", userData="all")
-        self.recon_data_type_filter.addItem("PLY", userData="ply")
-        self.recon_data_type_filter.addItem("Height", userData="height")
-        filter_row_1.addWidget(self.recon_data_type_filter)
-
-        # Имя
-        filter_row_1.addWidget(QLabel("Имя:"))
-        self.recon_name_filter = QLineEdit()
-        self.recon_name_filter.setPlaceholderText("Фильтр по имени файла...")
-        filter_row_1.addWidget(self.recon_name_filter)
-
-        # Модель
-        filter_row_1.addWidget(QLabel("Модель:"))
-        self.recon_model_filter = QComboBox()
-        self.recon_model_filter.addItem("Все модели")
-        filter_row_1.addWidget(self.recon_model_filter)
-
-        recon_layout.addLayout(filter_row_1)
-
-        # ---- Вторая строка ----
-        filter_row_2 = QHBoxLayout()
-
-        filter_row_2.addWidget(QLabel("С:"))
-        self.recon_date_from = QDateEdit()
-        self.recon_date_from.setCalendarPopup(True)
-        self.recon_date_from.setDisplayFormat("dd.MM.yyyy")
-        self.recon_date_from.setDate(QDate(2000, 1, 1))
-        filter_row_2.addWidget(self.recon_date_from)
-
-        filter_row_2.addWidget(QLabel("По:"))
-        self.recon_date_to = QDateEdit()
-        self.recon_date_to.setCalendarPopup(True)
-        self.recon_date_to.setDisplayFormat("dd.MM.yyyy")
-        self.recon_date_to.setDate(QDate.currentDate())
-        filter_row_2.addWidget(self.recon_date_to)
-
-        filter_row_2.addStretch()
-
-        recon_layout.addLayout(filter_row_2)
-
-        # ======================
         # СПИСОК
         # ======================
         self.recon_json_list = QListWidget()
@@ -642,171 +668,175 @@ class CameraControlGUI(QWidget):
         # ЗАГРУЗКА ФАЙЛОВ
         # ======================
         def load_recon_jsons():
-            self.recon_all_files.clear()
-            self.recon_model_filter.blockSignals(True)
-            self.recon_model_filter.clear()
-            self.recon_model_filter.addItem("Все модели")
-
-            models = set()
-
-            for folder_key, folder_path in self.recon_base_folders.items():
-                if not os.path.exists(folder_path):
-                    continue
-
-                for file in os.listdir(folder_path):
-                    if not file.lower().endswith(".json"):
-                        continue
-
-                    full_path = os.path.join(folder_path, file)
-
-                    try:
-                        with open(full_path, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                    except Exception:
-                        continue
-
-                    # --- Определение типа ---
-                    data_type = "ply"
-                    #lower_keys = {k.lower() for k in data.keys()}
-                    if "heightmap_path" in data:
-                        data_type = "height"
-
-                    model = data.get("model", "Unknown")
-
-                    # --- Дата ---
-                    dt = None
-                    time_str = data.get("time")
-
-                    if isinstance(time_str, str):
-                        try:
-                            dt = datetime.strptime(time_str, "%d.%m.%Y %H:%M")
-                        except Exception:
-                            try:
-                                dt = datetime.fromisoformat(time_str)
-                            except Exception:
-                                pass
-
-                    if dt is None:
-                        dt = datetime.fromtimestamp(os.path.getmtime(full_path))
-
-                    self.recon_all_files.append({
-                        "name": file,
-                        "path": full_path,
-                        "model": model,
-                        "datetime": dt,
-                        "data_type": data_type,
-                        "source_folder": os.path.basename(folder_path)
-                    })
-
-                    models.add(model)
-
-            for m in sorted(models):
-                self.recon_model_filter.addItem(m)
-
-            self.recon_model_filter.blockSignals(False)
-            apply_recon_filters()
-
-
-        # ======================
-        # ФИЛЬТРАЦИЯ
-        # ======================
-        def apply_recon_filters():
+            # Очищаем список
             self.recon_json_list.clear()
 
-            name_text = self.recon_name_filter.text().lower()
-            selected_model = self.recon_model_filter.currentText()
-            selected_data_type = self.recon_data_type_filter.currentData()
+            # Получаем список файлов (как и раньше)
+            try:
+                files_from_server = self.panda_app.tls_client.get_verified_models()
+            except Exception as e:
+                print(f"Ошибка получения списка с сервера: {e}")
+                files_from_server = []
 
-            from_date = self.recon_date_from.date().toPyDate()
-            to_date = self.recon_date_to.date().toPyDate()
-
+            # Сортируем по дате (от новых к старым)
             sorted_files = sorted(
-                self.recon_all_files,
-                key=lambda x: x["datetime"],
+                files_from_server,
+                key=lambda x: x.get("datetime", ""),
                 reverse=True
             )
 
-            for file in sorted_files:
+            # Временная директория для миниатюр
+            temp_dir = os.path.join(tempfile.gettempdir(), "vizutil_recon_thumbnails")
+            os.makedirs(temp_dir, exist_ok=True)
 
-                if name_text and name_text not in file["name"].lower():
-                    continue
-
-                if selected_model != "Все модели" and file["model"] != selected_model:
-                    continue
-
-                if selected_data_type != "all" and file["data_type"] != selected_data_type:
-                    continue
-
-                file_date = file["datetime"].date()
-                if not (from_date <= file_date <= to_date):
-                    continue
-
-                if file["data_type"] == "height":
-                    display_text = f'[HEIGHT] {file["name"]} | {file["model"]} | {file["datetime"].strftime("%d.%m.%Y %H:%M")}'
-                else:
-                    display_text = f'[PLY] {file["name"]} | {file["model"]} | {file["datetime"].strftime("%d.%m.%Y %H:%M")}'
-
-                item = QListWidgetItem(display_text)
-                item.setData(Qt.UserRole, file)
-
-                if file["data_type"] == "height":
-                    item.setForeground(QBrush(QColor("#0b84ff")))
-                else:
-                    item.setForeground(QBrush(QColor("#ff6600")))
-
+            for file_info in sorted_files:
+                # Парсим дату
+                dt = None
+                time_str_raw = file_info.get("datetime", "")
+                try:
+                    dt = datetime.strptime(time_str_raw, "%d.%m.%Y %H:%M")
+                except Exception:
+                    try:
+                        dt = datetime.fromisoformat(time_str_raw)
+                    except Exception:
+                        dt = datetime.now()
+                
+                # Формируем entry с дополнительными полями
+                entry = {
+                    "name": file_info["name"],
+                    "path": file_info["path"],
+                    "model": file_info["model"],
+                    "datetime": dt,
+                    "data_type": file_info.get("data_type", "ply"),
+                    "source_folder": "PLY_examples",
+                    "car_number": file_info.get("car_number", "Неизвестно"),
+                    "time": file_info.get("time", ""),
+                    "img_file": file_info.get("img_file", "")
+                }
+                
+                # Создаём элемент списка
+                item = QListWidgetItem()
+                item.setData(Qt.UserRole, entry)
+                
+                # Создаём виджет для отображения двух строк и иконки
+                display_time = dt.strftime("%d.%m.%Y %H:%M") if dt else ""
+                widget = ReconListItemWidget(
+                    car_number=entry["car_number"],
+                    time_str=display_time
+                )
+                
+                # Устанавливаем виджет в элемент
+                item.setSizeHint(widget.sizeHint())
                 self.recon_json_list.addItem(item)
-
+                self.recon_json_list.setItemWidget(item, widget)
+                
+                # Запускаем асинхронную загрузку миниатюры, если указан файл
+                if entry["img_file"]:
+                    task = ImageDownloadTask(
+                        client=self.panda_app.tls_client,
+                        img_filename=entry["img_file"],
+                        item_widget=widget,
+                        temp_dir=temp_dir
+                    )
+                    QThreadPool.globalInstance().start(task)
 
         # ======================
         # КЛИК
         # ======================
         def on_recon_file_clicked(item):
-            self.panda_app.clear_scene()
             file_data = item.data(Qt.UserRole)
             if not file_data:
                 return
 
-            model = file_data["model"]
-            path = file_data["path"]
-            data_type = file_data["data_type"]
+            # Создаём временную директорию для скачанных файлов
+            temp_dir = os.path.join(tempfile.gettempdir(), "vizutil_recon")
+            os.makedirs(temp_dir, exist_ok=True)
+
+            # Имя JSON файла на сервере (без пути)
+            server_json_name = file_data["name"]
+            local_json_path = os.path.join(temp_dir, server_json_name)
 
             # Показываем оверлей
-            self.show_overlay("🚀 Запуск реконструкции...")
+            self.show_overlay("🚀 Загрузка JSON с сервера...")
             try:
-                self.log_message(f"📁 Загружается модель: {model}")
-                self.load_model_set(model)
-                self.log_message("✅ Модель загружена")
-
-                recon_module = getattr(self.panda_app, "mesh_reconstruction", None)
-                if not recon_module:
-                    self.log_message("❌ Модуль реконструкции не найден")
-                    return
-
-                # Запускаем реконструкцию в зависимости от типа
-                if data_type == "height" and hasattr(recon_module, "run_height_to_3d_reconstruction_from"):
-                    self.log_message("🌄 Запуск реконструкции по карте высот...")
-                    recon_module.run_height_to_3d_reconstruction_from(path)
-                else:
-                    self.log_message("📊 Запуск реконструкции по облаку точек...")
-                    recon_module.run_2d_to_3d_reconstruction_from(path)
-
-                self.log_message("✅ Реконструкция завершена")
+                # Скачиваем JSON
+                self.panda_app.tls_client.download_file(server_json_name, local_json_path)
+                self.log_message(f"✅ JSON загружен: {server_json_name}")
             except Exception as e:
-                self.log_message(f"❌ Ошибка: {str(e)}")
-                print(f"Ошибка реконструкции: {e}")
-            finally:
-                # Скрываем оверлей через 2 секунды, чтобы пользователь увидел финальное сообщение
+                self.log_message(f"❌ Ошибка загрузки JSON: {e}")
                 self.hide_overlay_timer.start(2000)
+                return
+
+            # Читаем JSON, чтобы получить имя PLY файла
+            try:
+                with open(local_json_path, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                    car_number = json_data.get("car_number")
+                    filler = json_data.get("filler")
+                    time = json_data.get("time")
+                    target_volume = json_data.get("target_volume")
+                    self.panda_app.update_overlay_info(
+                        texture=filler,
+                        car_number=car_number,
+                        initial_volume=target_volume,
+                        time=time          # ← добавлено
+                    )
+            except Exception as e:
+                self.log_message(f"❌ Ошибка чтения JSON: {e}")
+                self.hide_overlay_timer.start(2000)
+                return
+
+            ply_filename = json_data.get("ply_file")
+            local_ply_path = None
+            if ply_filename:
+                local_ply_path = os.path.join(temp_dir, ply_filename)
+                # Проверяем, не скачан ли уже PLY
+                if not os.path.exists(local_ply_path):
+                    self.log_message("📁 Загрузка PLY файла...")
+                    try:
+                        self.panda_app.tls_client.download_file(ply_filename, local_ply_path)
+                        self.log_message(f"✅ PLY загружен: {ply_filename}")
+                    except Exception as e:
+                        self.log_message(f"❌ Ошибка загрузки PLY: {e}")
+                        self.hide_overlay_timer.start(2000)
+                        return
+                else:
+                    self.log_message(f"📁 PLY уже загружен: {ply_filename}")
+
+            # Загружаем модель (набор) по имени из JSON
+            model_name = file_data["model"]
+            self.log_message(f"📁 Загружается модель: {model_name}")
+            self.load_model_set(model_name)
+            self.log_message("✅ Модель загружена")
+
+            recon_module = getattr(self.panda_app, "mesh_reconstruction", None)
+            if not recon_module:
+                self.log_message("❌ Модуль реконструкции не найден")
+                self.hide_overlay_timer.start(2000)
+                return
+
+            # Запускаем реконструкцию в зависимости от типа
+            if file_data["data_type"] == "height":
+                # TODO: аналогично для карт высот (нужно скачивать изображение)
+                self.log_message("❌ Реконструкция по карте высот пока не реализована")
+            else:
+                self.log_message("📊 Запуск реконструкции по облаку точек...")
+                try:
+                    # Передаём локальный путь к JSON и (если есть) путь к PLY
+                    recon_module.run_2d_to_3d_reconstruction_from(
+                        json_path=local_json_path,
+                        ply_path=local_ply_path
+                    )
+                    self.log_message("✅ Реконструкция завершена")
+                except Exception as e:
+                    self.log_message(f"❌ Ошибка реконструкции: {e}")
+
+            self.hide_overlay_timer.start(2000)
 
 
         # ======================
         # СИГНАЛЫ
         # ======================
-        self.recon_name_filter.textChanged.connect(apply_recon_filters)
-        self.recon_model_filter.currentIndexChanged.connect(apply_recon_filters)
-        self.recon_date_from.dateChanged.connect(apply_recon_filters)
-        self.recon_date_to.dateChanged.connect(apply_recon_filters)
-        self.recon_data_type_filter.currentIndexChanged.connect(apply_recon_filters)
         self.recon_json_list.itemClicked.connect(on_recon_file_clicked)
 
         load_recon_jsons()

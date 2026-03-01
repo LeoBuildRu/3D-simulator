@@ -470,8 +470,29 @@ class PerlinMeshGenerator:
 
         perlin_base_np.removeNode()
 
-        # Генерация детального меша (grid_size=128)
-        perlin_detailed_np = self.generate_perlin_mesh(grid_size=512)
+        # Получаем данные для subdivision
+        height_texture_path = self._get_height_texture_path()
+        height_array, tex_width, tex_height = self._load_height_array(height_texture_path)
+        strength = self.panda_app.current_texture_set.get('strength', 0.14)
+        texture_repeatX = self.panda_app.current_texture_set.get('textureRepeatX', 1.35)
+        texture_repeatY = self.panda_app.current_texture_set.get('textureRepeatY', 3.2)
+
+        # Повышаем разрешение сетки (old_size=48 -> new_size=512)
+        new_vertices, new_normals, new_texcoords = self.subdivide_mesh(
+            self.perlin_vertices_before_displace,   # от грубой сетки
+            self.perlin_texcoords_before_displace,
+            old_size=48,
+            new_size=512,
+            height_array=height_array,
+            tex_width=tex_width,
+            tex_height=tex_height,
+            strength=strength
+        )
+
+        # Создаём детальный меш
+        perlin_detailed_np = self._create_geom_from_vertices(
+            new_vertices, new_normals, new_texcoords, 512, "subdivided_perlin_mesh"
+        )
         perlin_detailed_np.setPos(0, 0, best_z)
 
         if self.gui:
@@ -613,6 +634,73 @@ class PerlinMeshGenerator:
         if hasattr(self.panda_app, 'final_model') and self.panda_app.final_model:
             volume = self.panda_app.calculate_mesh_volume(self.panda_app.final_model)
             self.panda_app.update_overlay_info(volume=volume)
+
+    def subdivide_mesh(self, vertices, texcoords, old_size, new_size,
+                    height_array, tex_width, tex_height, strength):
+        """
+        Повышает разрешение сетки с old_size x old_size до new_size x new_size
+        путём билинейной интерполяции вершин и текстурных координат,
+        затем применяет displacement по карте высот и пересчитывает нормали.
+        """
+        # Преобразуем списки в двумерные массивы для удобства интерполяции
+        V = [[None] * old_size for _ in range(old_size)]
+        T = [[None] * old_size for _ in range(old_size)]
+        for j in range(old_size):
+            for i in range(old_size):
+                idx = j * old_size + i
+                V[j][i] = vertices[idx]
+                T[j][i] = texcoords[idx]
+
+        new_vertices = []
+        new_texcoords = []
+
+        # Для каждой точки новой сетки
+        for j_new in range(new_size):
+            for i_new in range(new_size):
+                # Параметрические координаты в [0, 1]
+                s = i_new / (new_size - 1)
+                t = j_new / (new_size - 1)
+
+                # Координаты в исходной сетке (вещественные)
+                u = s * (old_size - 1)
+                v = t * (old_size - 1)
+
+                i0 = int(u)
+                j0 = int(v)
+                i1 = min(i0 + 1, old_size - 1)
+                j1 = min(j0 + 1, old_size - 1)
+
+                dx = u - i0
+                dy = v - j0
+
+                # Билинейная интерполяция для трёхкомпонентной вершины
+                def interp3(c00, c10, c01, c11, dx, dy):
+                    x = (1-dx)*(1-dy)*c00[0] + dx*(1-dy)*c10[0] + (1-dx)*dy*c01[0] + dx*dy*c11[0]
+                    y = (1-dx)*(1-dy)*c00[1] + dx*(1-dy)*c10[1] + (1-dx)*dy*c01[1] + dx*dy*c11[1]
+                    z = (1-dx)*(1-dy)*c00[2] + dx*(1-dy)*c10[2] + (1-dx)*dy*c01[2] + dx*dy*c11[2]
+                    return (x, y, z)
+
+                def interp2(c00, c10, c01, c11, dx, dy):
+                    uu = (1-dx)*(1-dy)*c00[0] + dx*(1-dy)*c10[0] + (1-dx)*dy*c01[0] + dx*dy*c11[0]
+                    vv = (1-dx)*(1-dy)*c00[1] + dx*(1-dy)*c10[1] + (1-dx)*dy*c01[1] + dx*dy*c11[1]
+                    return (uu, vv)
+
+                new_v = interp3(V[j0][i0], V[j0][i1], V[j1][i0], V[j1][i1], dx, dy)
+                new_t = interp2(T[j0][i0], T[j0][i1], T[j1][i0], T[j1][i1], dx, dy)
+
+                new_vertices.append(new_v)
+                new_texcoords.append(new_t)
+
+        # Применяем displacement к новым вершинам
+        displaced_vertices = self._apply_displacement(
+            new_vertices, new_texcoords,
+            height_array, tex_width, tex_height, strength
+        )
+
+        # Пересчитываем нормали
+        new_normals = self._calculate_normals(displaced_vertices, new_size)
+
+        return displaced_vertices, new_normals, new_texcoords
     
     def find_best_z_position(self, mesh_np, target_model_trimesh, target_volume, initial_z=0):
         """Поиск оптимальной Z-позиции меша для достижения целевого объема"""
@@ -1049,18 +1137,23 @@ class PerlinMeshGenerator:
         return target_model_trimesh
     
     def _evaluate_z_position(self, mesh_np, target_model_trimesh, z, target_volume):
-        """Оценивает объём при заданной Z с помощью сервера (возвращает только объём)"""
         mesh_np.setPos(0, 0, z)
         perlin_trimesh = self.panda_app.panda_to_trimesh(mesh_np)
 
-        # Запрос только объёма
-        volume = self.tls_client.send_boolean_request(
+        # Всегда запрашиваем геометрию, чтобы избежать расхождений в расчёте объёма
+        result_vertices, result_triangles = self.tls_client.send_boolean_request(
             target_model_trimesh.vertices,
             target_model_trimesh.faces,
             perlin_trimesh.vertices,
             perlin_trimesh.faces,
-            return_volume_only=True
+            return_volume_only=False
         )
+
+        result_trimesh = trimesh.Trimesh(vertices=result_vertices, faces=result_triangles)
+        temp_np = self.panda_app.trimesh_to_panda(result_trimesh)
+        volume = self.panda_app.calculate_mesh_volume(temp_np)
+        temp_np.removeNode()
+
         error = abs(volume - target_volume)
         return volume, error
     
@@ -1134,114 +1227,79 @@ class PerlinMeshGenerator:
         model.setPos(0, 0, 0)
     
     def _apply_textures_and_material(self, model_np):
-        """Apply PBR textures correctly for tobspr RenderPipeline"""
-
         import os
         from panda3d.core import Texture, TextureStage, Material
 
         texset = self.panda_app.current_texture_set
 
-        # ------------------------------------------------------------------
-        # Resolve paths
-        # ------------------------------------------------------------------
-        diffuse_path = (
-            texset.get("diffuse")
-            or texset.get("albedo")
-            or "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        )
-
-        normal_path = texset.get(
-            "normal",
-            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
-        )
-
+        # Пути к текстурам
+        diffuse_path = texset.get("diffuse") or texset.get("albedo") or "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
+        normal_path = texset.get("normal", "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg")
         roughness_path = texset.get("roughness")
-        metallic_path  = texset.get("metallic")   # optional
+        metallic_path = texset.get("metallic")
 
+        # Проверка существования файлов (с резервными)
         if not os.path.exists(diffuse_path):
             diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-
         if not os.path.exists(normal_path):
             normal_path = "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
 
-        # ------------------------------------------------------------------
-        # Create RP-compatible material
-        # ------------------------------------------------------------------
+        # Создаём PBR-материал
         mat = Material()
-
-        # MUST be white for PBR
         mat.set_base_color((1, 1, 1, 1))
-
-        # enable normal map strength (RP trick)
+        # Для RP: зелёный канал emission = сила нормалей (если требуется)
         mat.set_emission((0, 1, 0, 0))
-
         model_np.set_material(mat)
 
-        # ------------------------------------------------------------------
-        # Helper to configure textures
-        # ------------------------------------------------------------------
+        # Вспомогательная функция настройки текстур
         def setup_tex(tex, srgb=False):
             if srgb:
                 tex.set_format(Texture.F_srgb)
-
             tex.set_minfilter(Texture.FTLinearMipmapLinear)
             tex.set_magfilter(Texture.FTLinear)
             tex.set_wrap_u(Texture.WMRepeat)
             tex.set_wrap_v(Texture.WMRepeat)
 
-        # ------------------------------------------------------------------
-        # Texture stages (STRICT ORDER)
-        # ------------------------------------------------------------------
+        # Слоты с правильным порядком
         ts_color = TextureStage("0-color")
         ts_color.set_sort(0)
-        ts_color.set_priority(0)
-
         ts_normal = TextureStage("1-normal")
         ts_normal.set_sort(1)
-        ts_normal.set_priority(1)
-
         ts_metal = TextureStage("2-metallic")
         ts_metal.set_sort(2)
-        ts_metal.set_priority(2)
-
         ts_rough = TextureStage("3-roughness")
         ts_rough.set_sort(3)
-        ts_rough.set_priority(3)
-
-        # ------------------------------------------------------------------
-        # Load + assign textures
-        # ------------------------------------------------------------------
 
         # Albedo
         diffuse_tex = self.panda_app.loader.loadTexture(diffuse_path)
         setup_tex(diffuse_tex, srgb=True)
         model_np.set_texture(ts_color, diffuse_tex)
 
-        # Normal
+        # Normal map
         normal_tex = self.panda_app.loader.loadTexture(normal_path)
         setup_tex(normal_tex)
         model_np.set_texture(ts_normal, normal_tex)
 
-        # Metallic (REQUIRED SLOT even if dummy)
+        # Metallic (всегда заполняем)
         if metallic_path and os.path.exists(metallic_path):
             metal_tex = self.panda_app.loader.loadTexture(metallic_path)
         else:
-            # dummy white metallic map
             metal_tex = Texture("dummy_metal")
-            metal_tex.setup2dTexture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
-            metal_tex.setRamImage(b"\x00")
-
+            metal_tex.setup_2d_texture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+            metal_tex.set_ram_image(b"\x00")  # чёрный = 0 металличности
         setup_tex(metal_tex)
         model_np.set_texture(ts_metal, metal_tex)
 
-        # Roughness
+        # Roughness (всегда заполняем заглушкой)
         if roughness_path and os.path.exists(roughness_path):
             rough_tex = self.panda_app.loader.loadTexture(roughness_path)
-            setup_tex(rough_tex)
-            model_np.set_texture(ts_rough, rough_tex)
+        else:
+            rough_tex = Texture("dummy_rough")
+            rough_tex.setup_2d_texture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+            rough_tex.set_ram_image(b"\x80")  # 0x80 = 0.5 в линейном (средняя шероховатость)
+        setup_tex(rough_tex)
+        model_np.set_texture(ts_rough, rough_tex)
 
-        # ------------------------------------------------------------------
-        # RP required flags
-        # ------------------------------------------------------------------
-        model_np.set_shader_auto()
+        # Флаги RP
+        # model_np.set_shader_auto()  # Для RP обычно не требуется, но можно оставить
         model_np.set_two_sided(True)

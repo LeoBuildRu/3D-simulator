@@ -16,7 +16,7 @@ Scania:
   cuzov: "models/Scania-Cuzov.bam"
   napolnitel: "models/Scania-Napolnitel.bam"
   other: "models/Scania-Other.bam"
-  max_volume: 24
+  max_volume: 20
   ground_plane: 2.6
 
 Kerax:

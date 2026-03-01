@@ -1785,36 +1785,39 @@ class MeshReconstruction:
     def run_2d_to_3d_reconstruction(self):
         self.run_2d_to_3d_reconstruction_from(self.recon_json_path)
     
-    def run_2d_to_3d_reconstruction_from(self, json_path):
+    def run_2d_to_3d_reconstruction_from(self, json_path, ply_path=None):
         if hasattr(self, 'final_mesh_node') and self.final_mesh_node:
             self.final_mesh_node.removeNode()
             self.final_mesh_node = None
 
-        # Удаляем предыдущий промежуточный меш (на случай ошибки)
         if hasattr(self, 'mesh_node') and self.mesh_node:
             self.mesh_node.removeNode()
             self.mesh_node = None
 
-        self.log("🚀 Запуск 2D-3D реконструкции...")  # <-- ДОБАВЛЕНО
+        self.log("🚀 Запуск 2D-3D реконструкции...")
         if not json_path or not os.path.isfile(json_path):
-            self.log("❌ Не выбран JSON-файл или файл не существует")  # <-- ДОБАВЛЕНО
-            #QMessageBox.warning(self.panda_app, "Ошибка", "Пожалуйста, выберите корректный JSON-файл.")
+            self.log("❌ JSON файл не существует")
             return
-        
+
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        self.log(f"✅ JSON загружен: {json_path}")  # <-- ДОБАВЛЕНО
+        self.log(f"✅ JSON загружен: {json_path}")
 
-        self.ply_path =  json_path.replace(".json", ".ply")
-        if(os.path.exists(self.ply_path)):
+        if ply_path is not None:
+            self.ply_path = ply_path
+        else:
+            # По умолчанию ищем PLY рядом с JSON
+            self.ply_path = json_path.replace(".json", ".ply")
+
+        if os.path.exists(self.ply_path):
             self.using_ply = True
-            self.log("📁 Загрузка облака точек...")  # <-- ДОБАВЛЕНО
+            self.log("📁 Загрузка облака точек...")
             self.point_cloud = pcu.load_mesh_v(self.ply_path)
-            self.log("✅ Облако точек загружено")  # <-- ДОБАВЛЕНО
+            self.log("✅ Облако точек загружено")
         else:
             self.using_ply = False
-            self.heightmap_path = os.path.dirname(json_path) + "/" + data["heightmap_path"]
-            if not self.load_height_map(): 
+            self.heightmap_path = os.path.dirname(json_path) + "/" + data.get("heightmap_path", "")
+            if not self.load_height_map():
                 return
         
         self.cam_node = self.panda_app.cam.node()

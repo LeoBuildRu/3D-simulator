@@ -1,4 +1,5 @@
 import requests
+import urllib.parse
 import numpy as np
 import base64
 import json
@@ -19,29 +20,49 @@ class TLS_client:
         self.timeout = timeout
 
     def _post(self, endpoint: str, payload: dict) -> dict:
-        """
-        Внутренний метод для отправки POST-запроса.
-        Возвращает распарсенный JSON-ответ или выбрасывает исключение.
-        """
         url = f"{self.base_url}/{endpoint}"
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
-            resp.raise_for_status()  # выбросит исключение при HTTP-ошибке
+            resp.raise_for_status()
             return resp.json()
         except requests.exceptions.Timeout:
             raise RuntimeError(f"Таймаут при обращении к серверу ({self.timeout} сек)")
         except requests.exceptions.ConnectionError as e:
             raise RuntimeError(f"Ошибка подключения к серверу {url}: {e}")
         except requests.exceptions.HTTPError as e:
-            # Попытаемся извлечь JSON с описанием ошибки от сервера
             try:
                 error_data = e.response.json()
                 msg = error_data.get("error", str(e))
             except:
                 msg = str(e)
             raise RuntimeError(f"Сервер вернул ошибку: {msg}")
+        except requests.exceptions.JSONDecodeError as e:
+            # Ответ получен, но не является валидным JSON
+            preview = resp.text[:500] + "..." if len(resp.text) > 500 else resp.text
+            raise RuntimeError(
+                f"Сервер вернул невалидный JSON: {e}\n"
+                f"Первые 500 символов ответа:\n{preview}"
+            )
         except Exception as e:
             raise RuntimeError(f"Неизвестная ошибка при запросе: {e}")
+
+    def get_verified_models(self) -> list:
+        response = self._post("get_verified_models", {})  # POST с пустым payload
+        if response.get("status") != "success":
+            raise RuntimeError(f"Ошибка сервера: {response.get('error', 'Неизвестная ошибка')}")
+        return response.get("files", [])
+    
+    def download_file(self, filename: str, local_path: str) -> None:
+        url = f"{self.base_url}/download?file={urllib.parse.quote(filename)}"
+        try:
+            resp = requests.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            with open(local_path, 'wb') as f:
+                f.write(resp.content)
+        except requests.exceptions.Timeout:
+            raise RuntimeError(f"Таймаут при скачивании файла {filename}")
+        except Exception as e:
+            raise RuntimeError(f"Ошибка скачивания файла {filename}: {e}")
 
     def send_perlin_request(self,
                             grid_size: int,

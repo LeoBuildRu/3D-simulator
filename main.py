@@ -12,9 +12,14 @@ else:
 sys.path.insert(0, base_path)
 
 # --- Добавлено: настройка путей поиска моделей для Panda3D ---
-from panda3d.core import get_model_path
-get_model_path().prepend_directory(base_path)
-get_model_path().prepend_directory(os.path.join(base_path, "models"))
+from panda3d.core import get_model_path, Filename
+
+# Преобразуем пути в формат Panda3D (Unix-стиль)
+base_path_p3d = Filename.fromOsSpecific(base_path).getFullpath()
+get_model_path().prepend_directory(base_path_p3d)
+
+models_path_p3d = Filename.fromOsSpecific(os.path.join(base_path, "models")).getFullpath()
+get_model_path().prepend_directory(models_path_p3d)
 # -------------------------------------------------------------
 
 # Теперь можно импортировать остальные модули
@@ -261,8 +266,8 @@ class MyApp(ShowBase):
         self.current_model_set = None
 
         # временный флаг:
-        self.particle_flag = True
-        self.canDistributeMeshes = True
+        self.particle_flag = False
+        self.canDistributeMeshes = False
 
         self.Target_Cuzov = "Scania-Cuzov.gltf"
         self.Target_Y_offset = 0
@@ -347,55 +352,116 @@ class MyApp(ShowBase):
         self.mesh_reconstruction = MeshReconstruction(self, tls_client=self.tls_client)
 
     def create_top_overlay(self):
-        """Создаёт панель, прижатую к верхнему левому углу."""
         from direct.gui.DirectFrame import DirectFrame
         from direct.gui.DirectLabel import DirectLabel
-        from panda3d.core import TextNode
-        import os
+        from direct.gui import DirectGuiGlobals as DGG
+        from panda3d.core import TextNode, SamplerState
 
-        r, g, b = 0x25 / 255.0, 0x25 / 255.0, 0x32 / 255.0
+        # Загрузка шрифта (один раз)
+        if not hasattr(self, "ui_font"):
+            font_path = Filename.fromOsSpecific("fonts/JOST/static/Jost-Regular.ttf").getFullpath()
+            self.ui_font = loader.loadFont(font_path)
+            self.ui_font.setPixelsPerUnit(60)
+            self.ui_font.setMinfilter(SamplerState.FT_linear)
+            self.ui_font.setMagfilter(SamplerState.FT_linear)
 
-        # Размеры панели в пикселях
+        # (по желанию) применить шрифт глобально
+        # DGG.setDefaultFont(self.ui_font)
+
+        # Цвета в формате (r, g, b, a) от 0 до 1
+        bg_color = (0.102, 0.102, 0.129, 1.0)        # #1a1a21
+        accent_color = (0.29, 0.50, 0.75, 1.0)       # #4a7fbe
+        text_color = (1.0, 1.0, 1.0, 1.0)            # белый
+
         panel_width = 500
-        panel_height = 100
-        
-        # Отступы от угла экрана
+        panel_height = 220                            # увеличено для заголовка
         margin_x = 20
-        margin_z = -20 # В pixel2d вниз — это минус
+        margin_z = -20
 
+        # Основной фон панели
         self.top_overlay = DirectFrame(
-            parent=pixel2d, 
-            frameColor=(r, g, b, 1.0),
+            parent=pixel2d,
+            frameColor=bg_color,
             frameSize=(0, panel_width, -panel_height, 0),
-            pos=(margin_x, 0, margin_z), # Фиксированная позиция в углу
+            pos=(margin_x, 0, margin_z),
             sortOrder=100,
             suppressMouse=True
         )
 
+        # Заголовок панели
+        title_options = {
+            "parent": self.top_overlay,
+            "text": "Data Information",
+            "text_scale": 18,
+            "text_fg": accent_color,
+            "text_align": TextNode.ALeft,
+            "text_font": self.ui_font,
+            "frameColor": (0, 0, 0, 0),
+            "relief": None
+        }
+        DirectLabel(pos=(20, 0, -25), **title_options)
+
+        # Общие настройки для информационных строк
         label_options = {
             "parent": self.top_overlay,
-            "text_scale": 16,               
-            "text_fg": (1, 1, 1, 1),
+            "text_scale": 16,
+            "text_fg": text_color,
             "text_align": TextNode.ALeft,
+            "text_font": self.ui_font,
             "frameColor": (0, 0, 0, 0),
             "relief": None
         }
 
-        # Позиции текста внутри панели
         text_margin = 20
-        self.model_label = DirectLabel(text="Model: —", pos=(text_margin, 0, -25), **label_options)
-        self.texture_label = DirectLabel(text="Texture: —", pos=(text_margin, 0, -50), **label_options)
-        self.volume_label = DirectLabel(text="Volume: —", pos=(text_margin, 0, -75), **label_options)
+        start_y = -55                                 # начальная позиция после заголовка
+        row_height = 28                               # увеличенный шаг между строками
 
-    def update_overlay_info(self, model=None, texture=None, volume=None):
+        self.model_label = DirectLabel(
+            text="Модель: —",
+            pos=(text_margin, 0, start_y),
+            **label_options
+        )
+        self.texture_label = DirectLabel(
+            text="Наполнитель: —",
+            pos=(text_margin, 0, start_y - row_height * 1),
+            **label_options
+        )
+        self.volume_label = DirectLabel(
+            text="Объём: —",
+            pos=(text_margin, 0, start_y - row_height * 2),
+            **label_options
+        )
+        self.initial_volume_label = DirectLabel(
+            text="Исходный объём: —",
+            pos=(text_margin, 0, start_y - row_height * 3),
+            **label_options
+        )
+        self.car_number_label = DirectLabel(
+            text="Номер машины: —",
+            pos=(text_margin, 0, start_y - row_height * 4),
+            **label_options
+        )
+        self.time_label = DirectLabel(
+            text="Время проезда: —",
+            pos=(text_margin, 0, start_y - row_height * 5),
+            **label_options
+        )
+
+    def update_overlay_info(self, model=None, texture=None, volume=None, car_number=None, initial_volume=None, time=None):
         if model is not None:
-            self.model_label['text'] = f"Model: {model}"
+            self.model_label['text'] = f"Модель: {model}"
         if texture is not None:
             import os
             tex_name = os.path.basename(texture) if texture else "—"
-            self.texture_label['text'] = f"Texture: {tex_name}"
+            self.texture_label['text'] = f"Наполнитель: {tex_name}"
         if volume is not None:
-            self.volume_label['text'] = f"Volume: {volume:.2f}"
+            self.volume_label['text'] = f"Объём: {volume:.2f}"
+        if initial_volume is not None:
+            self.initial_volume_label['text'] = f"Исходный объём: {initial_volume:.2f}"
+        if car_number is not None:
+            self.car_number_label['text'] = f"Номер машины: {car_number}"
+        if time is not None:
+            self.time_label['text'] = f"Время проезда: {time}"
 
 
     def setup_window_for_parenting(self, parent_hwnd):
@@ -439,8 +505,8 @@ class MyApp(ShowBase):
             new_texture_set['displacement'] = new_texture_set['height']
         
         self.current_texture_set = new_texture_set
-        tex_path = new_texture_set.get('diffuse') or new_texture_set.get('albedo')
-        self.update_overlay_info(texture=tex_path)
+        # tex_path = new_texture_set.get('diffuse') or new_texture_set.get('albedo')
+        # self.update_overlay_info(texture=tex_path)
         
         if('mesh_distributions' in new_texture_set):
             self.mesh_distributions_data = new_texture_set["mesh_distributions"]
@@ -901,7 +967,6 @@ class MyApp(ShowBase):
         indices_np = np.array(indices, dtype=np.int32)
 
         return vertices_np, indices_np
-
 
     def distribute_meshes(self, geom_node):
         if geom_node.getNumGeoms() > 0:
@@ -1573,6 +1638,11 @@ class MyApp(ShowBase):
                 self.loaded_models.remove(self.dynamic_perlin_model)
             self.dynamic_perlin_model.removeNode()
             self.dynamic_perlin_model = None
+
+        if hasattr(self, 'mesh_distributions'):
+            for distrib in self.mesh_distributions:
+                distrib.stop_rendering()
+            self.mesh_distributions.clear()
 
         if hasattr(self, 'mesh_reconstruction'):
             if hasattr(self.mesh_reconstruction, 'final_mesh_node') and self.mesh_reconstruction.final_mesh_node:
