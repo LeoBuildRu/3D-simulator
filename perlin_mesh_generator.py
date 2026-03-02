@@ -394,6 +394,10 @@ class PerlinMeshGenerator:
             self.gui.log_message("🌄 Начало генерации Perlin mesh...")
         """Генерация перлин-меша на основе CSG операции с использованием сервера для булевой разности"""
         # Очистка предыдущих моделей (как в оригинале)
+        if hasattr(self.panda_app, 'final_mesh_node') and self.panda_app.final_mesh_node:
+            self.panda_app.final_mesh_node.removeNode()
+            self.panda_app.final_mesh_node = None
+
         if hasattr(self.panda_app, 'test_perlin_mesh') and self.panda_app.test_perlin_mesh is not None:
             if self.panda_app.test_perlin_mesh in self.panda_app.loaded_models:
                 self.panda_app.loaded_models.remove(self.panda_app.test_perlin_mesh)

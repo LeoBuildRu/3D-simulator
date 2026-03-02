@@ -65,7 +65,6 @@ class MeshReconstruction:
         
         # Для хранения мешей
         self.source_mesh_node = None
-        self.mesh_node = None
         
         print(f"[DEBUG] Инициализирован MeshReconstruction")
 
@@ -1473,33 +1472,33 @@ class MeshReconstruction:
 
 
     def add_extended_mesh_to_scene(self, node):
-        if hasattr(self, "mesh_node") and self.mesh_node:
-            self.mesh_node.removeNode()
+        if hasattr(self, "mesh_node") and self.panda_app.mesh_node:
+            self.panda_app.mesh_node.removeNode()
         
         if node:
-            self.mesh_node = self.panda_app.render.attachNewNode(node)
+            self.panda_app.mesh_node = self.panda_app.render.attachNewNode(node)
             
             material = Material()
             material.setDiffuse((0.8, 0.8, 0.8, 1.0))
             material.setAmbient((0.3, 0.3, 0.3, 1.0))
             material.setSpecular((0.5, 0.5, 0.5, 1.0))
             material.setShininess(50.0)
-            self.mesh_node.setTwoSided(True)
-            self.mesh_node.setMaterial(material, 1)
+            self.panda_app.mesh_node.setTwoSided(True)
+            self.panda_app.mesh_node.setMaterial(material, 1)
             
-            self.mesh_node.setShaderAuto()
-            self.mesh_node.setPos(0, 0, 0)
+            self.panda_app.mesh_node.setShaderAuto()
+            self.panda_app.mesh_node.setPos(0, 0, 0)
             
             if not hasattr(self.panda_app, 'loaded_models'):
                 self.panda_app.loaded_models = []
             if not hasattr(self.panda_app, 'model_paths'):
                 self.panda_app.model_paths = {}
             
-            if self.mesh_node not in self.panda_app.loaded_models:
-                self.panda_app.loaded_models.append(self.mesh_node)
-                self.panda_app.model_paths[id(self.mesh_node)] = "extended_height_map_mesh"
+            if self.panda_app.mesh_node not in self.panda_app.loaded_models:
+                self.panda_app.loaded_models.append(self.panda_app.mesh_node)
+                self.panda_app.model_paths[id(self.panda_app.mesh_node)] = "extended_height_map_mesh"
             
-            return self.mesh_node
+            return self.panda_app.mesh_node
         
         return None
 
@@ -1786,13 +1785,13 @@ class MeshReconstruction:
         self.run_2d_to_3d_reconstruction_from(self.recon_json_path)
     
     def run_2d_to_3d_reconstruction_from(self, json_path, ply_path=None):
-        if hasattr(self, 'final_mesh_node') and self.final_mesh_node:
-            self.final_mesh_node.removeNode()
-            self.final_mesh_node = None
+        if hasattr(self, 'final_mesh_node') and self.panda_app.final_mesh_node:
+            self.panda_app.final_mesh_node.removeNode()
+            self.panda_app.final_mesh_node = None
 
-        if hasattr(self, 'mesh_node') and self.mesh_node:
-            self.mesh_node.removeNode()
-            self.mesh_node = None
+        if hasattr(self, 'mesh_node') and self.panda_app.mesh_node:
+            self.panda_app.mesh_node.removeNode()
+            self.panda_app.mesh_node = None
 
         self.log("🚀 Запуск 2D-3D реконструкции...")
         if not json_path or not os.path.isfile(json_path):
@@ -1881,26 +1880,26 @@ class MeshReconstruction:
             self.log(f"❌ Ошибка булевой разности: {e}")  
             return
 
-        self.final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
+        self.panda_app.final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
         
         # ВАЖНО: После boolean операции нужно правильно установить UV-координаты
         print(f"[DEBUG] Настройка UV-координат после boolean операции...")
-        self.final_mesh_node = self._setup_uv_coordinates_after_boolean(self.final_mesh_node, mesh_node)
+        self.panda_app.final_mesh_node = self._setup_uv_coordinates_after_boolean(self.panda_app.final_mesh_node, mesh_node)
         
-        if self.final_mesh_node is None or self.final_mesh_node.is_empty():
+        if self.panda_app.final_mesh_node is None or self.panda_app.final_mesh_node.is_empty():
             print(f"[ERROR] Не удалось создать меш с UV-координатами")
             self.log("❌ Не удалось создать меш с UV-координатами") 
             return
         
-        print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={self.final_mesh_node.is_empty()}")
+        print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={self.panda_app.final_mesh_node.is_empty()}")
         
         # Применяем текстуры и материал
         print(f"[DEBUG] Применение текстур к финальному мешу...")
-        self._apply_textures_and_material(self.final_mesh_node)
-        print(self.panda_app.calculate_mesh_volume(self.final_mesh_node))
+        self._apply_textures_and_material(self.panda_app.final_mesh_node)
+        print(self.panda_app.calculate_mesh_volume(self.panda_app.final_mesh_node))
 
         # Обновляем объём в оверлее
-        volume = self.panda_app.calculate_mesh_volume(self.final_mesh_node)
+        volume = self.panda_app.calculate_mesh_volume(self.panda_app.final_mesh_node)
         self.panda_app.update_overlay_info(volume=volume)
         
         mesh_node.removeNode()

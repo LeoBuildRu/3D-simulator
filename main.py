@@ -1644,18 +1644,9 @@ class MyApp(ShowBase):
                 distrib.stop_rendering()
             self.mesh_distributions.clear()
 
-        if hasattr(self, 'mesh_reconstruction'):
-            if hasattr(self.mesh_reconstruction, 'final_mesh_node') and self.mesh_reconstruction.final_mesh_node:
-                if self.mesh_reconstruction.final_mesh_node in self.loaded_models:
-                    self.loaded_models.remove(self.mesh_reconstruction.final_mesh_node)
-                self.mesh_reconstruction.final_mesh_node.removeNode()
-                self.mesh_reconstruction.final_mesh_node = None
-
-            if hasattr(self.mesh_reconstruction, 'mesh_node') and self.mesh_reconstruction.mesh_node:
-                if self.mesh_reconstruction.mesh_node in self.loaded_models:
-                    self.loaded_models.remove(self.mesh_reconstruction.mesh_node)
-                self.mesh_reconstruction.mesh_node.removeNode()
-                self.mesh_reconstruction.mesh_node = None
+        if hasattr(self, 'final_mesh_node') and self.final_mesh_node:
+            self.final_mesh_node.removeNode()
+            self.final_mesh_node = None
         
         if hasattr(self, 'final_model') and self.final_model:
             if self.final_model in self.loaded_models:
