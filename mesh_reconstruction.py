@@ -28,6 +28,7 @@ class MeshReconstruction:
 
         # for testing only
         self.alpha_threshold = 0.5
+        self.vertical_offset = -0.15
 
         self.adaptive_lift_enabled = True
         self.lift_intensity = 0.0
@@ -297,7 +298,7 @@ class MeshReconstruction:
         return LVector3f(
             x,   # right -> right
             z,   # forward -> forward
-            -y   # up (inverted Y) -> up
+            y   # up (inverted Y) -> up
         )
 
 
@@ -329,9 +330,13 @@ class MeshReconstruction:
             #self.setVertFOV(lens, 50.6)
 
             keypoints_3d = [np.array(p, dtype=float) for p in data["keypoints_3d"]]
+            keypoints_3d_orig = keypoints_3d.copy()
+
+            inds = [ 3, 4, 1, 2 ]
 
             for i in range(len(keypoints_3d)):
-                keypoints_3d[i] = self.cv_to_panda(self.np_to_panda_point(keypoints_3d[i]))
+                keypoints_3d[inds[i] - 1] = self.cv_to_panda(self.np_to_panda_point(keypoints_3d_orig[i]))
+                keypoints_3d[inds[i] - 1][1] += self.vertical_offset
 
             def ApplyScale(scale):
                 #camera.set_pos(self.np_to_panda_point(cam_pos))
@@ -393,7 +398,7 @@ class MeshReconstruction:
 
             trs_points = [self.cv_to_panda(self.np_to_panda_point(v)) for v in self.point_cloud]
             trs_points = [self.trs_matrix @ np.append(self.panda_vec3_to_np(v), 1.0) for v in trs_points]
-            self.trs_points = trs_points
+            self.trs_points = np.asarray(trs_points)[:, :3]
 
             return
 
@@ -1035,6 +1040,11 @@ class MeshReconstruction:
         # 3. KD-дерево для исходных точек (2D проекции)
         # ------------------------------------------------------------
         self.log("🌲 Построение KD-дерева...")  # <-- ДОБАВЛЕНО
+
+        source_mask = self.last_target_model_trimesh.contains(source_points)
+
+        source_points = source_points[source_mask]
+
         source_xy = source_points[:, :2]
         source_z = source_points[:, 2]
         source_tree = KDTree(source_xy)
@@ -1824,13 +1834,6 @@ class MeshReconstruction:
         self.reconstruct_camera_pos_hpr_fov_depth(data)
         self.log("🎥 Позиция камеры восстановлена")  # <-- ДОБАВЛЕНО
 
-        if self.using_ply:
-            node = self.create_mesh_from_point_cloud(self.grid_resolution_main)
-        else:
-            node = self.create_unified_perlin_mesh_with_lift()
-
-        mesh_node = self.add_extended_mesh_to_scene(node)
-
         target_model = None
         for model in self.panda_app.loaded_models:
             model_id = id(model)
@@ -1854,6 +1857,13 @@ class MeshReconstruction:
             return False
         target_model.setScale(1.0, 1.0, 1.0)
         target_model.setPos(0.0, 0.0, 0.0)
+
+        if self.using_ply:
+            node = self.create_mesh_from_point_cloud(self.grid_resolution_main)
+        else:
+            node = self.create_unified_perlin_mesh_with_lift()
+
+        mesh_node = self.add_extended_mesh_to_scene(node)
 
         mesh_node_trimesh = self.panda_app.panda_to_trimesh(mesh_node)
 
