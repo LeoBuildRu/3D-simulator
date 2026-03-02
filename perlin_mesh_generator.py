@@ -228,6 +228,11 @@ class PerlinMeshGenerator:
     
     def create_mesh_from_perlin_data(self):
         """Создание меша из сохраненных данных перлина"""
+        if not(self.panda_app.canDistributeMeshes):
+            for distrib in self.panda_app.mesh_distributions:
+                distrib.stop_rendering()
+            self.panda_app.mesh_distributions.clear()
+
         if hasattr(self.panda_app, 'final_model') and self.panda_app.final_model:
             self.panda_app.final_model.removeNode()
             self.panda_app.final_model = None
@@ -392,8 +397,7 @@ class PerlinMeshGenerator:
     def generate_perlin_mesh_from_csg(self):
         if self.gui:
             self.gui.log_message("🌄 Начало генерации Perlin mesh...")
-        """Генерация перлин-меша на основе CSG операции с использованием сервера для булевой разности"""
-        # Очистка предыдущих моделей (как в оригинале)
+
         if hasattr(self.panda_app, 'final_mesh_node') and self.panda_app.final_mesh_node:
             self.panda_app.final_mesh_node.removeNode()
             self.panda_app.final_mesh_node = None

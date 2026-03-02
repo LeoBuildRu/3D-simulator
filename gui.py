@@ -635,8 +635,8 @@ class CameraControlGUI(QWidget):
         particle_layout = QVBoxLayout()
         particle_layout.setSpacing(8)
 
-        self.particle_flag_checkbox = QCheckBox("Распределять частицы (particle_flag)")
-        self.particle_flag_checkbox.setChecked(self.panda_app.particle_flag)  # синхронизация с текущим состоянием
+        self.particle_flag_checkbox = QCheckBox("Распределять частицы")
+        self.particle_flag_checkbox.setChecked(self.panda_app.canDistributeMeshes)  # используем canDistributeMeshes
         self.particle_flag_checkbox.stateChanged.connect(self.on_particle_flag_changed)
 
         particle_layout.addWidget(self.particle_flag_checkbox)
@@ -650,8 +650,8 @@ class CameraControlGUI(QWidget):
 
                 # --- Папки (всегда читаем обе) ---
         self.recon_base_folders = {
-            "ply": os.path.join(os.getcwd(), "PLY_examples"),
-            "height": os.path.join(os.getcwd(), "height_examples")
+            "ply": os.path.join(PROJECT_ROOT, "PLY_examples"),
+            "height": os.path.join(PROJECT_ROOT, "height_examples")
         }
 
         self.recon_all_files = []
@@ -671,74 +671,129 @@ class CameraControlGUI(QWidget):
             # Очищаем список
             self.recon_json_list.clear()
 
-            # Получаем список файлов (как и раньше)
+            # --- 1. Получаем данные с сервера (как и раньше) ---
             try:
                 files_from_server = self.panda_app.tls_client.get_verified_models()
             except Exception as e:
                 print(f"Ошибка получения списка с сервера: {e}")
                 files_from_server = []
 
-            # Сортируем по дате (от новых к старым)
-            sorted_files = sorted(
-                files_from_server,
-                key=lambda x: x.get("datetime", ""),
-                reverse=True
-            )
+            # --- 2. Сканируем локальную папку height_examples ---
+            local_files = []
+            height_folder = self.recon_base_folders["height"]  # путь к height_examples
+            if os.path.exists(height_folder):
+                for filename in os.listdir(height_folder):
+                    if filename.lower().endswith('.json'):
+                        json_path = os.path.join(height_folder, filename)
+                        try:
+                            with open(json_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            
+                            # Парсим дату (ожидается поле "time")
+                            time_str = data.get("time", "")
+                            dt = None
+                            try:
+                                dt = datetime.strptime(time_str, "%d.%m.%Y %H:%M")
+                            except:
+                                try:
+                                    dt = datetime.fromisoformat(time_str)
+                                except:
+                                    dt = datetime.now()
+                            
+                            # Формируем запись
+                            entry = {
+                                "name": filename,
+                                "path": json_path,                # локальный путь
+                                "model": data.get("model", ""),
+                                "datetime": dt,
+                                "data_type": "height",            # помечаем как height
+                                "source_folder": "height_examples",
+                                "car_number": data.get("car_number", "Неизвестно"),
+                                "time": time_str,
+                                "img_file": data.get("img_file", ""),
+                                "ply_file": data.get("ply_file", None),  # может отсутствовать
+                                "is_local": True                   # флаг локальности
+                            }
+                            local_files.append(entry)
+                        except Exception as e:
+                            print(f"Ошибка чтения локального JSON {filename}: {e}")
+
+            # --- 3. Объединяем и сортируем ---
+            all_entries = []
+            # Серверные файлы
+            for f in files_from_server:
+                dt = None
+                try:
+                    dt = datetime.strptime(f.get("datetime", ""), "%d.%m.%Y %H:%M")
+                except:
+                    try:
+                        dt = datetime.fromisoformat(f.get("datetime", ""))
+                    except:
+                        dt = datetime.now()
+                entry = {
+                    "name": f["name"],
+                    "path": f["path"],                # серверный путь (не используется напрямую)
+                    "model": f["model"],
+                    "datetime": dt,
+                    "data_type": f.get("data_type", "ply"),
+                    "source_folder": "PLY_examples",
+                    "car_number": f.get("car_number", "Неизвестно"),
+                    "time": f.get("time", ""),
+                    "img_file": f.get("img_file", ""),
+                    "is_local": False
+                }
+                all_entries.append(entry)
+            
+            # Добавляем локальные
+            all_entries.extend(local_files)
+
+            # Сортируем по дате (новые сверху)
+            sorted_entries = sorted(all_entries, key=lambda x: x["datetime"], reverse=True)
 
             # Временная директория для миниатюр
             temp_dir = os.path.join(tempfile.gettempdir(), "vizutil_recon_thumbnails")
             os.makedirs(temp_dir, exist_ok=True)
 
-            for file_info in sorted_files:
-                # Парсим дату
-                dt = None
-                time_str_raw = file_info.get("datetime", "")
-                try:
-                    dt = datetime.strptime(time_str_raw, "%d.%m.%Y %H:%M")
-                except Exception:
-                    try:
-                        dt = datetime.fromisoformat(time_str_raw)
-                    except Exception:
-                        dt = datetime.now()
-                
-                # Формируем entry с дополнительными полями
-                entry = {
-                    "name": file_info["name"],
-                    "path": file_info["path"],
-                    "model": file_info["model"],
-                    "datetime": dt,
-                    "data_type": file_info.get("data_type", "ply"),
-                    "source_folder": "PLY_examples",
-                    "car_number": file_info.get("car_number", "Неизвестно"),
-                    "time": file_info.get("time", ""),
-                    "img_file": file_info.get("img_file", "")
-                }
-                
-                # Создаём элемент списка
+            for entry in sorted_entries:
                 item = QListWidgetItem()
                 item.setData(Qt.UserRole, entry)
-                
-                # Создаём виджет для отображения двух строк и иконки
-                display_time = dt.strftime("%d.%m.%Y %H:%M") if dt else ""
+
+                display_time = entry["datetime"].strftime("%d.%m.%Y %H:%M") if entry["datetime"] else ""
                 widget = ReconListItemWidget(
                     car_number=entry["car_number"],
                     time_str=display_time
                 )
-                
-                # Устанавливаем виджет в элемент
+
                 item.setSizeHint(widget.sizeHint())
                 self.recon_json_list.addItem(item)
                 self.recon_json_list.setItemWidget(item, widget)
-                
-                # Запускаем асинхронную загрузку миниатюры, если указан файл
+
+                # Загрузка миниатюры (если есть изображение)
                 if entry["img_file"]:
-                    task = ImageDownloadTask(
-                        client=self.panda_app.tls_client,
-                        img_filename=entry["img_file"],
-                        item_widget=widget,
-                        temp_dir=temp_dir
-                    )
-                    QThreadPool.globalInstance().start(task)
+                    if entry["is_local"]:
+                        # Для локальных файлов пытаемся загрузить изображение напрямую
+                        img_local_path = os.path.join(height_folder, entry["img_file"])
+                        if os.path.exists(img_local_path):
+                            pixmap = QPixmap(img_local_path)
+                            widget.set_icon_pixmap(pixmap)
+                        else:
+                            # Можно попробовать скачать с сервера, если картинка там же
+                            task = ImageDownloadTask(
+                                client=self.panda_app.tls_client,
+                                img_filename=entry["img_file"],
+                                item_widget=widget,
+                                temp_dir=temp_dir
+                            )
+                            QThreadPool.globalInstance().start(task)
+                    else:
+                        # Для серверных – асинхронная загрузка
+                        task = ImageDownloadTask(
+                            client=self.panda_app.tls_client,
+                            img_filename=entry["img_file"],
+                            item_widget=widget,
+                            temp_dir=temp_dir
+                        )
+                        QThreadPool.globalInstance().start(task)
 
         # ======================
         # КЛИК
@@ -748,26 +803,28 @@ class CameraControlGUI(QWidget):
             if not file_data:
                 return
 
-            # Создаём временную директорию для скачанных файлов
-            temp_dir = os.path.join(tempfile.gettempdir(), "vizutil_recon")
-            os.makedirs(temp_dir, exist_ok=True)
-
-            # Имя JSON файла на сервере (без пути)
-            server_json_name = file_data["name"]
-            local_json_path = os.path.join(temp_dir, server_json_name)
-
             # Показываем оверлей
-            self.show_overlay("🚀 Загрузка JSON с сервера...")
-            try:
-                # Скачиваем JSON
-                self.panda_app.tls_client.download_file(server_json_name, local_json_path)
-                self.log_message(f"✅ JSON загружен: {server_json_name}")
-            except Exception as e:
-                self.log_message(f"❌ Ошибка загрузки JSON: {e}")
-                self.hide_overlay_timer.start(2000)
-                return
+            self.show_overlay("🚀 Загрузка данных...")
 
-            # Читаем JSON, чтобы получить имя PLY файла
+            # Определяем путь к JSON (локальный или будем скачивать)
+            if file_data.get("is_local"):
+                local_json_path = file_data["path"]
+                self.log_message(f"📁 Используется локальный JSON: {local_json_path}")
+            else:
+                # Скачиваем с сервера
+                temp_dir = os.path.join(tempfile.gettempdir(), "vizutil_recon")
+                os.makedirs(temp_dir, exist_ok=True)
+                server_json_name = file_data["name"]
+                local_json_path = os.path.join(temp_dir, server_json_name)
+                try:
+                    self.panda_app.tls_client.download_file(server_json_name, local_json_path)
+                    self.log_message(f"✅ JSON загружен: {server_json_name}")
+                except Exception as e:
+                    self.log_message(f"❌ Ошибка загрузки JSON: {e}")
+                    self.hide_overlay_timer.start(2000)
+                    return
+
+            # Читаем JSON (локальный или скачанный)
             try:
                 with open(local_json_path, 'r', encoding='utf-8') as f:
                     json_data = json.load(f)
@@ -779,31 +836,58 @@ class CameraControlGUI(QWidget):
                         texture=filler,
                         car_number=car_number,
                         initial_volume=target_volume,
-                        time=time          # ← добавлено
+                        time=time
                     )
+
+                    # Установка набора текстур по filler (как и раньше)
+                    if filler:
+                        selected_texture_key = None
+                        selected_config = None
+                        for key, config in self.textures_config.items():
+                            if key == "default":
+                                continue
+                            if config.get("name") == filler:
+                                selected_texture_key = key
+                                selected_config = config
+                                break
+                        if selected_config:
+                            self.panda_app.set_texture_set(selected_config)
+                            self.textures_combo.setCurrentText(selected_texture_key)
+                            self.log_message(f"🎨 Установлен набор текстур: {selected_texture_key}")
+                        else:
+                            self.log_message(f"⚠️ Набор текстур для '{filler}' не найден, используется текущий")
             except Exception as e:
                 self.log_message(f"❌ Ошибка чтения JSON: {e}")
                 self.hide_overlay_timer.start(2000)
                 return
 
+            # Загрузка PLY-файла (если указан)
             ply_filename = json_data.get("ply_file")
             local_ply_path = None
             if ply_filename:
-                local_ply_path = os.path.join(temp_dir, ply_filename)
-                # Проверяем, не скачан ли уже PLY
-                if not os.path.exists(local_ply_path):
-                    self.log_message("📁 Загрузка PLY файла...")
-                    try:
-                        self.panda_app.tls_client.download_file(ply_filename, local_ply_path)
-                        self.log_message(f"✅ PLY загружен: {ply_filename}")
-                    except Exception as e:
-                        self.log_message(f"❌ Ошибка загрузки PLY: {e}")
-                        self.hide_overlay_timer.start(2000)
-                        return
+                # Для локальных файлов ищем PLY в той же папке, что и JSON
+                if file_data.get("is_local"):
+                    ply_dir = os.path.dirname(local_json_path)
+                    local_ply_path = os.path.join(ply_dir, ply_filename)
+                    if not os.path.exists(local_ply_path):
+                        self.log_message(f"⚠️ Локальный PLY не найден: {local_ply_path}")
+                        local_ply_path = None
                 else:
-                    self.log_message(f"📁 PLY уже загружен: {ply_filename}")
+                    temp_dir = os.path.dirname(local_json_path)
+                    local_ply_path = os.path.join(temp_dir, ply_filename)
+                    if not os.path.exists(local_ply_path):
+                        self.log_message("📁 Загрузка PLY файла...")
+                        try:
+                            self.panda_app.tls_client.download_file(ply_filename, local_ply_path)
+                            self.log_message(f"✅ PLY загружен: {ply_filename}")
+                        except Exception as e:
+                            self.log_message(f"❌ Ошибка загрузки PLY: {e}")
+                            self.hide_overlay_timer.start(2000)
+                            return
+                    else:
+                        self.log_message(f"📁 PLY уже загружен: {ply_filename}")
 
-            # Загружаем модель (набор) по имени из JSON
+            # Загружаем модель по имени из JSON
             model_name = file_data["model"]
             self.log_message(f"📁 Загружается модель: {model_name}")
             self.load_model_set(model_name)
@@ -815,23 +899,67 @@ class CameraControlGUI(QWidget):
                 self.hide_overlay_timer.start(2000)
                 return
 
-            # Запускаем реконструкцию в зависимости от типа
             if file_data["data_type"] == "height":
-                # TODO: аналогично для карт высот (нужно скачивать изображение)
-                self.log_message("❌ Реконструкция по карте высот пока не реализована")
-            else:
-                self.log_message("📊 Запуск реконструкции по облаку точек...")
+                # Получаем имя файла карты высот из JSON
+                heightmap_filename = json_data.get("heightmap_path", "")
+                if not heightmap_filename:
+                    self.log_message("❌ В JSON не указан путь к карте высот (heightmap_path)")
+                    self.hide_overlay_timer.start(2000)
+                    return
+
+                # Определяем локальный путь, где должна лежать карта высот
+                # Она должна находиться в той же папке, что и JSON (так ожидает MeshReconstruction.load_height_map)
+                target_dir = os.path.dirname(local_json_path)
+                local_heightmap_path = os.path.join(target_dir, heightmap_filename)
+
+                # Если файл ещё не существует – пытаемся его получить
+                if not os.path.exists(local_heightmap_path):
+                    if file_data.get("is_local"):
+                        # Локальный файл: ищем в исходной папке JSON
+                        src_dir = os.path.dirname(file_data["path"])
+                        src_heightmap = os.path.join(src_dir, heightmap_filename)
+                        if os.path.exists(src_heightmap):
+                            # Копируем или просто запоминаем путь (можно использовать исходный, но load_height_map ожидает рядом с JSON)
+                            # Проще скопировать, чтобы не менять логику загрузки
+                            import shutil
+                            shutil.copy2(src_heightmap, local_heightmap_path)
+                            self.log_message(f"📁 Карта высот скопирована из локальной папки: {heightmap_filename}")
+                        else:
+                            self.log_message(f"❌ Локальная карта высот не найдена: {src_heightmap}")
+                            self.hide_overlay_timer.start(2000)
+                            return
+                    else:
+                        # Серверный файл: скачиваем
+                        self.log_message(f"📁 Загрузка карты высот: {heightmap_filename}")
+                        try:
+                            self.panda_app.tls_client.download_file(heightmap_filename, local_heightmap_path)
+                            self.log_message(f"✅ Карта высот загружена: {heightmap_filename}")
+                        except Exception as e:
+                            self.log_message(f"❌ Ошибка загрузки карты высот: {e}")
+                            self.hide_overlay_timer.start(2000)
+                            return
+
+                # Всё готово, запускаем реконструкцию (ply_path не передаём)
+                self.log_message("📊 Запуск реконструкции по карте высот...")
                 try:
-                    # Передаём локальный путь к JSON и (если есть) путь к PLY
+                    recon_module.run_2d_to_3d_reconstruction_from(json_path=local_json_path)
+                    self.log_message("✅ Реконструкция по карте высот завершена")
+                except Exception as e:
+                    self.log_message(f"❌ Ошибка реконструкции: {e}")
+
+                self.hide_overlay_timer.start(2000)
+            else:
+                # Для PLY
+                self.log_message("📊 Запуск реконструкции по PLY...")
+                try:
                     recon_module.run_2d_to_3d_reconstruction_from(
                         json_path=local_json_path,
                         ply_path=local_ply_path
                     )
-                    self.log_message("✅ Реконструкция завершена")
+                    self.log_message("✅ Реконструкция по PLY завершена")
                 except Exception as e:
                     self.log_message(f"❌ Ошибка реконструкции: {e}")
-
-            self.hide_overlay_timer.start(2000)
+                self.hide_overlay_timer.start(2000)
 
 
         # ======================
@@ -847,9 +975,8 @@ class CameraControlGUI(QWidget):
         layout.addStretch()
 
     def on_particle_flag_changed(self, state):
-        """Обработчик изменения состояния чекбокса particle_flag."""
-        self.panda_app.particle_flag = (state == Qt.Checked)
-        self.set_status(f"Распределение частиц: {'включено' if self.panda_app.particle_flag else 'выключено'}")
+        self.panda_app.canDistributeMeshes = (state == Qt.Checked)
+        self.set_status(f"Распределение частиц: {'включено' if self.panda_app.canDistributeMeshes else 'выключено'}")
 
     def setup_scene_control_tab(self):
         layout = QVBoxLayout(self.scene_control_tab)

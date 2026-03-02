@@ -22,6 +22,32 @@ models_path_p3d = Filename.fromOsSpecific(os.path.join(base_path, "models")).get
 get_model_path().prepend_directory(models_path_p3d)
 # -------------------------------------------------------------
 
+def load_tls_config(base_path):
+    """Загружает активный TLS-сервер из tls_config.yaml"""
+    config_path = os.path.join(base_path, "tls_config.yaml")
+    default_host = "78.25.191.12"
+    default_port = 9999
+
+    if not os.path.exists(config_path):
+        print(f"TLS config file not found: {config_path}. Using default.")
+        return default_host, default_port
+
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        servers = config.get("servers", [])
+        for server in servers:
+            if server.get("active", False):
+                host = server.get("host", default_host)
+                port = server.get("port", default_port)
+                print(f"Using active TLS server: {host}:{port} ({server.get('name', 'unknown')})")
+                return host, port
+        print("No active server found in config. Using default.")
+        return default_host, default_port
+    except Exception as e:
+        print(f"Error reading TLS config: {e}. Using default.")
+        return default_host, default_port
+
 # Теперь можно импортировать остальные модули
 from gui import CameraControlGUI
 from panda_widget import Panda3DWidget
@@ -223,7 +249,7 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
 sys.excepthook = global_exception_handler
 
 class MyApp(ShowBase):
-    def __init__(self):
+    def __init__(self, tls_host="78.25.191.12", tls_port=9999):
         self.render_pipeline = RenderPipeline()
         self.render_pipeline.pre_showbase_init()
         
@@ -235,6 +261,8 @@ class MyApp(ShowBase):
         ShowBase.__init__(self)
 
         self.render_pipeline.create(self)
+
+        self.tls_client = TLS_client(host=tls_host, port=tls_port, timeout=300.0)
 
         self.current_texture_set = {
             'diffuse': "textures/stones_8k/rocks_ground_01_diff_8k.jpg",
@@ -344,7 +372,7 @@ class MyApp(ShowBase):
 
         self.mesh_distributions = []
 
-        self.tls_client = TLS_client(host='78.25.191.12', port=9999, timeout=300.0)
+        self.tls_client = TLS_client(host=tls_host, port=tls_port, timeout=300.0)
 
         self.perlin_generator = PerlinMeshGenerator(self, tls_client=self.tls_client)
         self.renderer_utils = RendererUtils(self)
@@ -920,7 +948,7 @@ class MyApp(ShowBase):
         
         node = GeomNode("trimesh_result")
         node.addGeom(geom)
-
+        print(self.particle_flag)
         if self.particle_flag == True:
             if(self.canDistributeMeshes):
                 self.distribute_meshes(node)
@@ -1688,6 +1716,8 @@ class MyApp(ShowBase):
         
 def main():
     app = CrashReportingApplication(sys.argv)
+
+    tls_host, tls_port = load_tls_config(base_path)
     
     main_window = QMainWindow()
     main_window.setWindowTitle('3D simulator')
@@ -1708,7 +1738,7 @@ def main():
     loadPrcFileData("", "fullscreen false")
     loadPrcFileData("", "window-type offscreen")
     
-    panda_app = MyApp()
+    panda_app = MyApp(tls_host=tls_host, tls_port=tls_port)
     
     control_panel = CameraControlGUI(panda_app, main_window=main_window)
     panda_app.gui = control_panel
@@ -1725,7 +1755,7 @@ def main():
     
     def update_panda():
         panda_app.taskMgr.step()
-    
+
     timer = QTimer()
     timer.timeout.connect(update_panda)
     timer.start(16)

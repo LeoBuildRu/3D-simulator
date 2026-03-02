@@ -17,6 +17,7 @@ include_files = [
     ("textures", "textures"),
     ("PLY_examples", "PLY_examples"),
     ("height_examples", "height_examples"),
+    ("fonts", "fonts"),
 
     ("models_config.yaml", "models_config.yaml"),
     ("textures_config.yaml", "textures_config.yaml"),

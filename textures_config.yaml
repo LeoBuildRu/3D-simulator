@@ -1,4 +1,5 @@
 asphalt_8k:
+  name: "asphalt"
   diffuse: "textures/asphalt_8k/worn_asphalt_diff_8k.jpg"
   displacement: "textures/asphalt_8k/worn_asphalt_disp_8k.jpg"
   normal: "textures/asphalt_8k/worn_asphalt_nor_dx_8k.jpg"
@@ -19,6 +20,7 @@ asphalt_8k:
     seed: 234
 
 concrete_8k:
+  name: "concrete"
   diffuse: "textures/concrete_8k/concrete_debris_diff_8k.jpg"
   displacement: "textures/concrete_8k/concrete_debris_disp_8k.jpg"
   normal: "textures/concrete_8k/concrete_debris_nor_dx_8k.jpg"
@@ -39,6 +41,7 @@ concrete_8k:
     seed: 234
 
 ground_8k:
+  name: "ground"
   diffuse: "textures/ground_8k/brown_mud_dry_diff_8k.jpg"
   displacement: "textures/ground_8k/brown_mud_dry_disp_8k.jpg"
   normal: "textures/ground_8k/brown_mud_dry_nor_dx_8k.jpg"
@@ -64,6 +67,7 @@ ground_8k:
     seed: 345
 
 sand_8k:
+  name: "sand"
   albedo: "textures/sand_8k/dune_albedo.jpg"
   height: "textures/sand_8k/dune_height.jpg"
   normal: "textures/sand_8k/dune_normal.jpg"
@@ -88,6 +92,7 @@ sand_8k:
     seed: 234
 
 stones_8k:
+  name: "stones"
   diffuse: "textures/stones_8k/rocks_ground_01_diff_4k.jpg"
   displacement: "textures/stones_8k/rocks_ground_01_disp_4k.jpg"
   normal: "textures/stones_8k/rocks_ground_01_nor_dx_4k.jpg"
