@@ -28,7 +28,7 @@ class MeshReconstruction:
 
         # for testing only
         self.alpha_threshold = 0.5
-        self.vertical_offset = -0.15
+        self.vertical_offset = -0.1
 
         self.adaptive_lift_enabled = True
         self.lift_intensity = 0.0
