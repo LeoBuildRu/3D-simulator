@@ -186,7 +186,7 @@ class MeshReconstruction:
     
 
     def correct_depth(self, depth):
-        return depth
+        #return depth
         return 1 / depth
         return math.sqrt(depth) 
 
@@ -424,11 +424,11 @@ class MeshReconstruction:
 
         # 99-55 для стационарного решения
         # 0-41 для блендера
-        fov_known = True
+        fov_known = False
         known_fov_x = 99
         known_fov_y = 55
 
-        self.matching_points = 4
+        self.matching_points = 3
 
         min_fov = 15
         max_fov = 130
@@ -532,11 +532,14 @@ class MeshReconstruction:
         fov = bestFOV
         self.fov_y = fov
 
-        if(known_fov_x != 0):
-            lens.setFov(known_fov_x, known_fov_y)
-            self.fov_y = known_fov_y
+        if(fov_known):
+            if(known_fov_x != 0):
+                lens.setFov(known_fov_x, known_fov_y)
+                self.fov_y = known_fov_y
+            else:
+                self.setVertFOV(lens, known_fov_y)
         else:
-            self.setVertFOV(lens, known_fov_y)
+            self.setVertFOV(lens, fov)
     
         print(f"camera keypoints final error: {bestError} FOV: {self.fov_y} minDepth: {bestMinDepth} maxDepth: {bestMaxDepth}")
         

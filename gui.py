@@ -12,6 +12,7 @@ import trimesh
 import json 
 import tempfile
 from datetime import datetime
+import traceback
 
 from panda3d.core import (
     Geom, GeomNode, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
@@ -945,7 +946,9 @@ class CameraControlGUI(QWidget):
                     recon_module.run_2d_to_3d_reconstruction_from(json_path=local_json_path)
                     self.log_message("✅ Реконструкция по карте высот завершена")
                 except Exception as e:
+                    traceback.print_exc()
                     self.log_message(f"❌ Ошибка реконструкции: {e}")
+                    
 
                 self.hide_overlay_timer.start(2000)
             else:
@@ -959,6 +962,7 @@ class CameraControlGUI(QWidget):
                     self.log_message("✅ Реконструкция по PLY завершена")
                 except Exception as e:
                     self.log_message(f"❌ Ошибка реконструкции: {e}")
+                    traceback.print_exc()
                 self.hide_overlay_timer.start(2000)
 
 
