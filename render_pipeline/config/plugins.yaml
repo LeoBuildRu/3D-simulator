@@ -77,11 +77,11 @@ overrides:
         chromatic_aberration_strength: 0.1512
         chromatic_aberration_samples: 2
         manual_camera_parameters: False
-        min_exposure_value: 0.01
+        min_exposure_value: 0.001
         max_exposure_value: 1.0
-        exposure_scale: 1.0
-        brightness_adaption_rate: 3.6
-        darkness_adaption_rate: 0.7
+        exposure_scale: 0.8
+        brightness_adaption_rate: 5.0
+        darkness_adaption_rate: 1.0
         use_sharpen: True
         sharpen_strength: 0.5
         sharpen_twice: False
@@ -120,23 +120,23 @@ overrides:
         logarithmic_factor: 3.0
         sun_distance: 100.0
         split_count: 4
-        resolution: 1024
-        border_bias: 0.058
+        resolution: 4096
+        border_bias: 0.0
         use_pcf: True
         filter_sequence: halton_2D_32
         filter_radius: 0.7
         fixed_bias: 0.11429
         slope_bias: 0.0
-        normal_bias: 0.67
+        normal_bias: 0.0
         use_pcss: False
         pcss_sequence: halton_2D_16
         pcss_penumbra_size: 2.38
         pcss_min_penumbra_size: 7.0
         use_distant_shadows: True
-        dist_shadow_resolution: 4096
+        dist_shadow_resolution: 8192
         dist_shadow_clipsize: 400.0
         dist_shadow_sundist: 300.0
-        scene_shadow_resolution: 512
+        scene_shadow_resolution: 4096
         scene_shadow_sundist: 300.0
 
     scattering:

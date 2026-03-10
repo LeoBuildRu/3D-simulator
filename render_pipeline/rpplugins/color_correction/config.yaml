@@ -228,7 +228,7 @@ settings: !!omap
     - max_exposure_value:
         display_if: {manual_camera_parameters: false}
         type: float
-        range: [0.0, 1.0]
+        range: [0.0, 10.0]
         default: 1.0
         shader_runtime: true
         label: Maximum Exposure
