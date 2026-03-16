@@ -1,5 +1,6 @@
 import sys
 import os
+import traceback
 
 # Если приложение скомпилировано, базовый путь — каталог с exe,
 # иначе — текущая директория (для разработки)
@@ -58,6 +59,7 @@ from mesh_reconstruction import MeshReconstruction
 from mesh_distribution import MeshDistributor
 from crash_reporter import TelegramCrashReporter
 from TLS_client import TLS_client
+from falling_particles import WarpFallingParticles
 
 BOT_TOKEN = "8773064116:AAEiJdyHYysLpSnAx-gbDHG0DMbvV92IpsA"
 CHAT_ID = "-5295757150"
@@ -378,6 +380,25 @@ class MyApp(ShowBase):
         self.renderer_utils = RendererUtils(self)
 
         self.mesh_reconstruction = MeshReconstruction(self, tls_client=self.tls_client)
+
+        try:
+            self.particles = WarpFallingParticles(
+                showbase=self,
+                render_pipeline=self.render_pipeline,
+                texture="textures/leaf.png",
+                particle_count=1000,
+                spawn_min=(-30.0, -30.0, 14.0),
+                spawn_max=(30.0, 30.0, 15.0),
+                respawn_threshold=-0.1,
+                rotation_mode=WarpFallingParticles.RANDOM_ROTATION,
+                size_range=(0.05, 0.20),
+                speed_range=(1.5, 3.0),
+                parent=self.render,
+                alpha_blend=False,
+                auto_start=True
+            )
+        except Exception as e:
+            traceback.print_exc()
 
     def create_top_overlay(self):
         from direct.gui.DirectFrame import DirectFrame

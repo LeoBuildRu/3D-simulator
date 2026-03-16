@@ -1,0 +1,27 @@
+vertex:
+    inout: |
+        uniform samplerBuffer InstancingData;
+
+    transform: |
+        int data_index = gl_InstanceID * 4;
+
+        vec4 data_0 = texelFetch(InstancingData, data_index);
+        vec4 data_1 = texelFetch(InstancingData, data_index + 1);
+        vec4 data_2 = texelFetch(InstancingData, data_index + 2);
+        vec4 data_3 = texelFetch(InstancingData, data_index + 3);
+
+        mat4 transform_mat = mat4(data_0, data_1, data_2, data_3);
+
+        vOutput.position = (transform_mat * p3d_Vertex).xyz;
+        vOutput.normal = normalize(mat3(transform_mat) * vOutput.normal);
+
+fragment:
+    material: |
+        #if IN_FORWARD_SHADER
+            vec4 particle_tex = texture(p3d_Texture0, texcoord);
+            if (particle_tex.a <= 0.001) {
+                discard;
+            }
+            color_result = vec4(mInput.color * particle_tex.rgb, particle_tex.a);
+            return;
+        #endif

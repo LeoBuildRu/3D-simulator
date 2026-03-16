@@ -8,7 +8,6 @@ enabled:
     - bloom
     - clouds
     - color_correction
-    - dof
     - env_probes
     - forward_shading
     - fxaa
@@ -19,7 +18,8 @@ enabled:
     - sky_ao
     - smaa
     - ssr
-    - volumetrics
+    # - dof
+    # - volumetrics
     # - vxgi
 
 
@@ -79,7 +79,7 @@ overrides:
         manual_camera_parameters: False
         min_exposure_value: 0.001
         max_exposure_value: 1.0
-        exposure_scale: 0.8
+        exposure_scale: 0.92
         brightness_adaption_rate: 5.0
         darkness_adaption_rate: 1.0
         use_sharpen: True
@@ -147,7 +147,7 @@ overrides:
         mie_height_scale: 1.3
         mie_phase_factor: 0.3
         beta_mie_scattering: 4.0
-        enable_godrays: False
+        enable_godrays: True
         atmosphere_start: 549.61
 
     skin_shading:
