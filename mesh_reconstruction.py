@@ -339,12 +339,8 @@ class MeshReconstruction:
                 keypoints_3d[inds[i] - 1][1] += self.vertical_offset
 
             def ApplyScale(scale):
-                #camera.set_pos(self.np_to_panda_point(cam_pos))
-                #camera.set_quat(quat)
-
                 transformed_keypoints = keypoints_3d.copy()
                 for i in range(len(keypoints_3d)):
-                    #transformed_keypoints[i] = self.panda_app.render.get_relative_point(camera, keypoints_3d[i] * scale)
                     transformed_keypoints[i] = keypoints_3d[i] * scale
 
                 M = self.compute_transform_np(
@@ -358,16 +354,6 @@ class MeshReconstruction:
                 for i in range(len(transformed_keypoints)):
                     op = self.trs_matrix @ np.append(transformed_keypoints[i], 1.0)
                     sp = np.append(scene_3d[i], 1.0)
-                    diff = self.np_to_panda_point(op - sp)
-                    error += math.sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z)
-                return error
-
-                #self.apply_transform(M, camera)
-
-                error = 0
-                for i in range(len(transformed_keypoints)):
-                    op = self.panda_app.render.get_relative_point(camera, keypoints_3d[i] * scale)
-                    sp = scene_3d[i]
                     diff = self.np_to_panda_point(op - sp)
                     error += math.sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z)
                 return error
