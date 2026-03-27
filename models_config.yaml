@@ -1,18 +1,21 @@
-FAW:
+FAW8x4:
+  model: "FAW J6 8x4"
   cuzov: "models/FAW-Cuzov.bam"
   napolnitel: "models/FAW-Napolnitel.bam"
   other: "models/FAW-Other.bam"
-  max_volume: 25
+  max_volume: 33
   ground_plane: 2.0
 
-FAW3x3:
+FAW6x4:
+  model: "FAW J6 6x4"
   cuzov: "models/FAW3x3-Cuzov.bam"
   napolnitel: "models/FAW3x3-Napolnitel.bam"
   other: "models/FAW3x3-Other.bam"
-  max_volume: 19
+  max_volume: 21
   ground_plane: 2.0
 
 Scania:
+  model: "Scania"
   cuzov: "models/Scania-Cuzov.bam"
   napolnitel: "models/Scania-Napolnitel.bam"
   other: "models/Scania-Other.bam"
@@ -20,6 +23,7 @@ Scania:
   ground_plane: 2.6
 
 Kerax:
+  model: "Kerax"
   cuzov: "models/Kerax-Cuzov.bam"
   napolnitel: "models/Kerax-Napolnitel.bam"
   other: "models/Kerax-Other.bam"
@@ -27,6 +31,7 @@ Kerax:
   ground_plane: 2.0
 
 Kamaz:
+  model: "Kamaz"
   cuzov: "models/Kamaz-Cuzov.bam"
   napolnitel: "models/Kamaz-Napolnitel.bam"
   other: "models/Kamaz-Other.bam"
@@ -34,6 +39,7 @@ Kamaz:
   ground_plane: 2.25
 
 HooperType1:
+  model: "HooperType1"
   cuzov: "models/Hooper1-Cuzov.bam"
   napolnitel: "models/Hooper1-Napolnitel.bam"
   other: "models/Hooper1-Other.bam"
@@ -41,6 +47,7 @@ HooperType1:
   ground_plane: 2.5
 
 HooperType2:
+  model: "HooperType2"
   cuzov: "models/Hooper2-Cuzov.bam"
   napolnitel: "models/Hooper2-Napolnitel.bam"
   other: "models/Hooper2-Other.bam"

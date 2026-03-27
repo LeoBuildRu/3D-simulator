@@ -38,14 +38,14 @@ class MeshReconstruction:
         self.smoothing_iterations = -28
 
         # радиус поиска точек в облаке (для сглаживания)
-        self.search_radius = 0.1
+        self.search_radius = 1.5
 
         # Параметры экстраполяции
         self.extrapolation_enabled = False
         self.target_width = 4.0  # Ширина целевой области в метрах
         self.target_height = 8.0  # Высота целевой области в метрах
-        self.grid_resolution = 256  # Разрешение сетки экстраполяции
-        self.grid_resolution_main = 512  # Разрешение основной сетки
+        self.grid_resolution = 128  # Разрешение сетки экстраполяции
+        self.grid_resolution_main = 256  # Разрешение основной сетки
         
         # Параметры шума Перлина
         self.noise_scale = 0.5
@@ -995,25 +995,33 @@ class MeshReconstruction:
         source_points = np.array(self.trs_points, dtype=np.float32)  # (N, 3)
         print(f"[DEBUG] Загружено {len(source_points)} точек из self.trs_points")
 
+        source_mask = self.last_target_model_trimesh.contains(source_points)
+        source_points = source_points[source_mask]
+
         # ------------------------------------------------------------
         # 2. Границы облака и параметры плоской сетки
         # ------------------------------------------------------------
         min_x, min_y = np.min(source_points[:, :2], axis=0)
         max_x, max_y = np.max(source_points[:, :2], axis=0)
 
+        overrideTargetSize = True
+
         # Размеры целевой области (можно переопределить через атрибуты)
-        if hasattr(self, 'target_width') and self.target_width > 0:
+        if hasattr(self, 'target_width') and self.target_width > 0 and not overrideTargetSize:
             target_width = self.target_width
         else:
-            target_width = max(max_x - min_x, 1.0) * 1.05   # запас 20%
+            target_width = max(max_x - min_x, 1.0) * 1.1   # запас
 
-        if hasattr(self, 'target_height') and self.target_height > 0:
+        if hasattr(self, 'target_height') and self.target_height > 0 and not overrideTargetSize:
             target_height = self.target_height
         else:
-            target_height = max(max_y - min_y, 1.0) * 1.05
-
+            target_height = max(max_y - min_y, 1.0) * 1.1
+        
         # Разрешение сетки
         grid_res = getattr(self, 'grid_resolution', size)
+
+        print("размеры сетки восстановления: ", target_width, target_height)
+        print("разрешение сетки восстановления: ", grid_res)
 
         # Центр плоской сетки – центр ограничивающего прямоугольника, Z = 0
         plane_center = np.array([0, 0, 0.0])
@@ -1022,6 +1030,8 @@ class MeshReconstruction:
         x_vals = np.linspace(-target_width / 2, target_width / 2, grid_res)
         y_vals = np.linspace(-target_height / 2, target_height / 2, grid_res)
 
+        step = (max(target_height, target_width) / grid_res) * self.search_radius
+
         print(f"[DEBUG] Плоская сетка: {grid_res}x{grid_res}, размер {target_width:.2f} x {target_height:.2f} м")
         print(f"[DEBUG] Центр плоскости: {plane_center[0]:.2f}, {plane_center[1]:.2f}, 0")
 
@@ -1029,10 +1039,6 @@ class MeshReconstruction:
         # 3. KD-дерево для исходных точек (2D проекции)
         # ------------------------------------------------------------
         self.log("🌲 Построение KD-дерева...")  # <-- ДОБАВЛЕНО
-
-        source_mask = self.last_target_model_trimesh.contains(source_points)
-
-        source_points = source_points[source_mask]
 
         source_xy = source_points[:, :2]
         source_z = source_points[:, 2]
@@ -1061,10 +1067,13 @@ class MeshReconstruction:
                 query_point = [global_x, global_y]
 
                 # --- 1. Поиск точек в радиусе ---
-                idxs = source_tree.query_ball_point(query_point, r=self.search_radius)
+                idxs = []
 
-                if len(idxs) == 0:
-                    continue
+                i = step
+
+                while len(idxs) == 0:
+                    idxs = source_tree.query_ball_point(query_point, r=i)
+                    i+=step
 
                 sampled_xy = source_xy[idxs]
                 sampled_z = source_z[idxs]
@@ -1659,73 +1668,118 @@ class MeshReconstruction:
         return new_mesh_np
     
     def _apply_textures_and_material(self, model_np):
-        """Применяет текстуры и материал к модели"""
-        self.log("🎨 Применение текстур...")  # <-- ДОБАВЛЕНО
-        if 'diffuse' in self.panda_app.current_texture_set:
-            diffuse_path = self.panda_app.current_texture_set['diffuse']
-        elif 'albedo' in self.panda_app.current_texture_set:
-            diffuse_path = self.panda_app.current_texture_set['albedo']
-        else:
-            diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        
-        normal_path = self.panda_app.current_texture_set.get('normal', 
-            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg")
-        
-        roughness_path = self.panda_app.current_texture_set.get('roughness', None)
-        
+        """Apply PBR textures correctly for tobspr RenderPipeline"""
+
+        import os
+        from panda3d.core import Texture, TextureStage, Material
+
+        texset = self.panda_app.current_texture_set
+
+        # ------------------------------------------------------------------
+        # Resolve paths
+        # ------------------------------------------------------------------
+        diffuse_path = (
+            texset.get("diffuse")
+            or texset.get("albedo")
+            or "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
+        )
+
+        normal_path = texset.get(
+            "normal",
+            "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
+        )
+
+        roughness_path = texset.get("roughness")
+        metallic_path  = texset.get("metallic")   # optional
+
         if not os.path.exists(diffuse_path):
             diffuse_path = "textures/stones_8k/rocks_ground_01_diff_8k.jpg"
-        
+
         if not os.path.exists(normal_path):
             normal_path = "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
-        
+
+        # ------------------------------------------------------------------
+        # Create RP-compatible material
+        # ------------------------------------------------------------------
+        mat = Material()
+
+        # MUST be white for PBR
+        mat.set_base_color((1, 1, 1, 1))
+
+        # enable normal map strength (RP trick)
+        mat.set_emission((0, 1, 0, 0))
+
+        model_np.set_material(mat)
+
+        # ------------------------------------------------------------------
+        # Helper to configure textures
+        # ------------------------------------------------------------------
+        def setup_tex(tex, srgb=False):
+            if srgb:
+                tex.set_format(Texture.F_srgb)
+
+            tex.set_minfilter(Texture.FTLinearMipmapLinear)
+            tex.set_magfilter(Texture.FTLinear)
+            tex.set_wrap_u(Texture.WMRepeat)
+            tex.set_wrap_v(Texture.WMRepeat)
+
+        # ------------------------------------------------------------------
+        # Texture stages (STRICT ORDER)
+        # ------------------------------------------------------------------
+        ts_color = TextureStage("0-color")
+        ts_color.set_sort(0)
+        ts_color.set_priority(0)
+
+        ts_normal = TextureStage("1-normal")
+        ts_normal.set_sort(1)
+        ts_normal.set_priority(1)
+
+        ts_metal = TextureStage("2-metallic")
+        ts_metal.set_sort(2)
+        ts_metal.set_priority(2)
+
+        ts_rough = TextureStage("3-roughness")
+        ts_rough.set_sort(3)
+        ts_rough.set_priority(3)
+
+        # ------------------------------------------------------------------
+        # Load + assign textures
+        # ------------------------------------------------------------------
+
+        # Albedo
         diffuse_tex = self.panda_app.loader.loadTexture(diffuse_path)
-        if diffuse_tex:
-            diffuse_tex.set_format(Texture.F_srgb)
-            diffuse_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-            diffuse_tex.setMagfilter(Texture.FTLinear)
-            diffuse_tex.setWrapU(Texture.WMRepeat)
-            diffuse_tex.setWrapV(Texture.WMRepeat)
-            model_np.setTexture(diffuse_tex, 1)
-        
+        setup_tex(diffuse_tex, srgb=True)
+        model_np.set_texture(ts_color, diffuse_tex)
+
+        # Normal
         normal_tex = self.panda_app.loader.loadTexture(normal_path)
-        if normal_tex:
-            normal_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-            normal_tex.setMagfilter(Texture.FTLinear)
-            normal_tex.setWrapU(Texture.WMRepeat)
-            normal_tex.setWrapV(Texture.WMRepeat)
-            
-            normal_stage = TextureStage('normal')
-            normal_stage.setMode(TextureStage.MNormal)
-            model_np.setTexture(normal_stage, normal_tex)
-        
+        setup_tex(normal_tex)
+        model_np.set_texture(ts_normal, normal_tex)
+
+        # Metallic (REQUIRED SLOT even if dummy)
+        if metallic_path and os.path.exists(metallic_path):
+            metal_tex = self.panda_app.loader.loadTexture(metallic_path)
+        else:
+            # dummy white metallic map
+            metal_tex = Texture("dummy_metal")
+            metal_tex.setup2dTexture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+            metal_tex.setRamImage(b"\x00")
+
+        setup_tex(metal_tex)
+        model_np.set_texture(ts_metal, metal_tex)
+
+
+        # Roughness
         if roughness_path and os.path.exists(roughness_path):
-            roughness_tex = self.panda_app.loader.loadTexture(roughness_path)
-            if roughness_tex:
-                roughness_tex.setMinfilter(Texture.FTLinearMipmapLinear)
-                roughness_tex.setMagfilter(Texture.FTLinear)
-                roughness_tex.setWrapU(Texture.WMRepeat)
-                roughness_tex.setWrapV(Texture.WMRepeat)
-                
-                roughness_stage = TextureStage('roughness')
-                roughness_stage.setMode(TextureStage.MModulate)
-                model_np.setTexture(roughness_stage, roughness_tex)
-        
-        base_material = Material("perlin_base_material_with_displacement")
-        # base_material.setDiffuse((0.4, 0.4, 0.4, 1.0))
-        # base_material.setAmbient((0.7, 0.7, 0.7, 1.0))
-        # base_material.setSpecular((0.1, 0.1, 0.1, 1.0))
-        # base_material.setShininess(5.0)
-        # base_material.setRoughness(0.85)
-        # base_material.setMetallic(0.0)
-        # base_material.setRefractiveIndex(1.5)
-        model_np.setMaterial(base_material, 1)
-        
-        model_np.setShaderAuto()
-        model_np.setTwoSided(True)
-        model_np.setBin("fixed", 0)
-        model_np.setDepthOffset(1)
-        self.log("✅ Текстуры применены")  # <-- ДОБАВЛЕНО
+            rough_tex = self.panda_app.loader.loadTexture(roughness_path)
+            setup_tex(rough_tex)
+            model_np.set_texture(ts_rough, rough_tex)
+
+        # ------------------------------------------------------------------
+        # RP required flags
+        # ------------------------------------------------------------------
+        model_np.set_shader_auto()
+        model_np.set_two_sided(True)
 
     def _prepare_target_model_for_boolean(self, target_model):
         """Подготавливает целевую модель для boolean операций"""

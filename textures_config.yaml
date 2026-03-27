@@ -66,6 +66,33 @@ ground_8k:
     size_var: 0.02
     seed: 345
 
+groundV2_4k:
+  name: "ground V2"
+  diffuse: "textures/groundV2_4k/Ground_basecolor.jpg"
+  displacement: "textures/groundV2_4k/Ground_height.jpg"
+  normal: "textures/groundV2_4k/Ground_normal.jpg"
+  roughness: "textures/groundV2_4k/Ground_roughness.jpg"
+  textureRepeatX: 0.7
+  textureRepeatY: 1.8
+  strength: 1.0
+  mesh_distributions:
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 5000
+    size: 0.02
+    size_var: 0.02
+    seed: 123
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 50
+    size: 0.05
+    size_var: 0.03
+    seed: 234
+  - mesh: "models/distribution_meshes/rock_lp3.gltf"
+    count: 50
+    size: 0.03
+    size_var: 0.02
+    seed: 345
+
+
 sand_8k:
   name: "sand"
   albedo: "textures/sand_8k/dune_albedo.jpg"
@@ -141,4 +168,4 @@ Rock_texture_1:
     size_var: 0.03
     seed: 234
 
-default: "stones_8k"
+default: "groundV2_4k"
