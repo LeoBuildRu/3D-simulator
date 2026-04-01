@@ -53,3 +53,35 @@ HooperType2:
   other: "models/Hooper2-Other.bam"
   max_volume: 88
   ground_plane: 2.8
+
+Shackman-X3000-6x4-standard:
+  model: "Shackman-X3000-6x4-standard"
+  cuzov: "models/Shackman-X3000-6x4-standard-Cuzov.bam"
+  napolnitel: "models/Shackman-X3000-6x4-standard-Napolnitel.bam"
+  other: "models/Shackman-X3000-6x4-standard-Other.bam"
+  max_volume: 19.32
+  ground_plane: 2.6
+
+Shackman-X3000-8x4-standard:
+  model: "Shackman-X3000-8x4-standard"
+  cuzov: "models/Shackman-X3000-8x4-standard-Cuzov.bam"
+  napolnitel: "models/Shackman-X3000-8x4-standard-Napolnitel.bam"
+  other: "models/Shackman-X3000-8x4-standard-Other.bam"
+  max_volume: 26
+  ground_plane: 2.6
+
+Shackman-X3000-6x4-tall:
+  model: "Shackman-X3000-6x4-tall"
+  cuzov: "models/Shackman-X3000-6x4-tall-Cuzov.bam"
+  napolnitel: "models/Shackman-X3000-6x4-tall-Napolnitel.bam"
+  other: "models/Shackman-X3000-6x4-tall-Other.bam"
+  max_volume: 25
+  ground_plane: 2.6
+
+Shackman-X3000-8x4-tall:
+  model: "Shackman-X3000-8x4-tall"
+  cuzov: "models/Shackman-X3000-8x4-tall-Cuzov.bam"
+  napolnitel: "models/Shackman-X3000-8x4-tall-Napolnitel.bam"
+  other: "models/Shackman-X3000-8x4-tall-Other.bam"
+  max_volume: 34
+  ground_plane: 2.6
