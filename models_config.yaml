@@ -85,3 +85,35 @@ Shackman-X3000-8x4-tall:
   other: "models/Shackman-X3000-8x4-tall-Other.bam"
   max_volume: 34
   ground_plane: 2.6
+
+FAW-J6-6x4-standard:
+  model: "FAW-J6-6x4-standard"
+  cuzov: "models/FAW-J6-6x4-standard-Cuzov.bam"
+  napolnitel: "models/FAW-J6-6x4-standard-Napolnitel.bam"
+  other: "models/FAW-J6-6x4-standard-Other.bam"
+  max_volume: 20
+  ground_plane: 2.6
+
+FAW-J6-8x4-standard:
+  model: "FAW-J6-8x4-standard"
+  cuzov: "models/FAW-J6-8x4-standard-Cuzov.bam"
+  napolnitel: "models/FAW-J6-8x4-standard-Napolnitel.bam"
+  other: "models/FAW-J6-8x4-standard-Other.bam"
+  max_volume: 26
+  ground_plane: 2.6
+
+FAW-J6-6x4-tall:
+  model: "FAW-J6-6x4-tall"
+  cuzov: "models/FAW-J6-6x4-tall-Cuzov.bam"
+  napolnitel: "models/FAW-J6-6x4-tall-Napolnitel.bam"
+  other: "models/FAW-J6-6x4-tall-Other.bam"
+  max_volume: 25
+  ground_plane: 2.6
+
+FAW-J6-8x4-tall:
+  model: "FAW-J6-8x4-tall"
+  cuzov: "models/FAW-J6-8x4-tall-Cuzov.bam"
+  napolnitel: "models/FAW-J6-8x4-tall-Napolnitel.bam"
+  other: "models/FAW-J6-8x4-tall-Other.bam"
+  max_volume: 34
+  ground_plane: 2.6
