@@ -27,7 +27,7 @@ def load_tls_config(base_path):
     """Загружает активный TLS-сервер из tls_config.yaml"""
     config_path = os.path.join(base_path, "tls_config.yaml")
     default_host = "78.25.191.12"
-    default_port = 9999
+    default_port = 9998
 
     if not os.path.exists(config_path):
         print(f"TLS config file not found: {config_path}. Using default.")
@@ -251,7 +251,7 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
 sys.excepthook = global_exception_handler
 
 class MyApp(ShowBase):
-    def __init__(self, tls_host="78.25.191.12", tls_port=9999):
+    def __init__(self, tls_host="78.25.191.12", tls_port=9998):
         self.render_pipeline = RenderPipeline()
         self.render_pipeline.pre_showbase_init()
         

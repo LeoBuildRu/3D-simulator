@@ -35,7 +35,7 @@ NOISE_AVAILABLE = True
 class PerlinMeshGenerator:
     """Класс для генерации перлин-мешей и связанных операций"""
     
-    def __init__(self, panda_app, tls_client=None, server_host='78.25.191.12', server_port=9999):
+    def __init__(self, panda_app, tls_client=None, server_host='78.25.191.12', server_port=9998):
         self.panda_app = panda_app
         self.last_target_model_trimesh = None
         self.last_best_z = None

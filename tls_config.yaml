@@ -1,9 +1,9 @@
 servers:
   - name: Локальный сервер
     host: 192.168.123.53
-    port: 9999
+    port: 9998
     active: false
   - name: Удалённый сервер
     host: 78.25.191.12
-    port: 9999
+    port: 9998
     active: true
