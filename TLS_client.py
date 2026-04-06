@@ -3,7 +3,7 @@ import urllib.parse
 import numpy as np
 import base64
 import json
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional, Union, List
 
 class TLS_client:
     """
@@ -11,11 +11,6 @@ class TLS_client:
     """
 
     def __init__(self, host='192.168.123.53', port=9999, timeout=300.0):
-        """
-        :param host: IP-адрес сервера
-        :param port: порт сервера
-        :param timeout: таймаут на весь запрос (в секундах)
-        """
         self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
 
@@ -37,7 +32,6 @@ class TLS_client:
                 msg = str(e)
             raise RuntimeError(f"Сервер вернул ошибку: {msg}")
         except requests.exceptions.JSONDecodeError as e:
-            # Ответ получен, но не является валидным JSON
             preview = resp.text[:500] + "..." if len(resp.text) > 500 else resp.text
             raise RuntimeError(
                 f"Сервер вернул невалидный JSON: {e}\n"
@@ -46,12 +40,28 @@ class TLS_client:
         except Exception as e:
             raise RuntimeError(f"Неизвестная ошибка при запросе: {e}")
 
+    def _get(self, endpoint: str, params: dict = None) -> requests.Response:
+        url = f"{self.base_url}/{endpoint}"
+        try:
+            resp = requests.get(url, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout:
+            raise RuntimeError(f"Таймаут при обращении к серверу ({self.timeout} сек)")
+        except requests.exceptions.ConnectionError as e:
+            raise RuntimeError(f"Ошибка подключения к серверу {url}: {e}")
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(f"Сервер вернул ошибку: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Неизвестная ошибка при запросе: {e}")
+
+    # ====================== СУЩЕСТВУЮЩИЕ МЕТОДЫ ======================
     def get_verified_models(self) -> list:
-        response = self._post("get_verified_models", {})  # POST с пустым payload
+        response = self._post("get_verified_models", {})
         if response.get("status") != "success":
             raise RuntimeError(f"Ошибка сервера: {response.get('error', 'Неизвестная ошибка')}")
         return response.get("files", [])
-    
+
     def download_file(self, filename: str, local_path: str) -> None:
         url = f"{self.base_url}/download?file={urllib.parse.quote(filename)}"
         try:
@@ -81,18 +91,11 @@ class TLS_client:
                             height_array: np.ndarray,
                             vertices_before: list,
                             texcoords_before: list) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """
-        Запрос на генерацию перлин-меша.
-        Возвращает кортеж (vertices, normals, texcoords) как numpy массивы.
-        """
-        # Преобразуем height_array в base64
         tex_height, tex_width = height_array.shape
         height_normalized = (height_array * 255).astype(np.uint8)
         height_map_b64 = base64.b64encode(height_normalized.tobytes()).decode('ascii')
-
-        # Формируем payload
         payload = {
-            "type": "generate_perlin_mesh",  # сервер ожидает это поле (можно не отправлять, если endpoint отдельный, но оставим для совместимости)
+            "type": "generate_perlin_mesh",
             "grid_size": grid_size,
             "size_x": float(size_x),
             "size_y": float(size_y),
@@ -109,28 +112,22 @@ class TLS_client:
             "tex_width": tex_width,
             "tex_height": tex_height,
             "height_map": height_map_b64,
-            # vertices_before и texcoords_before игнорируются сервером, но оставляем для совместимости API
         }
-
         response = self._post("generate_perlin_mesh", payload)
-
         if response.get("status") != "success":
             raise RuntimeError(f"Ошибка сервера: {response.get('error', 'Неизвестная ошибка')}")
-
         result = response.get("result", {})
         if isinstance(result, str):
             try:
                 result = json.loads(result)
             except json.JSONDecodeError:
                 raise RuntimeError("Ошибка парсинга result")
-
         try:
             vertices = np.array(result["vertices"], dtype=np.float32).reshape(-1, 3)
             normals = np.array(result["normals"], dtype=np.float32).reshape(-1, 3)
             texcoords = np.array(result["texcoords"], dtype=np.float32).reshape(-1, 2)
         except (KeyError, ValueError) as e:
             raise RuntimeError(f"Ошибка преобразования данных: {e}")
-
         return vertices, normals, texcoords
 
     def send_boolean_intersection(self,
@@ -139,30 +136,21 @@ class TLS_client:
                                 mesh2_vertices: np.ndarray,
                                 mesh2_triangles: np.ndarray,
                                 return_volume_only: bool = False) -> Union[float, Tuple[np.ndarray, np.ndarray]]:
-        """
-        Запрос на булево пересечение двух сеток.
-        Если return_volume_only=True, возвращает объём (float).
-        Иначе возвращает кортеж (vertices, triangles) как numpy массивы.
-        """
         v1 = np.asarray(mesh1_vertices, dtype=np.float32)
         t1 = np.asarray(mesh1_triangles, dtype=np.uint32)
         v2 = np.asarray(mesh2_vertices, dtype=np.float32)
         t2 = np.asarray(mesh2_triangles, dtype=np.uint32)
-
         payload = {
-            "type": "boolean_intersection",  # опционально
+            "type": "boolean_intersection",
             "mesh1_vertices": base64.b64encode(v1.tobytes()).decode('ascii'),
             "mesh1_triangles": base64.b64encode(t1.tobytes()).decode('ascii'),
             "mesh2_vertices": base64.b64encode(v2.tobytes()).decode('ascii'),
             "mesh2_triangles": base64.b64encode(t2.tobytes()).decode('ascii'),
             "return_volume_only": "true" if return_volume_only else "false"
         }
-
         response = self._post("boolean_intersection", payload)
-
         if response.get("status") != "success":
             raise RuntimeError(f"Ошибка сервера: {response.get('error', 'Неизвестная ошибка')}")
-
         if return_volume_only:
             try:
                 return float(response["volume"])
@@ -184,31 +172,21 @@ class TLS_client:
                              mesh2_vertices: np.ndarray,
                              mesh2_triangles: np.ndarray,
                              return_volume_only: bool = False) -> Union[float, Tuple[np.ndarray, np.ndarray]]:
-        """
-        Запрос на булеву разность двух сеток.
-        Если return_volume_only=True, возвращает объём (float).
-        Иначе возвращает кортеж (vertices, triangles) как numpy массивы.
-        """
-        # Приведение типов и кодирование в base64
         v1 = np.asarray(mesh1_vertices, dtype=np.float32)
         t1 = np.asarray(mesh1_triangles, dtype=np.uint32)
         v2 = np.asarray(mesh2_vertices, dtype=np.float32)
         t2 = np.asarray(mesh2_triangles, dtype=np.uint32)
-
         payload = {
-            "type": "boolean_difference",  # опционально
+            "type": "boolean_difference",
             "mesh1_vertices": base64.b64encode(v1.tobytes()).decode('ascii'),
             "mesh1_triangles": base64.b64encode(t1.tobytes()).decode('ascii'),
             "mesh2_vertices": base64.b64encode(v2.tobytes()).decode('ascii'),
             "mesh2_triangles": base64.b64encode(t2.tobytes()).decode('ascii'),
             "return_volume_only": "true" if return_volume_only else "false"
         }
-
         response = self._post("boolean_difference", payload)
-
         if response.get("status") != "success":
             raise RuntimeError(f"Ошибка сервера: {response.get('error', 'Неизвестная ошибка')}")
-
         if return_volume_only:
             try:
                 return float(response["volume"])
@@ -223,3 +201,43 @@ class TLS_client:
                 return verts, tris
             except (KeyError, ValueError) as e:
                 raise RuntimeError(f"Ошибка декодирования результата: {e}")
+
+    # ====================== НОВЫЕ МЕТОДЫ ======================
+    def get_models_config(self) -> dict:
+        """Запрашивает с сервера конфигурацию моделей."""
+        response = self._post("get_models_config", {})
+        if response.get("status") != "success":
+            raise RuntimeError(f"Ошибка получения конфига моделей: {response.get('error', 'Неизвестная ошибка')}")
+        return response.get("config", {})
+
+    def download_model_file(self, set_name: str, file_type: str, local_path: str) -> None:
+        """Скачивает файл модели (cuzov/napolnitel/other) для указанного набора."""
+        url = f"{self.base_url}/download_model_file?set={urllib.parse.quote(set_name)}&type={urllib.parse.quote(file_type)}"
+        try:
+            resp = requests.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            with open(local_path, 'wb') as f:
+                f.write(resp.content)
+        except Exception as e:
+            raise RuntimeError(f"Ошибка скачивания файла {file_type} для набора {set_name}: {e}")
+
+    def get_texture_list(self, textures_dir: str) -> List[str]:
+        """Возвращает список имён файлов в указанной папке текстур на сервере."""
+        params = {"dir": textures_dir}
+        resp = self._get("list_textures", params)
+        data = resp.json()
+        if data.get("status") != "success":
+            raise RuntimeError(f"Ошибка получения списка текстур: {data.get('error', 'Неизвестная ошибка')}")
+        return data.get("files", [])
+
+    def download_texture_file(self, textures_dir: str, filename: str, local_path: str) -> None:
+        """Скачивает конкретный файл текстуры с сервера."""
+        params = {"dir": textures_dir, "file": filename}
+        url = f"{self.base_url}/download_texture"
+        try:
+            resp = requests.get(url, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            with open(local_path, 'wb') as f:
+                f.write(resp.content)
+        except Exception as e:
+            raise RuntimeError(f"Ошибка скачивания текстуры {filename} из {textures_dir}: {e}")

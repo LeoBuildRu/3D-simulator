@@ -2,6 +2,7 @@
 import random
 import math
 import os
+import tempfile
 import sys
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -322,7 +323,9 @@ class CameraControlGUI(QWidget):
             'r': 0.0
         }
 
-        self.models_config = self.load_models_config()
+        # Загружаем конфиги (модели с сервера, текстуры локально)
+        self.models_config = {}
+        self.load_models_config_from_server()
         self.textures_config = self.load_textures_config()
 
         self.setup_styles()
@@ -864,12 +867,35 @@ class CameraControlGUI(QWidget):
             # Очищаем список
             self.recon_json_list.clear()
 
-            # --- 1. Получаем данные с сервера (как и раньше) ---
+            # --- 1. Получаем данные с сервера и оставляем только последние 5 ---
             try:
-                files_from_server = self.panda_app.tls_client.get_verified_models()
+                files_from_server_raw = self.panda_app.tls_client.get_verified_models()
             except Exception as e:
                 print(f"Ошибка получения списка с сервера: {e}")
-                files_from_server = []
+                files_from_server_raw = []
+
+            # Преобразуем в список с распарсенными датами и сортируем
+            server_entries = []
+            for f in files_from_server_raw:
+                dt = None
+                try:
+                    dt = datetime.strptime(f.get("datetime", ""), "%d.%m.%Y %H:%M")
+                except:
+                    try:
+                        dt = datetime.fromisoformat(f.get("datetime", ""))
+                    except:
+                        dt = datetime.now()
+                server_entries.append({
+                    "raw": f,
+                    "dt": dt
+                })
+
+            # Сортируем по убыванию даты (новые первыми)
+            server_entries.sort(key=lambda x: x["dt"], reverse=True)
+            # Берём только первые 5
+            start_index = 0   # 20-я запись (0-based)
+            end_index = 20     # до 41-й не включая, т.е. последний индекс 39 = 40-я запись
+            files_from_server = [entry["raw"] for entry in server_entries[start_index:end_index]]
 
             # --- 2. Сканируем локальную папку height_examples ---
             local_files = []
@@ -1099,11 +1125,13 @@ class CameraControlGUI(QWidget):
                     if config.get("model") == model_name:
                         model_kayname = key
                 if model_kayname:
-                    self.load_model_set(model_kayname)
-                    # Синхронизируем выпадающий список
-                    self.model_set_combo.setCurrentText(model_kayname)
-                else:
-                    self.set_status(f"Модель '{model_name}' не найдена в конфигурации", True)
+                    # Устанавливаем ключ в комбобоксе и загружаем через существующий метод
+                    index = self.model_set_combo.findText(model_kayname)
+                    if index >= 0:
+                        self.model_set_combo.setCurrentIndex(index)
+                        self.load_selected_model_set()   # вместо load_model_set
+                    else:
+                        self.set_status(f"Набор моделей '{model_kayname}' не найден в списке", True)
             self.log_message("✅ Модель загружена")
 
             recon_module = getattr(self.panda_app, "mesh_reconstruction", None)
@@ -1681,6 +1709,7 @@ class CameraControlGUI(QWidget):
             border-top: 1px solid #2a2a35;
             min-height: 24px;
         """)
+        print(message)
         self.status_bar.setText(message)
 
         self.status_timer.start(5000)
@@ -1763,6 +1792,21 @@ class CameraControlGUI(QWidget):
         target_model_copy.removeNode()
 
         return target_model_trimesh
+    
+    def load_models_config_from_server(self):
+        """Загружает конфигурацию моделей с сервера, в случае неудачи использует локальный YAML."""
+        try:
+            config_data = self.panda_app.tls_client.get_models_config()
+            # Преобразуем относительные пути в абсолютные (как в исходном load_models_config)
+            for key in config_data:
+                for subkey in ['cuzov', 'napolnitel', 'other']:
+                    if subkey in config_data[key]:
+                        config_data[key][subkey] = os.path.join(PROJECT_ROOT, config_data[key][subkey])
+            self.models_config = config_data
+            print("Конфигурация моделей загружена с сервера")
+        except Exception as e:
+            print(f"Не удалось загрузить конфиг с сервера: {e}. Используем локальный.")
+            self.models_config = self.load_models_config()   # fallback
 
     def on_texture_set_changed(self, texture_set_name):
         if texture_set_name in self.textures_config:
@@ -1798,22 +1842,173 @@ class CameraControlGUI(QWidget):
         else:
             self.model_set_info.setText("Неизвестный набор моделей")
 
+    def get_cache_dir(self):
+        """Возвращает путь к глобальной кэш-директории для моделей."""
+        cache_dir = os.path.join(tempfile.gettempdir(), "vizutil_models_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def download_and_cache_model_set(self, set_name: str):
+        """
+        Загружает текстуры и модели выбранного набора с сервера в локальный кэш.
+        Возвращает словарь с абсолютными путями к файлам моделей и параметрами (max_volume, ground_plane).
+        """
+        config = self.models_config.get(set_name)
+        if not config:
+            raise ValueError(f"Набор {set_name} не найден в конфигурации")
+
+        cache_dir = self.get_cache_dir()          # %TEMP%\vizutil_models_cache
+        downloaded_paths = {}
+
+        # --- 1. Загрузка текстур ---
+        textures_dir_rel = config.get('textures_dir')
+        if textures_dir_rel:
+            # Извлекаем имя конечной папки (например, "kamaz_tex")
+            textures_basename = os.path.basename(textures_dir_rel.rstrip('/\\'))
+            textures_cache_dir = os.path.join(cache_dir, textures_basename)
+            os.makedirs(textures_cache_dir, exist_ok=True)
+
+            # Получаем список файлов из папки текстур на сервере
+            try:
+                texture_files = self.panda_app.tls_client.get_texture_list(textures_dir_rel)
+            except Exception as e:
+                if hasattr(self, 'status_bar'):
+                    self.set_status(f"Ошибка получения списка текстур: {e}", True)
+                raise
+
+            for filename in texture_files:
+                local_tex_path = os.path.join(textures_cache_dir, filename)
+                if not os.path.exists(local_tex_path):
+                    if hasattr(self, 'status_bar'):
+                        self.set_status(f"Загрузка текстуры {filename}...")
+                    try:
+                        self.panda_app.tls_client.download_texture_file(
+                            textures_dir_rel, filename, local_tex_path
+                        )
+                    except Exception as e:
+                        if hasattr(self, 'status_bar'):
+                            self.set_status(f"Ошибка загрузки текстуры {filename}: {e}", True)
+                        raise
+                else:
+                    if hasattr(self, 'status_bar'):
+                        self.set_status(f"Текстура {filename} уже есть в кэше")
+
+        # --- 2. Загрузка моделей (bam-файлов) ---
+        file_types = ['cuzov', 'napolnitel', 'other']
+        for ftype in file_types:
+            if ftype not in config:
+                continue
+            remote_rel_path = config[ftype]
+            filename = os.path.basename(remote_rel_path)   # например, FAW-Cuzov.bam
+            local_file = os.path.join(cache_dir, filename)
+
+            if not os.path.exists(local_file):
+                if hasattr(self, 'status_bar'):
+                    self.set_status(f"Загрузка {ftype} для {set_name}...")
+                try:
+                    self.panda_app.tls_client.download_model_file(set_name, ftype, local_file)
+                except Exception as e:
+                    if hasattr(self, 'status_bar'):
+                        self.set_status(f"Ошибка загрузки {ftype}: {e}", True)
+                    raise
+            else:
+                if hasattr(self, 'status_bar'):
+                    self.set_status(f"Файл {ftype} уже есть в кэше")
+
+            downloaded_paths[ftype] = local_file
+
+        # --- 3. Параметры набора ---
+        downloaded_paths['max_volume'] = config.get('max_volume')
+        downloaded_paths['ground_plane'] = config.get('ground_plane')
+
+        return downloaded_paths
+
     def load_selected_model_set(self):
         model_set_name = self.model_set_combo.currentText()
-        self.load_model_set(model_set_name)
-
-    def load_model_set(self, model_set_name):
-        if not model_set_name or model_set_name not in self.models_config:
-            self.set_status("⚠️ Не выбран набор моделей!", True)
+        if not model_set_name:
+            self.set_status("Не выбран набор моделей", True)
             return
 
-        config = self.models_config[model_set_name]
-        success = self.panda_app.load_model_set(config, model_set_name)
+        # Скачиваем (если нужно) и получаем пути к кэшированным файлам
+        try:
+            cached_paths = self.download_and_cache_model_set(model_set_name)
+        except Exception as e:
+            self.set_status(f"Не удалось загрузить модели: {e}", True)
+            return
 
+        # Формируем конфиг, который будет передан в panda_app
+        model_config = {
+            'cuzov': cached_paths.get('cuzov'),
+            'napolnitel': cached_paths.get('napolnitel'),
+            'other': cached_paths.get('other'),
+            'max_volume': cached_paths.get('max_volume'),
+            'ground_plane': cached_paths.get('ground_plane')
+        }
+
+        # Загружаем модели в сцену
+        success = self.panda_app.load_model_set(model_config, model_set_name)
         if success:
-            self.set_status(f"✅ Набор моделей '{model_set_name}' успешно загружен")
+            self.set_status(f"Набор моделей '{model_set_name}' загружен из кэша")
+            # Обновляем информацию в GUI (например, max_volume, ground_plane)
+            self.on_model_set_changed(model_set_name)
         else:
-            self.set_status("❌ Не удалось загрузить набор моделей", True)
+            self.set_status(f"Ошибка загрузки набора '{model_set_name}'", True)
+
+    def load_model_set(self, config, model_set_name):
+        self.clear_scene()
+
+        if not hasattr(self, 'perlin_model') or self.perlin_model is None:
+            self.create_perlin_noise_mesh()
+
+        models_loaded = []
+
+        def get_model_path(path):
+            # Если путь абсолютный – используем как есть, иначе собираем относительно PROJECT_ROOT
+            if os.path.isabs(path):
+                return path
+            return os.path.join(PROJECT_ROOT, path)
+
+        if 'other' in config and config['other']:
+            other_path = get_model_path(config['other'])
+            if os.path.exists(other_path):
+                other_model = self.load_gltf_model(other_path)
+                if other_model:
+                    models_loaded.append('other')
+                    self.current_other_path = other_path
+
+        if 'cuzov' in config and config['cuzov']:
+            cuzov_path = get_model_path(config['cuzov'])
+            if os.path.exists(cuzov_path):
+                cuzov_model = self.load_gltf_model(cuzov_path)
+                if cuzov_model:
+                    models_loaded.append('cuzov')
+                    self.Target_Cuzov = os.path.basename(cuzov_path)
+                    self.current_cuzov_path = cuzov_path
+
+        if 'napolnitel' in config and config['napolnitel']:
+            napolnitel_path = get_model_path(config['napolnitel'])
+            if os.path.exists(napolnitel_path):
+                napolnitel_model = self.load_gltf_model(napolnitel_path)
+                if napolnitel_model:
+                    napolnitel_model.hide()
+                    models_loaded.append('napolnitel')
+                    self.Target_Napolnitel = os.path.basename(napolnitel_path)
+                    self.current_napolnitel_path = napolnitel_path
+
+        if 'max_volume' in config:
+            self.Target_Volume = config['max_volume']
+
+        if 'ground_plane' in config:
+            self.current_ground_plane_z = config['ground_plane']
+
+        self.current_model_set = model_set_name
+        self.update_overlay_info(model=model_set_name)
+
+        if hasattr(self, 'perlin_model') and self.perlin_model:
+            if self.perlin_model.isHidden():
+                self.perlin_model.show()
+
+        return True
 
     def update_gradient_start(self, value):
         if hasattr(self.panda_app, 'depth_renderer') and self.panda_app.depth_renderer:
