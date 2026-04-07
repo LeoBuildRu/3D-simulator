@@ -81,6 +81,20 @@ class RendererUtils:
         
         return cropped_img
     
+    def fix_alpha_to_opaque(self, img):
+        # If image has no alpha channel, add one
+        if not img.hasAlpha():
+            img.addAlpha()
+
+        width = img.getXSize()
+        height = img.getYSize()
+
+        for y in range(height):
+            for x in range(width):
+                img.setAlpha(x, y, 1.0)
+
+        return img
+
     def stretch_to_1920x1080(self, img):
         target_width = 1920
         target_height = 1080
@@ -123,7 +137,7 @@ class RendererUtils:
         
         return stretched_img
     
-    def _process_render_image(self, img, camera_fov_x=None, camera_fov_y=None, output_dir="renders", 
+    def _process_render_image(self, img, depthImg, camera_fov_x=None, camera_fov_y=None, output_dir="renders", 
                          filename_prefix="render", metadata=None):
         orig_width = img.getXSize()
         orig_height = img.getYSize()
@@ -204,6 +218,8 @@ class RendererUtils:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{filename_prefix}_{timestamp}.png"
         output_path = os.path.join(output_dir, filename)
+        filenameDepth = f"{filename_prefix}_{timestamp}_depth.png"
+        output_path_depth = os.path.join(output_dir, filenameDepth)
 
         # Параметры преобразований
         k1 = 0.30
@@ -290,52 +306,54 @@ class RendererUtils:
                 else:
                     transformed_points_2d.append(None)
         
-        # === ДОБАВЛЕНИЕ ЦВЕТНЫХ КРУГОВ ===
-        try:
-            from PIL import Image, ImageDraw
-            import io
-            from panda3d.core import StringStream
-            
-            # Конвертируем PNMImage в PIL Image
-            stream = StringStream()
-            img_final.write(stream, "png")
-            pil_img = Image.open(io.BytesIO(stream.getData()))
-            draw = ImageDraw.Draw(pil_img)
-            
-            colors = [
-                (255, 0, 0, 200),    # красный для bottom_left_top
-                (0, 255, 0, 200),    # зеленый для top_left_top
-                (0, 0, 255, 200),    # синий для top_right_top
-                (255, 255, 0, 200),  # желтый для bottom_right_top
-            ]
-            
-            # Рисуем круги для каждой точки, которая не None
-            for i, point_2d in enumerate(transformed_points_2d):
-                if point_2d is not None:
-                    x = int(point_2d["x"])
-                    y = int(point_2d["y"])
-                    color = colors[i % len(colors)]
-                    
-                    # Рисуем круг с радиусом 10 пикселей
-                    draw.ellipse([(x-10, y-10), (x+10, y+10)], fill=color, outline=(255, 255, 255, 255))
-            
-            # Конвертируем обратно в PNMImage
-            output = io.BytesIO()
-            pil_img.save(output, format="PNG")
-            output.seek(0)
-            new_img = PNMImage()
-            new_img.read(StringStream(output.read()), "png")
-            
-            # Заменяем исходное изображение на новое
-            img_final = new_img
-            
-        except ImportError:
-            print("Warning: Pillow not installed. Skipping circle drawing.")
-        except Exception as e:
-            print(f"Warning: Error while drawing circles: {e}")
+        if(False):
+            # === ДОБАВЛЕНИЕ ЦВЕТНЫХ КРУГОВ ===
+            try:
+                from PIL import Image, ImageDraw
+                import io
+                from panda3d.core import StringStream
+                
+                # Конвертируем PNMImage в PIL Image
+                stream = StringStream()
+                img_final.write(stream, "png")
+                pil_img = Image.open(io.BytesIO(stream.getData()))
+                draw = ImageDraw.Draw(pil_img)
+                
+                colors = [
+                    (255, 0, 0, 200),    # красный для bottom_left_top
+                    (0, 255, 0, 200),    # зеленый для top_left_top
+                    (0, 0, 255, 200),    # синий для top_right_top
+                    (255, 255, 0, 200),  # желтый для bottom_right_top
+                ]
+                
+                # Рисуем круги для каждой точки, которая не None
+                for i, point_2d in enumerate(transformed_points_2d):
+                    if point_2d is not None:
+                        x = int(point_2d["x"])
+                        y = int(point_2d["y"])
+                        color = colors[i % len(colors)]
+                        
+                        # Рисуем круг с радиусом 10 пикселей
+                        draw.ellipse([(x-10, y-10), (x+10, y+10)], fill=color, outline=(255, 255, 255, 255))
+                
+                # Конвертируем обратно в PNMImage
+                output = io.BytesIO()
+                pil_img.save(output, format="PNG")
+                output.seek(0)
+                new_img = PNMImage()
+                new_img.read(StringStream(output.read()), "png")
+                
+                # Заменяем исходное изображение на новое
+                img_final = new_img
+                
+            except ImportError:
+                print("Warning: Pillow not installed. Skipping circle drawing.")
+            except Exception as e:
+                print(f"Warning: Error while drawing circles: {e}")
         
         # Сохраняем финальное изображение
         img_final.write(Filename.from_os_specific(output_path))
+        depthImg.write(Filename.from_os_specific(output_path_depth))
         
         # Формируем render_metadata только с необходимыми данными
         render_metadata = {}
@@ -439,6 +457,10 @@ class RendererUtils:
         finally:
             if os.path.exists(list_file):
                 os.remove(list_file)
+
+    def wait_panda_render(self):    
+        for i in range(20):
+            self.panda_app.graphicsEngine.renderFrame()
     
     def save_single_render(self):
         lens = self.panda_app.cam.node().getLens()
@@ -449,12 +471,32 @@ class RendererUtils:
         else:
             camera_fov_x = camera_fov_y = None
         
+        self.panda_app.depth_renderer.set_overlay_visibility(False)
+        self.wait_panda_render()
+
         img = PNMImage()
         if not self.panda_app.win.getScreenshot(img):
             return False
+            
+        self.panda_app.depth_renderer.set_overlay_visibility(True)
+
+        time.sleep(0.5)
+
+        self.wait_panda_render()
+        
+        depthImg = PNMImage()
+        if not self.panda_app.win.getScreenshot(depthImg):
+            return False
+        
+        self.panda_app.depth_renderer.set_overlay_visibility(False)
+        
+        img = self.stretch_to_1920x1080(img)
+        depthImg = self.stretch_to_1920x1080(depthImg)
+        depthImg = self.fix_alpha_to_opaque(depthImg)
         
         output_path = self._process_render_image(
-            img, 
+            img,
+            depthImg, 
             camera_fov_x=camera_fov_x,
             camera_fov_y=camera_fov_y,
             output_dir="renders/single",
