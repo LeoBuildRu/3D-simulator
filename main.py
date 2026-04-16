@@ -1291,41 +1291,42 @@ class MyApp(ShowBase):
     def setup_scene(self):
         self.quarry_model = None
         
-        self.create_perlin_noise_mesh()
-        self.add_scene_points()
+        #self.create_perlin_noise_mesh()
+        #self.add_scene_points()
+        self.load_gltf_model("models/base.bam", False)
         self.taskMgr.do_method_later(0.5, self._set_initial_time, "set_initial_time")
+
+        # Очищаем существующие источники света
+        self._night_lights = []
+         
+        # Создаем точечный свет (Point Light)
+        main_light = PointLight()
         
-        # # Очищаем существующие источники света
-        # self._night_lights = []
-        # 
-        ## Создаем точечный свет (Point Light)
-        #main_light = PointLight()
-        #
-        ## Устанавливаем позицию из Transform
-        #main_light.pos = (4.0762, 1.0055, 5.9039)
-        #
-        ## Устанавливаем цвет из температуры (6500K)
-        #main_light.set_color_from_temperature(6500)
-        #
-        ## Устанавливаем мощность (Power/Exposure 1000.000)
-        #main_light.energy = 100.0
-        #
-        ## Устанавливаем радиус влияния (Custom Distance 40m)
-        #main_light.radius = 20.0
-        #
-        ## Настройки теней
-        #main_light.casts_shadows = True
-        #main_light.shadow_map_resolution = 1024
-        #
-        ## В RenderPipeline влияние на диффузные/глянцевые материалы обычно 
-        ## настраивается через материалы, а не через свет
-        #
-        ## Добавляем свет в сцену
+        # Устанавливаем позицию из Transform
+        main_light.pos = (1.59908, 0.74428, 8.03699)
+        
+        # Устанавливаем цвет из температуры (6500K)
+        main_light.set_color_from_temperature(6500)
+        
+        # Устанавливаем мощность (Power/Exposure 1000.000)
+        main_light.energy = 200.0
+        
+        # Устанавливаем радиус влияния (Custom Distance 40m)
+        main_light.radius = 40.0
+        
+        # Настройки теней
+        main_light.casts_shadows = True
+        main_light.shadow_map_resolution = 4096
+        
+        # В RenderPipeline влияние на диффузные/глянцевые материалы обычно 
+        # настраивается через материалы, а не через свет
+        
+        # Добавляем свет в сцену
         #self.render_pipeline.add_light(main_light)
         #self._night_lights.append(main_light)
-        #
-        #print(f"Main light added at position {main_light.pos}")
-        #print(f"Light parameters: temperature=6500K, energy=1000.0, radius=40.0m")
+        
+        print(f"Main light added at position {main_light.pos}")
+        print(f"Light parameters: temperature=6500K, energy=1000.0, radius=40.0m")
 
         self.camera.set_pos(0, -20, 5)
         self.camera.look_at(0, 0, 0)
@@ -1599,7 +1600,7 @@ class MyApp(ShowBase):
         
         return task.cont
 
-    def load_gltf_model(self, file_path):
+    def load_gltf_model(self, file_path, addToLoaded = True):
         model_filename = Filename.from_os_specific(file_path)
         
         model_np = self.loader.load_model(model_filename, noCache=True) 
@@ -1610,16 +1611,19 @@ class MyApp(ShowBase):
         model_np.set_hpr(0, 0, 0) 
         model_np.set_scale(1)
         
-        self.loaded_models.append(model_np)
-        self.model_paths[id(model_np)] = file_path
+        if(addToLoaded):
+            self.loaded_models.append(model_np)
+            self.model_paths[id(model_np)] = file_path
         
         return model_np 
 
     def load_model_set(self, config, model_set_name):
         self.clear_scene()
         
-        if not hasattr(self, 'perlin_model') or self.perlin_model is None:
-            self.create_perlin_noise_mesh()
+        #if not hasattr(self, 'perlin_model') or self.perlin_model is None:
+            #self.create_perlin_noise_mesh()
+
+        #self.load_gltf_model("models/base.bam")
         
         models_loaded = []
         

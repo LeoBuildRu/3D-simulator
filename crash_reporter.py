@@ -28,7 +28,7 @@ class TelegramCrashReporter:
         try:
             requests.post(url, data=data, timeout=5)
         except Exception as e:
-            print(f"Failed to send Telegram message: {e}")
+            print(f"Failed to send Telegram message: {e}\n\nMessage: {text}")
 
     def send_screenshot(self, caption=''):
         """Делает скриншот главного окна и отправляет как фото."""
