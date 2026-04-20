@@ -222,14 +222,17 @@ class RendererUtils:
         output_path_depth = os.path.join(output_dir, filenameDepth)
 
         # Параметры преобразований
-        k1 = 0.30
-        k2 = 0.35
-        crop_left = 423
-        crop_top = 238
-        crop_right = 1498
-        crop_bottom = 840
+        k1 = 0.04
+        k2 = k1
+
+        crop_div = 1.5
+
+        crop_left = round(423/crop_div)
+        crop_top = round(238/crop_div)
         final_width = 1920
         final_height = 1080
+        crop_right = final_width - crop_left
+        crop_bottom = final_height - crop_top
         
         # Создаем копии изображения для каждого этапа преобразования
         img_distorted = self.barrel_distortion(img, k1=k1, k2=k2)
@@ -459,7 +462,7 @@ class RendererUtils:
                 os.remove(list_file)
 
     def wait_panda_render(self):    
-        for i in range(20):
+        for i in range(2):
             self.panda_app.graphicsEngine.renderFrame()
     
     def save_single_render(self):
