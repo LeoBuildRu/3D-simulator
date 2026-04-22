@@ -238,6 +238,11 @@ class RendererUtils:
         img_distorted = self.barrel_distortion(img, k1=k1, k2=k2)
         img_cropped = self.crop_image(img_distorted, left=crop_left, top=crop_top, right=crop_right, bottom=crop_bottom)
         img_final = self.stretch_to_1920x1080(img_cropped)
+
+        img_distorted = self.barrel_distortion(depthImg, k1=k1, k2=k2)
+        img_cropped = self.crop_image(img_distorted, left=crop_left, top=crop_top, right=crop_right, bottom=crop_bottom)
+        depthImg = self.stretch_to_1920x1080(img_cropped)
+        
         
         # Преобразуем 2D точки с учетом всех примененных трансформаций
         transformed_points_2d = []
