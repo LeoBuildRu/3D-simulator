@@ -61,6 +61,12 @@ Shackman-X3000-6x4-standard:
   other: "models/Shackman-X3000-6x4-standard-Other.bam"
   max_volume: 19.32
   ground_plane: 2.6
+  cam_pos_x: -1.1
+  cam_pos_y: 3.2
+  cam_pos_z: 4.2
+  cam_rot_h: -137
+  cam_rot_p: -40
+  cam_rot_r: 0
 
 Shackman-X3000-8x4-standard:
   model: "Shackman-X3000-8x4-standard"
@@ -69,6 +75,12 @@ Shackman-X3000-8x4-standard:
   other: "models/Shackman-X3000-8x4-standard-Other.bam"
   max_volume: 26
   ground_plane: 2.6
+  cam_pos_x: -1.1
+  cam_pos_y: 3.2
+  cam_pos_z: 4.2
+  cam_rot_h: -137
+  cam_rot_p: -40
+  cam_rot_r: 0
 
 Shackman-X3000-6x4-tall:
   model: "Shackman-X3000-6x4-tall"
@@ -77,6 +89,12 @@ Shackman-X3000-6x4-tall:
   other: "models/Shackman-X3000-6x4-tall-Other.bam"
   max_volume: 25
   ground_plane: 2.6
+  cam_pos_x: -1.1
+  cam_pos_y: 3.2
+  cam_pos_z: 4.2
+  cam_rot_h: -137
+  cam_rot_p: -40
+  cam_rot_r: 0
 
 Shackman-X3000-8x4-tall:
   model: "Shackman-X3000-8x4-tall"
@@ -85,6 +103,12 @@ Shackman-X3000-8x4-tall:
   other: "models/Shackman-X3000-8x4-tall-Other.bam"
   max_volume: 34
   ground_plane: 2.6
+  cam_pos_x: -1.1
+  cam_pos_y: 3.2
+  cam_pos_z: 4.2
+  cam_rot_h: -137
+  cam_rot_p: -40
+  cam_rot_r: 0
 
 FAW-J6-6x4-standard:
   model: "FAW-J6-6x4-standard"
@@ -93,6 +117,12 @@ FAW-J6-6x4-standard:
   other: "models/FAW-J6-6x4-standard-Other.bam"
   max_volume: 20
   ground_plane: 2.6
+  cam_pos_x: -1.1
+  cam_pos_y: 2.5
+  cam_pos_z: 4.2
+  cam_rot_h: -137
+  cam_rot_p: -40
+  cam_rot_r: 0
 
 FAW-J6-8x4-standard:
   model: "FAW-J6-8x4-standard"
@@ -101,6 +131,12 @@ FAW-J6-8x4-standard:
   other: "models/FAW-J6-8x4-standard-Other.bam"
   max_volume: 26
   ground_plane: 2.6
+  cam_pos_x: -1.1
+  cam_pos_y: 3.5
+  cam_pos_z: 4.4
+  cam_rot_h: -137
+  cam_rot_p: -40
+  cam_rot_r: 0
 
 FAW-J6-6x4-tall:
   model: "FAW-J6-6x4-tall"
@@ -109,6 +145,12 @@ FAW-J6-6x4-tall:
   other: "models/FAW-J6-6x4-tall-Other.bam"
   max_volume: 25
   ground_plane: 2.6
+  cam_pos_x: -1.1
+  cam_pos_y: 2.5
+  cam_pos_z: 4.2
+  cam_rot_h: -137
+  cam_rot_p: -40
+  cam_rot_r: 0
 
 FAW-J6-8x4-tall:
   model: "FAW-J6-8x4-tall"
@@ -117,3 +159,9 @@ FAW-J6-8x4-tall:
   other: "models/FAW-J6-8x4-tall-Other.bam"
   max_volume: 34
   ground_plane: 2.6
+  cam_pos_x: -1.1
+  cam_pos_y: 3.5
+  cam_pos_z: 4.4
+  cam_rot_h: -137
+  cam_rot_p: -40
+  cam_rot_r: 0
