@@ -1793,9 +1793,11 @@ class CameraControlGUI(QWidget):
 
         return target_model_trimesh
     
-    def load_models_config_from_server(self):
+    def load_models_config_from_server(self, mustUseLocal = False):
         """Загружает конфигурацию моделей с сервера, в случае неудачи использует локальный YAML."""
         try:
+            if(mustUseLocal):
+                raise Exception("для тестирования был выбран локальный конфиг")
             config_data = self.panda_app.tls_client.get_models_config()
             # Преобразуем относительные пути в абсолютные (как в исходном load_models_config)
             for key in config_data:
@@ -1827,6 +1829,14 @@ class CameraControlGUI(QWidget):
         if model_set_name in self.models_config:
             config = self.models_config[model_set_name]
             max_volume = config.get('max_volume', 'N/A')
+            
+            if "cam_pos_x" in config:
+                self.panda_app.camera.set_pos(config["cam_pos_x"], config["cam_pos_y"], config["cam_pos_z"])
+                self.panda_app.camera.set_hpr(config["cam_rot_h"], config["cam_rot_p"], config["cam_rot_r"])
+                print("Позиция бортовой камеры установлена из конфига")
+            else:
+                print("В конфиге не была найдена позиция бортовой камеры")
+
             info_text = f"<b>{model_set_name}</b><br>"
             info_text += f"Макс. объем: {max_volume}<br>"
 
