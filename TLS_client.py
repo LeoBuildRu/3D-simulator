@@ -10,7 +10,7 @@ class TLS_client:
     Клиент для взаимодействия с сервером перлин-генерации и булевых операций через REST API.
     """
 
-    def __init__(self, host='192.168.123.53', port=9998, timeout=300.0):
+    def __init__(self, host='192.168.123.53', port=9999, timeout=300.0):
         self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
 
@@ -129,7 +129,103 @@ class TLS_client:
         except (KeyError, ValueError) as e:
             raise RuntimeError(f"Ошибка преобразования данных: {e}")
         return vertices, normals, texcoords
+    
+    def generate_landscape(self,
+                        # Геометрия
+                        size: float = 10.0,
+                        subdivisions: int = 64,
+                        height: float = 2.0,
+                        seed: int = 0,
+                        noise_scale: float = 1.0,
+                        # Расширенные параметры
+                        name: str = "Landscape",
+                        subdivisions_x: int = None,
+                        subdivisions_y: int = None,
+                        mesh_size_x: float = None,
+                        mesh_size_y: float = None,
+                        noise_type: str = "rocks_noise",
+                        noise_basis: str = "BLENDER",
+                        offset_x: float = -1.05,
+                        offset_y: float = 0.0,
+                        size_x: float = 1.45,
+                        size_y: float = 2.23,
+                        depth: int = 8,
+                        distortion: float = 1.39,
+                        hard_noise: str = "0",
+                        height_offset: float = 0.0,
+                        maximum: float = 10000.0,
+                        minimum: float = -10000.0,
+                        edge_falloff: str = "3",
+                        edge_level: float = -0.12,
+                        falloff_x: float = 3.70,
+                        falloff_y: float = 4.00,
+                        strata_type: str = "0",
+                        output_format: str = "ply",
+                        # Повторение текстуры
+                        texture_repeat_x: float = 1.35,
+                        texture_repeat_y: float = 3.2
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Генерирует ландшафт через Blender и возвращает:
+        vertices (N,3), triangles (M,3), normals (N,3), uvs (N,2)
+        """
+        if subdivisions_x is None:
+            subdivisions_x = subdivisions
+        if subdivisions_y is None:
+            subdivisions_y = subdivisions
+        if mesh_size_x is None:
+            mesh_size_x = size
+        if mesh_size_y is None:
+            mesh_size_y = size
 
+        payload = {
+            "name": name,
+            "size": size,
+            "subdivisions": subdivisions,
+            "subdivisions_x": subdivisions_x,
+            "subdivisions_y": subdivisions_y,
+            "mesh_size_x": mesh_size_x,
+            "mesh_size_y": mesh_size_y,
+            "height": height,
+            "seed": seed,
+            "noise_scale": noise_scale,
+            "noise_type": noise_type,
+            "noise_basis": noise_basis,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "size_x": size_x,
+            "size_y": size_y,
+            "depth": depth,
+            "distortion": distortion,
+            "hard_noise": hard_noise,
+            "height_offset": height_offset,
+            "maximum": maximum,
+            "minimum": minimum,
+            "edge_falloff": edge_falloff,
+            "edge_level": edge_level,
+            "falloff_x": falloff_x,
+            "falloff_y": falloff_y,
+            "strata_type": strata_type,
+            "output_format": output_format,
+            "texture_repeat_x": texture_repeat_x,
+            "texture_repeat_y": texture_repeat_y
+        }
+        response = self._post("generate_landscape", payload)
+        if response.get("status") != "success":
+            raise RuntimeError(f"Landscape generation failed: {response.get('error', 'Unknown')}")
+
+        verts_b64 = response["vertices"]
+        tris_b64  = response["triangles"]
+        norms_b64 = response["normals"]
+        uvs_b64   = response["uvs"]
+
+        vertices  = np.frombuffer(base64.b64decode(verts_b64), dtype=np.float32).reshape(-1, 3)
+        triangles = np.frombuffer(base64.b64decode(tris_b64),  dtype=np.uint32).reshape(-1, 3)
+        normals   = np.frombuffer(base64.b64decode(norms_b64), dtype=np.float32).reshape(-1, 3)
+        uvs       = np.frombuffer(base64.b64decode(uvs_b64),   dtype=np.float32).reshape(-1, 2)
+        return vertices, triangles, normals, uvs
+
+    # ----------------- остальные методы (boolean, конфиги и т.д.) без изменений -----------------
     def send_boolean_intersection(self,
                                 mesh1_vertices: np.ndarray,
                                 mesh1_triangles: np.ndarray,
@@ -202,16 +298,13 @@ class TLS_client:
             except (KeyError, ValueError) as e:
                 raise RuntimeError(f"Ошибка декодирования результата: {e}")
 
-    # ====================== НОВЫЕ МЕТОДЫ ======================
     def get_models_config(self) -> dict:
-        """Запрашивает с сервера конфигурацию моделей."""
         response = self._post("get_models_config", {})
         if response.get("status") != "success":
             raise RuntimeError(f"Ошибка получения конфига моделей: {response.get('error', 'Неизвестная ошибка')}")
         return response.get("config", {})
 
     def download_model_file(self, set_name: str, file_type: str, local_path: str) -> None:
-        """Скачивает файл модели (cuzov/napolnitel/other) для указанного набора."""
         url = f"{self.base_url}/download_model_file?set={urllib.parse.quote(set_name)}&type={urllib.parse.quote(file_type)}"
         try:
             resp = requests.get(url, timeout=self.timeout)
@@ -222,7 +315,6 @@ class TLS_client:
             raise RuntimeError(f"Ошибка скачивания файла {file_type} для набора {set_name}: {e}")
 
     def get_texture_list(self, textures_dir: str) -> List[str]:
-        """Возвращает список имён файлов в указанной папке текстур на сервере."""
         params = {"dir": textures_dir}
         resp = self._get("list_textures", params)
         data = resp.json()
@@ -231,7 +323,6 @@ class TLS_client:
         return data.get("files", [])
 
     def download_texture_file(self, textures_dir: str, filename: str, local_path: str) -> None:
-        """Скачивает конкретный файл текстуры с сервера."""
         params = {"dir": textures_dir, "file": filename}
         url = f"{self.base_url}/download_texture"
         try:

@@ -61,18 +61,21 @@ class PerlinMeshGenerator:
             self.tls_client = TLS_client(host=server_host, port=server_port)
         
     def generate_perlin_mesh(self, grid_size=48):
-        """Генерация перлин-меша с указанным размером сетки через C++ сервер"""
-        base_vertex_count = grid_size * grid_size
+        """
+        Генерация ландшафта через Blender ANT Landscape (замена перлин-меша).
+        Параметр grid_size оставлен для совместимости, но не используется.
+        """
         if self.gui:
-            self.gui.log_message(f"🔄 Отправка запроса на сервер для генерации перлин-меша (grid_size={grid_size})...")
-        self.last_grid_size = grid_size
-        
-        # Получаем размеры из последней CSG операции
+            self.gui.log_message("🔄 Отправка запроса на сервер для генерации ландшафта (Blender ANT Landscape)...")
+
+        # -----------------------------------------------------------------
+        # 1. Получение размеров из последней CSG‑операции (как и раньше)
+        # -----------------------------------------------------------------
         csg_info = self.panda_app.csg_results[-1]
         csg_node = csg_info["result_node"]
         pos = csg_node.getPos()
         min_bound, max_bound = csg_node.getTightBounds()
-        
+
         if min_bound is None or max_bound is None:
             size_x = 10.0
             size_y = 10.0
@@ -81,20 +84,18 @@ class PerlinMeshGenerator:
             size_x = max_bound.x - min_bound.x
             size_y = max_bound.y - min_bound.y
             size_z = max_bound.z - min_bound.z
-            
+
+            # (опционально) масштабирование по объёму – оставляем как было
             project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             models_dir = os.path.join(project_root, "models")
-
             max_volumes = {
                 os.path.join(models_dir, "Scania-Napolnitel.gltf"): 24,
                 os.path.join(models_dir, "Kamaz-Napolnitel.gltf"): 10,
                 os.path.join(models_dir, "Hooper1-Napolnitel.gltf"): 48,
                 os.path.join(models_dir, "Hooper2-Napolnitel.gltf"): 88
             }
-            
             max_coefficient = 48
             min_coefficient = 14
-            
             target_model_path = None
             for model in self.panda_app.loaded_models:
                 model_id = id(model)
@@ -102,7 +103,6 @@ class PerlinMeshGenerator:
                     if self.panda_app.Target_Napolnitel in self.panda_app.model_paths[model_id]:
                         target_model_path = self.panda_app.model_paths[model_id]
                         break
-            
             if target_model_path in max_volumes:
                 max_volume = max_volumes[target_model_path]
                 volume_ratio = self.panda_app.Target_Volume / max_volume
@@ -110,87 +110,127 @@ class PerlinMeshGenerator:
                 coefficient = max(min_coefficient, min(max_coefficient, coefficient))
             else:
                 coefficient = (max_coefficient + min_coefficient) / 2
-            
             size_z = size_z * coefficient
 
-        half_size_x = size_x / 2.0
-        half_size_y = size_y / 2.0
         self.last_size_x = size_x
         self.last_size_y = size_y
-        self.last_half_size_x = half_size_x
-        self.last_half_size_y = half_size_y
-        
+        self.last_half_size_x = size_x / 2.0
+        self.last_half_size_y = size_y / 2.0
+        self.last_grid_size = grid_size  # сохраняем для возможной обратной совместимости
+
+        # -----------------------------------------------------------------
+        # 2. Параметры текстуры и шума (из текущего набора)
+        # -----------------------------------------------------------------
         texture_repeatX = self.panda_app.current_texture_set.get('textureRepeatX', 1.35)
         texture_repeatY = self.panda_app.current_texture_set.get('textureRepeatY', 3.2)
-        
-        # Параметры шума (такие же, как в локальной версии)
-        noise_scale = 4
-        octaves = 12
-        persistence = 0.01
-        lacunarity = 1.0
-        seed = random.randint(0, 10000)
         strength = self.panda_app.current_texture_set.get('strength', 0.14)
-        
-        # Загружаем карту высот (height map)
-        height_texture_path = self._get_height_texture_path()
-        height_array, tex_width, tex_height = self._load_height_array(height_texture_path)
-        
-        # Отправляем запрос на сервер
-        print(f"Отправка запроса на сервер для grid_size={grid_size}...")
-        result = self.tls_client.send_perlin_request(
-            grid_size=grid_size,
-            size_x=size_x,
-            size_y=size_y,
-            size_z=size_z,
-            base_z=pos.getZ(),
-            noise_scale=noise_scale,
-            octaves=octaves,
-            persistence=persistence,
-            lacunarity=lacunarity,
-            seed=seed,
-            texture_repeatX=texture_repeatX,
-            texture_repeatY=texture_repeatY,
-            strength=strength,
-            height_array=height_array,
-            vertices_before=[],          # не используются, но обязательны в интерфейсе
-            texcoords_before=[]           # не используются, но обязательны
-        )
-        
-        if result is None:
-            raise RuntimeError("Не удалось получить данные от сервера генерации")
-        
-        if self.gui:
-            self.gui.log_message("✅ Данные от сервера получены, применение falloff...")
-        
-        vertices, normals_from_server, texcoords = result
-        
-        # Преобразуем списки в удобный формат: список кортежей (x,y,z)
-        vertices_list = [tuple(v) for v in vertices]   # vertices уже numpy (N,3)
-        texcoords_list = [tuple(tc) for tc in texcoords]  # texcoords (N,2)
-        
-        # Применяем falloff (сервер его не выполняет)
-        falloff_config = self._get_falloff_config()
-        vertices_list = self._apply_falloff(vertices_list, size_x, size_y, pos.getZ(), falloff_config)
-        
-        # Пересчитываем нормали после falloff
-        normals_list = self._calculate_normals(vertices_list, grid_size)
+        seed = random.randint(0, 10000)
+
+        # -----------------------------------------------------------------
+        # 3. Параметры для Blender ANT Landscape
+        #    (подбираются в соответствии с логикой старого генератора)
+        # -----------------------------------------------------------------
+        # Можно задать фиксированные значения или вычислить из контекста
+        subdivisions = 48               # высокое разрешение сразу, чтобы не делать subdivision
+        mesh_size_x_blender = size_x     # передаём реальные размеры области
+        mesh_size_y_blender = size_y
+        noise_scale_blender = 1.36       # аналог noise_scale в старом коде
+        height_blender = 0.77            # можно связать с strength / size_z
+        distortion_blender = 1.39
+        depth_blender = 8
+        edge_falloff = "3"               # тип спада по краям
+        edge_level = -0.12
+        falloff_x = 3.70
+        falloff_y = 4.00
+
+        try:
+            landscape_data = self.tls_client.generate_landscape(
+                name="Landscape",
+                subdivisions=subdivisions,
+                subdivisions_x=subdivisions,
+                subdivisions_y=subdivisions,
+                mesh_size_x=mesh_size_x_blender,
+                mesh_size_y=mesh_size_y_blender,
+                size_x=1.45,
+                size_y=2.23,
+                noise_scale=noise_scale_blender,
+                noise_type="rocks_noise",
+                noise_basis="BLENDER",
+                offset_x=-1.05,
+                offset_y=0.0,
+                height=height_blender,
+                height_offset=0.0,
+                depth=depth_blender,
+                distortion=distortion_blender,
+                hard_noise="0",
+                maximum=10000.0,
+                minimum=-10000.0,
+                edge_falloff=edge_falloff,
+                edge_level=edge_level,
+                falloff_x=falloff_x,
+                falloff_y=falloff_y,
+                strata_type="0",
+                seed=seed,
+                texture_repeat_x=texture_repeatX,
+                texture_repeat_y=texture_repeatY,
+                output_format="ply"
+            )
+        except Exception as e:
+            if self.gui:
+                self.gui.log_message(f"❌ Ошибка вызова generate_landscape: {e}")
+            raise RuntimeError("Не удалось получить данные от сервера ландшафта")
+
+        if landscape_data is None:
+            raise RuntimeError("Сервер не вернул данные ландшафта")
+
+                # Ожидаем, что landscape_data — это кортеж: (vertices, normals, uvs, triangles)
+        if len(landscape_data) != 4:
+            raise RuntimeError(f"Неверный формат данных от generate_landscape: ожидался кортеж из 4 элементов, получено {len(landscape_data)}")
+
+                # Правильный порядок: vertices, triangles, normals, uvs
+        vertices_list, triangles, normals_list, texcoords_list = landscape_data
 
         if self.gui:
-            self.gui.log_message("✅ Falloff применён")
-        
-        # Строим геометрию Panda3D
-        perlin_np = self._create_geom_from_vertices(
-            vertices_list, normals_list, texcoords_list, grid_size, "perlin_mesh_from_server"
-        )
-        
-        # Сохраняем данные для возможного использования в других методах
-        # ВНИМАНИЕ: здесь сохраняются уже вершины после displacement и falloff
+            self.gui.log_message(f"✅ Получено {len(vertices_list)} вершин, {len(triangles)} треугольников")
+
+        # -----------------------------------------------------------------
+        # 5. Построение геометрии Panda3D
+        # -----------------------------------------------------------------
+        format = GeomVertexFormat.getV3n3t2()
+        format = GeomVertexFormat.registerFormat(format)
+        vdata = GeomVertexData("landscape_mesh", format, Geom.UHStatic)
+
+        vertex_writer = GeomVertexWriter(vdata, "vertex")
+        normal_writer = GeomVertexWriter(vdata, "normal")
+        texcoord_writer = GeomVertexWriter(vdata, "texcoord")
+
+        # vertices_list, normals_list, texcoords_list — NumPy массивы (N,3), (N,3), (N,2)
+        for i in range(len(vertices_list)):
+            v = vertices_list[i]
+            n = normals_list[i]
+            t = texcoords_list[i]
+            vertex_writer.addData3f(v[0], v[1], v[2])
+            normal_writer.addData3f(n[0], n[1], n[2])
+            texcoord_writer.addData2f(t[0], t[1])
+
+        # triangles — NumPy массив (M,3) uint32
+        prim = GeomTriangles(Geom.UHStatic)
+        for tri in triangles:
+            prim.addVertices(int(tri[0]), int(tri[1]), int(tri[2]))
+        prim.closePrimitive()
+
+        geom = Geom(vdata)
+        geom.addPrimitive(prim)
+        geom_node = GeomNode("landscape_node")
+        geom_node.addGeom(geom)
+        perlin_np = NodePath(geom_node)
+
         self.perlin_vertices_before_displace = vertices_list.copy()
         self.perlin_texcoords_before_displace = texcoords_list.copy()
 
         if self.gui:
-            self.gui.log_message("✅ Геометрия создана")
-        
+            self.gui.log_message("✅ Ландшафт успешно создан")
+
         return perlin_np
     
     def extract_perlin_mesh_data(self, vertices, texcoords_list, grid_size):
@@ -584,11 +624,8 @@ class PerlinMeshGenerator:
 
                 for vx, vy, vz in vertices:
                     vertex_writer.addData3f(vx, vy, vz)
-                    if normal_reader:
-                        n = normal_reader.getData3f()
-                        normal_writer.addData3f(n.x, n.y, n.z)
-                    else:
-                        normal_writer.addData3f(0, 0, 1)
+                    n = normal_reader.getData3f()
+                    normal_writer.addData3f(-n.x, -n.y, -n.z)
 
                     # Генерация UV на основе исходных размеров перлин-меша
                     u = ((vx + half_size_x) / size_x) * tex_repeat_x
@@ -712,9 +749,9 @@ class PerlinMeshGenerator:
     
     def find_best_z_position(self, mesh_np, target_model_trimesh, target_volume, initial_z=0):
         """Поиск оптимальной Z-позиции меша для достижения целевого объема"""
-        tolerance = 0.2
-        min_z = -2
-        max_z = 2
+        tolerance = 0.15
+        min_z = -3
+        max_z = 3
         max_iterations = 50
 
         best_z = initial_z

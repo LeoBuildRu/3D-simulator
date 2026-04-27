@@ -381,6 +381,57 @@ class MyApp(ShowBase):
 
         self.mesh_reconstruction = MeshReconstruction(self, tls_client=self.tls_client)
 
+        # try:
+        #     print("send request to server")
+        #     # Получаем текущие настройки текстурных повторов (если есть)
+        #     tex_rep_x = 1.35
+        #     tex_rep_y = 3.2
+        #     if hasattr(self, 'panda_app') and hasattr(self.panda_app, 'current_texture_set'):
+        #         tex_set = self.panda_app.current_texture_set
+        #         tex_rep_x = tex_set.get('textureRepeatX', tex_rep_x)
+        #         tex_rep_y = tex_set.get('textureRepeatY', tex_rep_y)
+        #     vertices, triangles, normals, uvs = self.tls_client.generate_landscape(
+        #         # Основные геометрические параметры
+        #         size=20.0,
+        #         subdivisions=128,
+        #         height=0.77,
+        #         seed=120,
+        #         noise_scale=1.36,
+        #         name="Landscape",
+        #         subdivisions_x=128,
+        #         subdivisions_y=128,
+        #         mesh_size_x=3.06,
+        #         mesh_size_y=6.46,
+        #         noise_type="rocks_noise",
+        #         noise_basis="BLENDER",
+        #         offset_x=-1.05,
+        #         offset_y=0.00,
+        #         size_x=1.45,
+        #         size_y=2.23,
+        #         depth=8,
+        #         distortion=1.39,
+        #         hard_noise="0",
+        #         height_offset=0.00,
+        #         maximum=10000.0,
+        #         minimum=-10000.0,
+        #         edge_falloff="3",
+        #         edge_level=-0.12,
+        #         falloff_x=3.70,
+        #         falloff_y=4.00,
+        #         strata_type="0",
+        #         output_format="ply",
+        #         texture_repeat_x=tex_rep_x,
+        #         texture_repeat_y=tex_rep_y
+        #     )
+        #     print("create mesh from data")
+        #     mesh = self.create_mesh_from_data(vertices, triangles, normals, uvs)
+        #     print("reparent to render")
+        #     mesh.reparentTo(self.render)
+        # except Exception as e:
+        #     import traceback
+        #     print("ERROR during landscape generation:")
+        #     traceback.print_exc()
+
         try:
             self.particles = WarpFallingParticles(
                 showbase=self,
@@ -399,6 +450,131 @@ class MyApp(ShowBase):
             )
         except Exception as e:
             traceback.print_exc()
+
+    def create_mesh_from_data(self, vertices: np.ndarray, triangles: np.ndarray,
+                            normals: np.ndarray, uvs: np.ndarray):
+        from panda3d.core import (GeomVertexFormat, GeomVertexData, Geom,
+                                GeomNode, GeomTriangles, GeomVertexWriter)
+
+        # 1. Поднимаем меш по Z (опционально)
+        vertices = vertices.copy()
+        vertices[:, 2] += 1.0
+
+        # 2. Создаём геометрию с форматом V3N3T2
+        fmt = GeomVertexFormat.getV3n3t2()
+        vdata = GeomVertexData("landscape", fmt, Geom.UHStatic)
+
+        vertex_writer = GeomVertexWriter(vdata, "vertex")
+        normal_writer = GeomVertexWriter(vdata, "normal")
+        texcoord_writer = GeomVertexWriter(vdata, "texcoord")
+        normals = -normals
+
+        for i in range(len(vertices)):
+            v = vertices[i]
+            n = normals[i]
+            uv = uvs[i]
+            vertex_writer.addData3f(v[0], v[1], v[2])
+            normal_writer.addData3f(n[0], n[1], n[2])
+            texcoord_writer.addData2f(uv[0], uv[1])
+
+        # 3. Индексы треугольников
+        prim = GeomTriangles(Geom.UHStatic)
+        for tri in triangles:
+            prim.addVertices(int(tri[0]), int(tri[1]), int(tri[2]))
+        prim.closePrimitive()
+
+        geom = Geom(vdata)
+        geom.addPrimitive(prim)
+
+        node = GeomNode("landscape")
+        node.addGeom(geom)
+
+        np_node = self.render.attachNewNode(node)
+        np_node.setShaderAuto()
+        np_node.setTwoSided(False)
+
+        # 4. Применение PBR-текстур
+        self._apply_textures_and_material(np_node)
+
+        return np_node
+    
+    def _apply_textures_and_material(self, model_np):
+        import os
+        from panda3d.core import Texture, TextureStage, Material
+
+        texset = self.current_texture_set
+
+        # Пути к текстурам
+        diffuse_path = texset.get("diffuse") or texset.get("albedo") or "textures/concrete_8k/concrete_debris_diff_8k.jpg"
+        normal_path = texset.get("normal", "textures/concrete_8k/concrete_debris_nor_dx_8k.jpg")
+        roughness_path = texset.get("roughness")
+        metallic_path = texset.get("metallic")
+
+        # Проверка существования файлов (с резервными)
+        if not os.path.exists(diffuse_path):
+            diffuse_path = "textures/concrete_8k/concrete_debris_diff_8k.jpg"
+        if not os.path.exists(normal_path):
+            normal_path = "textures/concrete_8k/concrete_debris_nor_dx_8k.jpg"
+
+        # Создаём PBR-материал
+        mat = Material()
+        mat.set_base_color((1, 1, 1, 1))
+        # Для RP: зелёный канал emission = сила нормалей (если требуется)
+        mat.set_emission((0, 1, 0, 0))
+        model_np.set_material(mat)
+
+        # Вспомогательная функция настройки текстур
+        def setup_tex(tex, srgb=False):
+            if srgb:
+                tex.set_format(Texture.F_srgb)
+            tex.set_minfilter(Texture.FTLinearMipmapLinear)
+            tex.set_magfilter(Texture.FTLinear)
+            tex.set_wrap_u(Texture.WMRepeat)
+            tex.set_wrap_v(Texture.WMRepeat)
+
+        # Слоты с правильным порядком
+        ts_color = TextureStage("0-color")
+        ts_color.set_sort(0)
+        ts_normal = TextureStage("1-normal")
+        ts_normal.set_sort(1)
+        ts_metal = TextureStage("2-metallic")
+        ts_metal.set_sort(2)
+        ts_rough = TextureStage("3-roughness")
+        ts_rough.set_sort(3)
+
+        # Albedo
+        diffuse_tex = self.loader.loadTexture(diffuse_path)
+        setup_tex(diffuse_tex, srgb=True)
+        model_np.set_texture(ts_color, diffuse_tex)
+
+        # Normal map
+        normal_tex = self.loader.loadTexture(normal_path)
+        setup_tex(normal_tex)
+        model_np.set_texture(ts_normal, normal_tex)
+
+        # Metallic (всегда заполняем)
+        if metallic_path and os.path.exists(metallic_path):
+            metal_tex = self.loader.loadTexture(metallic_path)
+        else:
+            metal_tex = Texture("dummy_metal")
+            metal_tex.setup_2d_texture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+            metal_tex.set_ram_image(b"\x00")  # чёрный = 0 металличности
+        setup_tex(metal_tex)
+        model_np.set_texture(ts_metal, metal_tex)
+
+        # Roughness (всегда заполняем заглушкой)
+        if roughness_path and os.path.exists(roughness_path):
+            rough_tex = self.loader.loadTexture(roughness_path)
+        else:
+            rough_tex = Texture("dummy_rough")
+            rough_tex.setup_2d_texture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+            rough_tex.set_ram_image(b"\x80")  # 0x80 = 0.5 в линейном (средняя шероховатость)
+        setup_tex(rough_tex)
+        model_np.set_texture(ts_rough, rough_tex)
+
+        # Флаги RP
+        # model_np.set_shader_auto()  # Для RP обычно не требуется, но можно оставить
+        model_np.set_two_sided(True)
 
     def create_top_overlay(self):
         from direct.gui.DirectFrame import DirectFrame
@@ -783,19 +959,30 @@ class MyApp(ShowBase):
         if self.gui:
             self.gui.log_message("Начало perform_AABB_plane...")
 
+        # Поиск модели кузова
         target_model = None
         target_model_path = None
         for model in self.loaded_models:
             model_id = id(model)
             if model_id in self.model_paths:
-                model_filename = self.model_paths[model_id].split('/')[-1]
+                model_filename = os.path.basename(self.model_paths[model_id])
                 if model_filename == self.Target_Cuzov:
                     target_model = model
                     target_model_path = self.model_paths[model_id]
                     break
 
         if target_model is None:
+            if self.gui:
+                self.gui.log_message("❌ Модель кузова не найдена")
             return False
+
+        # Сохраняем и сбрасываем трансформации кузова для корректного AABB
+        old_scale = target_model.getScale()
+        old_pos = target_model.getPos()
+        old_hpr = target_model.getHpr()
+        target_model.setScale(1.0, 1.0, 1.0)
+        target_model.setPos(0, 0, 0)
+        target_model.setHpr(0, 0, 0)
 
         if self.gui:
             self.gui.log_message("📦 Вычисление AABB модели...")
@@ -803,33 +990,42 @@ class MyApp(ShowBase):
         aabb_center = (min_point + max_point) / 2.0
         aabb_size = max_point - min_point
 
+        # Восстанавливаем трансформации
+        target_model.setScale(old_scale)
+        target_model.setPos(old_pos)
+        target_model.setHpr(old_hpr)
+
         ground_pos = self.ground_plane.getPos()
         plane_thickness = 0.05
 
+        # Создаём плоскость и AABB как trimesh объекты
         full_plane_mesh = trimesh.creation.box(
             extents=[self.plane_size_x, self.plane_size_y, plane_thickness]
         )
-
         aabb_mesh = trimesh.creation.box(
             extents=[aabb_size.x, aabb_size.y, aabb_size.z]
         )
 
+        # Перемещаем AABB в мировые координаты кузова
         aabb_transform = trimesh.transformations.translation_matrix([
-            aabb_center.x - ground_pos.x,
-            aabb_center.y - ground_pos.y, 
-            aabb_center.z - ground_pos.z
+            aabb_center.x, aabb_center.y, aabb_center.z
         ])
         aabb_mesh.apply_transform(aabb_transform)
 
-        # --- Замена локальной boolean на удалённый вызов через TLS клиент ---
+        # Перемещаем плоскость в позицию ground_plane
+        full_plane_mesh.apply_translation([ground_pos.x, ground_pos.y, ground_pos.z])
+
+        if self.gui:
+            self.gui.log_message(f"Plane size: {self.plane_size_x} x {self.plane_size_y}, AABB size: {aabb_size.x:.2f} x {aabb_size.y:.2f} x {aabb_size.z:.2f}")
+
+        # Проверка наличия TLS клиента
         if not hasattr(self, 'tls_client') or self.tls_client is None:
             print("[ERROR] TLS client not available. Cannot perform intersection.")
             return False
 
         if self.gui:
-            self.gui.log_message("✂️ Выполнение boolean операции через TLS-сервер...")
+            self.gui.log_message("✂️ Выполнение boolean пересечения через TLS-сервер...")
         try:
-            # Отправляем запрос на сервер для пересечения
             result_verts, result_tris = self.tls_client.send_boolean_intersection(
                 full_plane_mesh.vertices,
                 full_plane_mesh.faces,
@@ -837,20 +1033,21 @@ class MyApp(ShowBase):
                 aabb_mesh.faces,
                 return_volume_only=False
             )
-            # Создаём меш из полученных данных
             result_mesh = trimesh.Trimesh(vertices=result_verts, faces=result_tris)
             if result_mesh.is_empty:
-                print("[WARN] Intersection result is empty.")
+                if self.gui:
+                    self.gui.log_message("⚠️ Результат пересечения пуст")
                 return False
         except Exception as e:
-            print(f"[ERROR] Boolean intersection via TLS client failed: {e}")
+            if self.gui:
+                self.gui.log_message(f"❌ Ошибка булевой операции: {e}")
             return False
-        # ----------------------------------------------------------------
 
         if self.gui:
             self.gui.log_message("✅ Boolean операция завершена, создание меша...")
         csg_result_panda = self.trimesh_to_panda(result_mesh)
 
+        # Применяем материал к результату
         material = Material()
         material.setDiffuse((0, 0.7, 0, 1))
         material.setAmbient((0, 0.3, 0, 1))
@@ -859,19 +1056,17 @@ class MyApp(ShowBase):
         csg_result_panda.setMaterial(material)
         csg_result_panda.setShaderAuto()
 
-        old_pos = self.ground_plane.getPos()
-        old_hpr = self.ground_plane.getHpr()
-        old_scale = self.ground_plane.getScale()
+        # Заменяем старую ground_plane на результат CSG
+        old_pos_plane = self.ground_plane.getPos()
+        old_hpr_plane = self.ground_plane.getHpr()
+        old_scale_plane = self.ground_plane.getScale()
 
         self.ground_plane.removeNode()
 
         csg_result_panda.reparentTo(self.render)
-        csg_result_panda.setPos(old_pos)
-        csg_result_panda.setHpr(old_hpr)
-        csg_result_panda.setScale(old_scale)
-
-        if self.gui:
-            self.gui.log_message("🔄 Замена ground_plane на результат CSG")
+        csg_result_panda.setPos(old_pos_plane)
+        csg_result_panda.setHpr(old_hpr_plane)
+        csg_result_panda.setScale(old_scale_plane)
 
         self.ground_plane = csg_result_panda
 
@@ -888,7 +1083,7 @@ class MyApp(ShowBase):
 
         if self.gui:
             self.gui.log_message("✅ AABB plane успешно выполнено")
-        return True   
+        return True
 
     def panda_to_trimesh(self, node_path):
         geom_node = node_path.node()
@@ -1291,42 +1486,41 @@ class MyApp(ShowBase):
     def setup_scene(self):
         self.quarry_model = None
         
-        #self.create_perlin_noise_mesh()
-        #self.add_scene_points()
-        self.load_gltf_model("models/base.bam", False)
+        self.create_perlin_noise_mesh()
+        self.add_scene_points()
         self.taskMgr.do_method_later(0.5, self._set_initial_time, "set_initial_time")
-
-        # Очищаем существующие источники света
-        self._night_lights = []
-         
-        # Создаем точечный свет (Point Light)
-        main_light = PointLight()
         
-        # Устанавливаем позицию из Transform
-        main_light.pos = (1.59908, 0.74428, 8.03699)
-        
-        # Устанавливаем цвет из температуры (6500K)
-        main_light.set_color_from_temperature(6500)
-        
-        # Устанавливаем мощность (Power/Exposure 1000.000)
-        main_light.energy = 200.0
-        
-        # Устанавливаем радиус влияния (Custom Distance 40m)
-        main_light.radius = 40.0
-        
-        # Настройки теней
-        main_light.casts_shadows = True
-        main_light.shadow_map_resolution = 4096
-        
-        # В RenderPipeline влияние на диффузные/глянцевые материалы обычно 
-        # настраивается через материалы, а не через свет
-        
-        # Добавляем свет в сцену
+        # # Очищаем существующие источники света
+        # self._night_lights = []
+        # 
+        ## Создаем точечный свет (Point Light)
+        #main_light = PointLight()
+        #
+        ## Устанавливаем позицию из Transform
+        #main_light.pos = (4.0762, 1.0055, 5.9039)
+        #
+        ## Устанавливаем цвет из температуры (6500K)
+        #main_light.set_color_from_temperature(6500)
+        #
+        ## Устанавливаем мощность (Power/Exposure 1000.000)
+        #main_light.energy = 100.0
+        #
+        ## Устанавливаем радиус влияния (Custom Distance 40m)
+        #main_light.radius = 20.0
+        #
+        ## Настройки теней
+        #main_light.casts_shadows = True
+        #main_light.shadow_map_resolution = 1024
+        #
+        ## В RenderPipeline влияние на диффузные/глянцевые материалы обычно 
+        ## настраивается через материалы, а не через свет
+        #
+        ## Добавляем свет в сцену
         #self.render_pipeline.add_light(main_light)
         #self._night_lights.append(main_light)
-        
-        print(f"Main light added at position {main_light.pos}")
-        print(f"Light parameters: temperature=6500K, energy=1000.0, radius=40.0m")
+        #
+        #print(f"Main light added at position {main_light.pos}")
+        #print(f"Light parameters: temperature=6500K, energy=1000.0, radius=40.0m")
 
         self.camera.set_pos(0, -20, 5)
         self.camera.look_at(0, 0, 0)
@@ -1600,7 +1794,7 @@ class MyApp(ShowBase):
         
         return task.cont
 
-    def load_gltf_model(self, file_path, addToLoaded = True):
+    def load_gltf_model(self, file_path):
         model_filename = Filename.from_os_specific(file_path)
         
         model_np = self.loader.load_model(model_filename, noCache=True) 
@@ -1611,19 +1805,16 @@ class MyApp(ShowBase):
         model_np.set_hpr(0, 0, 0) 
         model_np.set_scale(1)
         
-        if(addToLoaded):
-            self.loaded_models.append(model_np)
-            self.model_paths[id(model_np)] = file_path
+        self.loaded_models.append(model_np)
+        self.model_paths[id(model_np)] = file_path
         
         return model_np 
 
     def load_model_set(self, config, model_set_name):
         self.clear_scene()
         
-        #if not hasattr(self, 'perlin_model') or self.perlin_model is None:
-            #self.create_perlin_noise_mesh()
-
-        #self.load_gltf_model("models/base.bam")
+        if not hasattr(self, 'perlin_model') or self.perlin_model is None:
+            self.create_perlin_noise_mesh()
         
         models_loaded = []
         
