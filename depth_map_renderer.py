@@ -122,6 +122,10 @@ class DepthMapRenderer:
             float t = 1.0 - normalized_depth;
             vec3 color;
 
+            fragColor = vec4(t, t, t, 1.0);
+
+            return;
+            
             if (t >= 0.9) {
                 float segment_t = (t - 0.9) / 0.1;
                 color = mix(vec3(1.0, 0.0, 0.0), vec3(0.5, 0.0, 0.0), segment_t);

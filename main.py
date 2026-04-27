@@ -594,9 +594,9 @@ class MyApp(ShowBase):
         # DGG.setDefaultFont(self.ui_font)
 
         # Цвета в формате (r, g, b, a) от 0 до 1
-        bg_color = (0.102, 0.102, 0.129, 1.0)        # #1a1a21
-        accent_color = (0.29, 0.50, 0.75, 1.0)       # #4a7fbe
-        text_color = (1.0, 1.0, 1.0, 1.0)            # белый
+        bg_color = (0.102, 0.102, 0.129, 0.0)        # #1a1a21
+        accent_color = (0.29, 0.50, 0.75, 0.0)       # #4a7fbe
+        text_color = (1.0, 1.0, 1.0, 0.0)            # белый
 
         panel_width = 500
         panel_height = 220                            # увеличено для заголовка
@@ -1328,6 +1328,7 @@ class MyApp(ShowBase):
         from panda3d.core import Texture, TextureStage, Material, GeomVertexFormat, GeomVertexData, \
             GeomVertexWriter, GeomTriangles, Geom, GeomNode, LPoint3f
 
+
         size_x = 2000.0
         size_y = 2000.0
         size_z = 2.0
@@ -1486,7 +1487,20 @@ class MyApp(ShowBase):
     def setup_scene(self):
         self.quarry_model = None
         
-        self.create_perlin_noise_mesh()
+        #self.create_perlin_noise_mesh()
+
+        file_path = "models/base.bam"
+
+        model_filename = Filename.from_os_specific(file_path)
+        
+        model_np = self.loader.load_model(model_filename, noCache=True) 
+        
+        model_np.reparent_to(self.render)
+        self.render_pipeline.prepare_scene(model_np)
+        model_np.set_pos(0, 0, 0)
+        model_np.set_hpr(0, 0, 0) 
+        model_np.set_scale(1)
+
         self.add_scene_points()
         self.taskMgr.do_method_later(0.5, self._set_initial_time, "set_initial_time")
         
