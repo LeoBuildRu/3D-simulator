@@ -277,7 +277,7 @@ class PerlinMeshGenerator:
             self.panda_app.final_model.removeNode()
             self.panda_app.final_model = None
 
-        if not hasattr(self, 'perlin_vertices_before_displace') or not self.perlin_vertices_before_displace:
+        if not hasattr(self, 'perlin_vertices_before_displace'):
             print("Нет сохраненных данных перлина")
             return False
         
@@ -665,7 +665,8 @@ class PerlinMeshGenerator:
 
         # Применение текстур и материала (как было)
         self._apply_textures_and_material(self.panda_app.final_model)
-        print(self.panda_app.calculate_mesh_volume(self.panda_app.final_model))
+        self.panda_app.actual_volume_generated = self.panda_app.calculate_mesh_volume(self.panda_app.final_model)
+        print(self.panda_app.actual_volume_generated)
 
         if self.gui:
             self.gui.log_message("✅ Текстуры применены")

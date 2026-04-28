@@ -1829,6 +1829,7 @@ class CameraControlGUI(QWidget):
         if model_set_name in self.models_config:
             config = self.models_config[model_set_name]
             max_volume = config.get('max_volume', 'N/A')
+            self.panda_app.max_volume = max_volume
             
             if "cam_pos_x" in config:
                 self.panda_app.camera.set_pos(config["cam_pos_x"], config["cam_pos_y"], config["cam_pos_z"])
@@ -1947,12 +1948,14 @@ class CameraControlGUI(QWidget):
             return
 
         # Формируем конфиг, который будет передан в panda_app
+        source_config = self.models_config.get(model_set_name, {})
         model_config = {
             'cuzov': cached_paths.get('cuzov'),
             'napolnitel': cached_paths.get('napolnitel'),
             'other': cached_paths.get('other'),
             'max_volume': cached_paths.get('max_volume'),
-            'ground_plane': cached_paths.get('ground_plane')
+            'ground_plane': cached_paths.get('ground_plane'),
+            'points_3d': source_config.get('points_3d')
         }
 
         # Загружаем модели в сцену

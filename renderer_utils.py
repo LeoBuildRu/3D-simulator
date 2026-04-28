@@ -12,6 +12,47 @@ class RendererUtils:
     def __init__(self, panda_app):
         self.panda_app = panda_app
 
+    def _get_top_points_3d_from_model_config(self):
+        points_3d = None
+
+        current_config = getattr(self.panda_app, "current_model_config", None)
+        if isinstance(current_config, dict):
+            points_3d = current_config.get("points_3d")
+
+        if points_3d is None:
+            model_set = getattr(self.panda_app, "current_model_set", None)
+            gui = getattr(self.panda_app, "gui", None)
+            models_config = getattr(gui, "models_config", None) if gui else None
+
+            if isinstance(models_config, dict):
+                config = models_config.get(model_set) if model_set else None
+
+                if (not isinstance(config, dict) and gui and
+                        hasattr(gui, "model_set_combo")):
+                    combo_set = gui.model_set_combo.currentText()
+                    config = models_config.get(combo_set)
+
+                if isinstance(config, dict):
+                    points_3d = config.get("points_3d")
+
+        if not isinstance(points_3d, list):
+            return []
+
+        normalized_points = []
+        for point in points_3d:
+            if not isinstance(point, (list, tuple)) or len(point) != 3:
+                continue
+            try:
+                normalized_points.append((
+                    float(point[0]),
+                    float(point[1]),
+                    float(point[2])
+                ))
+            except (TypeError, ValueError):
+                continue
+
+        return normalized_points
+
     def barrel_distortion(self, img, k1=0.15, k2=0.35):
         tex = Texture()
         tex.load(img)
@@ -151,13 +192,8 @@ class RendererUtils:
             cx = orig_width / 2.0
             cy = orig_height / 2.0
         
-        # Определяем 3D точки для преобразования
-        top_points_3d = [
-            (-1.03, -2.22, 2.4),   # bottom_left_top
-            (-1.03, 2.4, 2.4),     # top_left_top
-            (1.045, 2.4, 2.4),     # top_right_top
-            (1.045, -2.22, 2.4)    # bottom_right_top
-        ]
+        # Берем точки из конфига текущего набора моделей.
+        top_points_3d = self._get_top_points_3d_from_model_config()
         
         top_points_2d = []
         distances_to_camera = []  # Для хранения расстояний до камеры
@@ -412,11 +448,13 @@ class RendererUtils:
         render_metadata["distances_to_camera"] = distances_to_camera
         
         # Добавляем Target_Volume
-        if hasattr(self.panda_app, 'Target_Volume'):
-            render_metadata["target_volume"] = self.panda_app.Target_Volume
+        if hasattr(self.panda_app, 'actual_volume_generated'):
+            render_metadata["target_volume"] = self.panda_app.actual_volume_generated
         else:
             render_metadata["target_volume"] = None
         
+        #render_metadata["actual_volume"] =  self.panda_app.actual_volume_generated
+
         # Добавляем current_texture_set['diffuse']
         if (hasattr(self.panda_app, 'current_texture_set') and 
             self.panda_app.current_texture_set and 
@@ -480,15 +518,17 @@ class RendererUtils:
             camera_fov_x = camera_fov_y = None
         
         self.panda_app.depth_renderer.set_overlay_visibility(False)
+        self.panda_app.depth_renderer.update_depth_texture()
         self.wait_panda_render()
+        self.panda_app.depth_renderer.update_depth_texture()
 
         img = PNMImage()
         if not self.panda_app.win.getScreenshot(img):
             return False
-            
+
         self.panda_app.depth_renderer.set_overlay_visibility(True)
 
-        time.sleep(0.5)
+        #time.sleep(0.5)
 
         self.wait_panda_render()
         
@@ -546,11 +586,21 @@ class RendererUtils:
         fixed_hpr = (89.99999237060547, -66.110355377197266, 0.0)
         fixed_fov_x = 48.0
         fixed_fov_y = 26.14091682434082
+
+        min_value = 1.0
+        max_value = self.panda_app.max_volume
+
+        volume_steps = 10 # should be 2 or more
+        passes_per_volume = 1
+
+        volume_step = (max_value - min_value) / (volume_steps - 1)
         
-        volumes = [0.5 + i * 0.5 for i in range(99)] 
-        passes_per_volume = 4
+        volumes = [min_value + i * volume_step for i in range(volume_steps)] 
         
         total_renders = len(volumes) * passes_per_volume
+
+        print(f"Rendering {total_renders} dataset renders")
+
         current_render = 0
         
         for i, volume in enumerate(volumes):
@@ -558,29 +608,15 @@ class RendererUtils:
                 current_render += 1
                 
                 self.panda_app.Target_Volume = volume
+                self.panda_app.gui.target_volume_spinbox.setValue(volume)
                 
-                self.panda_app.clear_scene()
-                self.panda_app.load_gltf_model(self.panda_app.current_other_path)
-                self.panda_app.load_gltf_model(self.panda_app.current_cuzov_path)
-                self.panda_app.load_gltf_model(self.panda_app.current_napolnitel_path)
+                self.panda_app.gui.run_full_process()
+
+                self.wait_panda_render()
                 
-                self.panda_app.create_ground_plane()
-                if hasattr(self.panda_app, 'current_ground_plane_z'):
-                    self.panda_app.ground_plane.setPos(0, 0, self.panda_app.current_ground_plane_z)
-                
-                success_aabb = self.panda_app.perform_AABB_plane()
-                if not success_aabb:
-                    continue
-                
-                if not hasattr(self.panda_app, 'Perlin_Seed'):
-                    self.panda_app.Perlin_Seed = random.randint(0, 10000000)
-                else:
-                    self.panda_app.Perlin_Seed = random.randint(0, 10000000) + pass_num * 1000000 + i * 100000000
-                
-                success_perlin = self.panda_app.perlin_generator.generate_perlin_mesh_from_csg()
-                if not success_perlin:
-                    continue
-                
+                self.save_single_render()
+
+                continue
                 time.sleep(1.0)
                 
                 self.panda_app.camera.setPos(*fixed_pos)

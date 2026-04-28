@@ -294,6 +294,7 @@ class MyApp(ShowBase):
         self.next_model_x = 0
 
         self.current_model_set = None
+        self.current_model_config = {}
 
         # временный флаг:
         self.particle_flag = False
@@ -1501,7 +1502,7 @@ class MyApp(ShowBase):
         model_np.set_hpr(0, 0, 0) 
         model_np.set_scale(1)
 
-        self.add_scene_points()
+        #self.add_scene_points()
         self.taskMgr.do_method_later(0.5, self._set_initial_time, "set_initial_time")
         
         # # Очищаем существующие источники света
@@ -1873,6 +1874,7 @@ class MyApp(ShowBase):
             self.current_ground_plane_z = config['ground_plane']
         
         self.current_model_set = model_set_name
+        self.current_model_config = dict(config) if isinstance(config, dict) else {}
         self.update_overlay_info(model=model_set_name)
         
         if hasattr(self, 'perlin_model') and self.perlin_model:

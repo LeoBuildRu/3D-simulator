@@ -12,6 +12,8 @@ class DepthMapRenderer:
         self.gradient_end = 0.4
         self.depth_buffer = None
         self.depth_camera_np = None
+        self.last_width = 0
+        self.last_height = 0
         self.setup_depth_render()
         self.setup_depth_overlay()
 
@@ -24,10 +26,65 @@ class DepthMapRenderer:
         self.gradient_end = value
         if self.overlay_node:
             self.overlay_node.setShaderInput("gradientEnd", value)
+
+    def should_upd_tex(self):
+        win_width, win_height = self._get_window_size()
+        if win_width <= 0 or win_height <= 0:
+            return False
+        return self.last_width != win_width or self.last_height != win_height
+
+    def _get_window_size(self):
+        win = getattr(self.base, "win", None)
+        if not win and hasattr(self.base, "render_pipeline"):
+            rp_base = getattr(self.base.render_pipeline, "_showbase", None)
+            if rp_base:
+                win = getattr(rp_base, "win", None)
+
+        if not win:
+            return 0, 0
+
+        if hasattr(win, "get_x_size"):
+            return win.get_x_size(), win.get_y_size()
+        return win.getXSize(), win.getYSize()
+
+    def _remove_depth_buffer(self):
+        if not self.depth_buffer:
+            return
+        if hasattr(self.base.graphicsEngine, "remove_window"):
+            self.base.graphicsEngine.remove_window(self.depth_buffer)
+        else:
+            self.base.graphicsEngine.removeWindow(self.depth_buffer)
+        self.depth_buffer = None
+
+    def _remove_nodepath(self, nodepath):
+        if not nodepath:
+            return
+        if hasattr(nodepath, "remove_node"):
+            nodepath.remove_node()
+        else:
+            nodepath.removeNode()
+
+    def _rebuild_depth_render(self):
+        self._remove_depth_buffer()
+        if self.depth_camera_np:
+            self._remove_nodepath(self.depth_camera_np)
+            self.depth_camera_np = None
+        self.setup_depth_render()
+        if self.overlay_node and self.depth_texture:
+            self.overlay_node.setShaderInput("depthMap", self.depth_texture)
+
+    def sync_with_window_size(self, force=False):
+        if not force and not self.should_upd_tex():
+            return False
+        self._rebuild_depth_render()
+        return True
     
     def setup_depth_render(self):
-        win_width = 1920
-        win_height = 1080
+        win_width, win_height = self._get_window_size()
+        if win_width <= 0 or win_height <= 0:
+            return
+        self.last_width = win_width
+        self.last_height = win_height
         
         self.depth_texture = Texture()
         self.depth_texture.setup_2d_texture(win_width, win_height, Texture.T_float, Texture.F_depth_component32)
@@ -79,8 +136,9 @@ class DepthMapRenderer:
         depth_region.set_clear_color_active(False)
             
     def setup_depth_overlay(self):
-        win_width = self.base.win.getXSize()
-        win_height = self.base.win.getYSize()
+        if self.overlay_node:
+            self._remove_nodepath(self.overlay_node)
+            self.overlay_node = None
 
         cm = CardMaker('depth_overlay')
         cm.setFrame(-1, 1, -1, 1)
@@ -117,9 +175,9 @@ class DepthMapRenderer:
         void main() {
             float depth = texture(depthMap, texcoord).r;
             float linear_depth = linearize_depth(depth);
-            float normalized_depth = (linear_depth - gradientStart) / (gradientEnd - gradientStart);
+            float normalized_depth = linear_depth;// - gradientStart) / (gradientEnd - gradientStart);
             normalized_depth = clamp(normalized_depth, 0.0, 1.0);
-            float t = 1.0 - normalized_depth;
+            float t = normalized_depth;
             vec3 color;
 
             fragColor = vec4(t, t, t, 1.0);
@@ -170,6 +228,8 @@ class DepthMapRenderer:
         self.overlay_node.hide()
     
     def update_depth_texture(self):
+        self.sync_with_window_size()
+
         if not hasattr(self, 'depth_buffer') or not self.depth_buffer:
             return False
         
@@ -219,13 +279,16 @@ class DepthMapRenderer:
     def toggle_overlay(self):
         if self.overlay_node:
             if self.overlay_node.isHidden():
-                self.overlay_node.show()
+                self.set_overlay_visibility(True)
             else:
-                self.overlay_node.hide()
+                self.set_overlay_visibility(False)
             return not self.overlay_node.isHidden()
         return False
     
     def set_overlay_visibility(self, visible):
+        if self.sync_with_window_size():
+            self.update_depth_texture()
+            
         if self.overlay_node:
             if visible:
                 self.overlay_node.show()
