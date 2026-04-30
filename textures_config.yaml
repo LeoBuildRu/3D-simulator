@@ -72,9 +72,9 @@ groundV2_4k:
   displacement: "textures/groundV2_4k/Ground_height.jpg"
   normal: "textures/groundV2_4k/Ground_normal.jpg"
   roughness: "textures/groundV2_4k/Ground_roughness.jpg"
-  textureRepeatX: 1.2
-  textureRepeatY: 3.0
-  strength: 0.05
+  textureRepeatX: 0.7
+  textureRepeatY: 1.8
+  strength: 1.0
   mesh_distributions:
   - mesh: "models/distribution_meshes/rock_lp3.gltf"
     count: 5000

@@ -1,4 +1,4 @@
-# gui.py
+﻿# gui.py
 import random
 import math
 import os
@@ -1793,11 +1793,9 @@ class CameraControlGUI(QWidget):
 
         return target_model_trimesh
     
-    def load_models_config_from_server(self, mustUseLocal = False):
+    def load_models_config_from_server(self):
         """Загружает конфигурацию моделей с сервера, в случае неудачи использует локальный YAML."""
         try:
-            if(mustUseLocal):
-                raise Exception("для тестирования был выбран локальный конфиг")
             config_data = self.panda_app.tls_client.get_models_config()
             # Преобразуем относительные пути в абсолютные (как в исходном load_models_config)
             for key in config_data:
@@ -1829,15 +1827,6 @@ class CameraControlGUI(QWidget):
         if model_set_name in self.models_config:
             config = self.models_config[model_set_name]
             max_volume = config.get('max_volume', 'N/A')
-            self.panda_app.max_volume = max_volume
-            
-            if "cam_pos_x" in config:
-                self.panda_app.camera.set_pos(config["cam_pos_x"], config["cam_pos_y"], config["cam_pos_z"])
-                self.panda_app.camera.set_hpr(config["cam_rot_h"], config["cam_rot_p"], config["cam_rot_r"])
-                print("Позиция бортовой камеры установлена из конфига")
-            else:
-                print("В конфиге не была найдена позиция бортовой камеры")
-
             info_text = f"<b>{model_set_name}</b><br>"
             info_text += f"Макс. объем: {max_volume}<br>"
 
@@ -1948,14 +1937,12 @@ class CameraControlGUI(QWidget):
             return
 
         # Формируем конфиг, который будет передан в panda_app
-        source_config = self.models_config.get(model_set_name, {})
         model_config = {
             'cuzov': cached_paths.get('cuzov'),
             'napolnitel': cached_paths.get('napolnitel'),
             'other': cached_paths.get('other'),
             'max_volume': cached_paths.get('max_volume'),
-            'ground_plane': cached_paths.get('ground_plane'),
-            'points_3d': source_config.get('points_3d')
+            'ground_plane': cached_paths.get('ground_plane')
         }
 
         # Загружаем модели в сцену

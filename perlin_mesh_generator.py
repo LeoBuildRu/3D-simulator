@@ -277,7 +277,7 @@ class PerlinMeshGenerator:
             self.panda_app.final_model.removeNode()
             self.panda_app.final_model = None
 
-        if not hasattr(self, 'perlin_vertices_before_displace'):
+        if not hasattr(self, 'perlin_vertices_before_displace') or len(self.perlin_vertices_before_displace) == 0:
             print("Нет сохраненных данных перлина")
             return False
         
@@ -373,11 +373,22 @@ class PerlinMeshGenerator:
             geom = geom_node.getGeom(0)
             vdata = geom.getVertexData()
             
+            # Создаём копию вершинных данных
             new_vdata = GeomVertexData(vdata)
-            new_geom = Geom(new_vdata)
             
-            vertex_reader = GeomVertexReader(new_vdata, "vertex")
+            # ---------- БЛОК ИНВЕРСИИ НОРМАЛЕЙ ----------
+            # Важно: создаём Writer до Reader'ов, чтобы не нарушить целостность данных
+            normal_writer = GeomVertexWriter(new_vdata, "normal")
             normal_reader = GeomVertexReader(new_vdata, "normal")
+            
+            while not normal_reader.isAtEnd():
+                n = normal_reader.getData3f()
+                normal_writer.setData3f(-n.x, -n.y, -n.z)
+            # --------------------------------------------
+            
+            # Теперь создаём остальные Reader'ы и Writer'ы
+            vertex_reader = GeomVertexReader(new_vdata, "vertex")
+            normal_reader = GeomVertexReader(new_vdata, "normal")  # пересоздаём, т.к. старый уже в конце
             texcoord_writer = GeomVertexWriter(new_vdata, "texcoord")
             
             vertices_with_normals = []
@@ -410,6 +421,7 @@ class PerlinMeshGenerator:
                 v = (vertex.y + half_size_y) / size_y * texture_repeatY
                 texcoord_writer.setData2f(u, v)
             
+            new_geom = Geom(new_vdata)
             for i in range(geom.getNumPrimitives()):
                 prim = geom.getPrimitive(i)
                 new_geom.addPrimitive(prim)
@@ -665,8 +677,7 @@ class PerlinMeshGenerator:
 
         # Применение текстур и материала (как было)
         self._apply_textures_and_material(self.panda_app.final_model)
-        self.panda_app.actual_volume_generated = self.panda_app.calculate_mesh_volume(self.panda_app.final_model)
-        print(self.panda_app.actual_volume_generated)
+        print(self.panda_app.calculate_mesh_volume(self.panda_app.final_model))
 
         if self.gui:
             self.gui.log_message("✅ Текстуры применены")

@@ -1,7 +1,7 @@
 import requests
 import os
 
-server_url = "http://192.168.123.53:9998/upload"  # замените IP/порт при необходимости
+server_url = "http://192.168.123.53:9999/upload"  # замените IP/порт при необходимости
 
 local_folder = ""
 

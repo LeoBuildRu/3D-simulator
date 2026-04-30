@@ -3,9 +3,9 @@ import os
 import traceback
 import requests
 from datetime import datetime
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtGui import QPixmap, QScreen
-from PyQt5.QtCore import PYQT_VERSION_STR
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QPixmap, QScreen
+from PyQt6.QtCore import PYQT_VERSION_STR
 
 # Флаг для предотвращения рекурсивных вызовов
 _inside_excepthook = False
@@ -28,7 +28,7 @@ class TelegramCrashReporter:
         try:
             requests.post(url, data=data, timeout=5)
         except Exception as e:
-            print(f"Failed to send Telegram message: {e}\n\nMessage: {text}")
+            print(f"Failed to send Telegram message: {e}")
 
     def send_screenshot(self, caption=''):
         """Делает скриншот главного окна и отправляет как фото."""

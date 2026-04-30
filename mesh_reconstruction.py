@@ -1,8 +1,7 @@
 # mesh_reconstruction.py
 import tkinter as tk
 from tkinter import filedialog
-from PyQt5 import *
-from PyQt5.QtWidgets import *
+# Qt is only used through panda_app.gui; no direct Qt imports needed here.
 from panda3d.core import *
 import os
 import json
@@ -1480,8 +1479,18 @@ class MeshReconstruction:
 
 
     def add_extended_mesh_to_scene(self, node):
-        if hasattr(self, "mesh_node") and self.panda_app.mesh_node:
-            self.panda_app.mesh_node.removeNode()
+        # Cleanup must check panda_app, not self.
+        old_np = getattr(self.panda_app, "mesh_node", None)
+        if old_np:
+            try:
+                old_np.removeNode()
+            except Exception:
+                pass
+            try:
+                if hasattr(self.panda_app, "loaded_models")                         and old_np in self.panda_app.loaded_models:
+                    self.panda_app.loaded_models.remove(old_np)
+            except Exception:
+                pass
         
         if node:
             self.panda_app.mesh_node = self.panda_app.render.attachNewNode(node)
@@ -1838,13 +1847,24 @@ class MeshReconstruction:
         self.run_2d_to_3d_reconstruction_from(self.recon_json_path)
     
     def run_2d_to_3d_reconstruction_from(self, json_path, ply_path=None):
-        if hasattr(self, 'final_mesh_node') and self.panda_app.final_mesh_node:
-            self.panda_app.final_mesh_node.removeNode()
-            self.panda_app.final_mesh_node = None
-
-        if hasattr(self, 'mesh_node') and self.panda_app.mesh_node:
-            self.panda_app.mesh_node.removeNode()
-            self.panda_app.mesh_node = None
+        # NB: hasattr() must check panda_app, NOT self (mesh_reconstruction)
+        # - both fields live on the Panda3D app. The old hasattr(self, ...)
+        # always returned False here so previous reconstructions left
+        # stale meshes on the scene.
+        for attr in ("final_mesh_node", "mesh_node"):
+            old_np = getattr(self.panda_app, attr, None)
+            if old_np:
+                try:
+                    old_np.removeNode()
+                except Exception:
+                    pass
+                setattr(self.panda_app, attr, None)
+                # Also drop from loaded_models if it was registered there.
+                try:
+                    if hasattr(self.panda_app, "loaded_models")                             and old_np in self.panda_app.loaded_models:
+                        self.panda_app.loaded_models.remove(old_np)
+                except Exception:
+                    pass
 
         self.log("🚀 Запуск 2D-3D реконструкции...")
         if not json_path or not os.path.isfile(json_path):
@@ -1934,26 +1954,46 @@ class MeshReconstruction:
             return
 
         self.panda_app.final_mesh_node = self.panda_app.trimesh_to_panda(mesh_node_result_trimesh)
-        
+
         # ВАЖНО: После boolean операции нужно правильно установить UV-координаты
         print(f"[DEBUG] Настройка UV-координат после boolean операции...")
-        self.panda_app.final_mesh_node = self._setup_uv_coordinates_after_boolean(self.panda_app.final_mesh_node, mesh_node)
-        
+        self.panda_app.final_mesh_node = self._setup_uv_coordinates_after_boolean(
+            self.panda_app.final_mesh_node, mesh_node
+        )
+
+        # ---- Drop the INPUT relief mesh as soon as the boolean result
+        # is on the scene. Doing this here (instead of at the very end
+        # of the function) guarantees the user never sees the
+        # height-map relief overlaid on top of the boolean mesh, even
+        # if texture application or volume calculation throws below.
+        try:
+            if mesh_node:
+                mesh_node.removeNode()
+                if hasattr(self.panda_app, "loaded_models") \
+                        and mesh_node in self.panda_app.loaded_models:
+                    self.panda_app.loaded_models.remove(mesh_node)
+            if getattr(self.panda_app, "mesh_node", None) is not None:
+                self.panda_app.mesh_node = None
+        except Exception as exc:
+            print(f"[WARN] mesh_node cleanup failed: {exc}")
+
         if self.panda_app.final_mesh_node is None or self.panda_app.final_mesh_node.is_empty():
             print(f"[ERROR] Не удалось создать меш с UV-координатами")
-            self.log("❌ Не удалось создать меш с UV-координатами") 
+            self.log("❌ Не удалось создать меш с UV-координатами")
             return
-        
+
         print(f"[DEBUG] final_mesh_node после настройки UV: is_empty={self.panda_app.final_mesh_node.is_empty()}")
-        
+
         # Применяем текстуры и материал
         print(f"[DEBUG] Применение текстур к финальному мешу...")
-        self._apply_textures_and_material(self.panda_app.final_mesh_node)
-        print(self.panda_app.calculate_mesh_volume(self.panda_app.final_mesh_node))
+        try:
+            self._apply_textures_and_material(self.panda_app.final_mesh_node)
+            print(self.panda_app.calculate_mesh_volume(self.panda_app.final_mesh_node))
 
-        # Обновляем объём в оверлее
-        volume = self.panda_app.calculate_mesh_volume(self.panda_app.final_mesh_node)
-        self.panda_app.update_overlay_info(volume=volume)
-        
-        mesh_node.removeNode()
+            # Обновляем объём в оверлее
+            volume = self.panda_app.calculate_mesh_volume(self.panda_app.final_mesh_node)
+            self.panda_app.update_overlay_info(volume=volume)
+        except Exception as exc:
+            print(f"[WARN] post-boolean texture/volume step failed: {exc}")
+
         self.log("✅ Реконструкция завершена!")  

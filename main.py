@@ -50,7 +50,7 @@ def load_tls_config(base_path):
         return default_host, default_port
 
 # Теперь можно импортировать остальные модули
-from gui import CameraControlGUI
+# (gui import removed - new MainWindow lives in main_window.py)
 from panda_widget import Panda3DWidget
 from depth_map_renderer import DepthMapRenderer
 from perlin_mesh_generator import PerlinMeshGenerator
@@ -89,9 +89,9 @@ from PIL import Image, ImageDraw, ImageFilter
 
 import tkinter as tk
 from tkinter import filedialog
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import *
-from PyQt5.QtGui import *
+# (PyQt5 imports removed - we use PyQt6 in main())
+# (PyQt5 imports removed - we use PyQt6 in main())
+# (PyQt5 imports removed - we use PyQt6 in main())
 
 from panda3d.core import *
 
@@ -114,151 +114,20 @@ from rpcore.util.movement_controller import MovementController
 NOISE_AVAILABLE = True
 USE_SCIPY = True
 
-class MainWindowManager:
-    """Управляет главным окном, содержащим сцену и control panel"""
-    def __init__(self, panda_app):
-        self.panda_app = panda_app
-        self.qt_app = QApplication.instance() or QApplication(sys.argv)
-        
-        self.main_window = QMainWindow()
-        self.main_window.setWindowTitle('3D Scene Viewer')
-        
-        self.main_window.resize(2300, 1080)
-        self.main_window.setMinimumSize(2300, 1080)
-        
-        try:
-            self.main_window.setWindowIcon(QIcon('icon.png'))
-        except:
-            pass
-        
-        central_widget = QWidget()
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
-        
-        self.panda_container = QWidget()
-        self.panda_container.setMinimumSize(1920, 1080)  
-        self.panda_container.setStyleSheet("""
-            background-color: #000000;
-            border: 1px solid #2a2a35;
-        """)
-        
-        self.control_panel = CameraControlGUI(panda_app, main_window=self.main_window)
-        panda_app.gui = self.control_panel
-        self.control_panel.setMinimumWidth(380)
-        self.control_panel.setMaximumWidth(380)
-        
-        main_layout.addWidget(self.panda_container, 1)  
-        main_layout.addWidget(self.control_panel, 0)    
-        
-        self.main_window.setCentralWidget(central_widget)
-        
-        self.panda_timer = QTimer()
-        self.panda_timer.timeout.connect(self.update_panda)
-        self.panda_timer.start(16)  
-        
-        self.init_timer = QTimer()
-        self.init_timer.setSingleShot(True)
-        self.init_timer.timeout.connect(self.initialize_window_integration)
-        
-        self.panda_app_reference = panda_app
-        
-        self.panda_window_handle = None
-        
-    def update_panda(self):
-        self.panda_app.taskMgr.step()
-        
-    def initialize_window_integration(self):
-        if hasattr(self.panda_app, 'win') and self.panda_app.win:
-            self.panda_window_handle = self.panda_app.win.getWindowHandle()
-            
-            if self.panda_window_handle:
-                container_hwnd = int(self.panda_container.winId())
-                
-                win32gui.SetParent(self.panda_window_handle, container_hwnd)
-                
-                style = win32gui.GetWindowLong(self.panda_window_handle, win32con.GWL_STYLE)
-                style = style & ~(win32con.WS_CAPTION | win32con.WS_THICKFRAME | 
-                                 win32con.WS_MINIMIZEBOX | win32con.WS_MAXIMIZEBOX | 
-                                 win32con.WS_SYSMENU | win32con.WS_BORDER | 
-                                 win32con.WS_DLGFRAME)
-                style = style | win32con.WS_CHILD
-                win32gui.SetWindowLong(self.panda_window_handle, win32con.GWL_STYLE, style)
-                
-                self.update_panda_window_position()
-                
-    
-    def update_panda_window_position(self):
-        if self.panda_window_handle:
-            container_rect = self.panda_container.geometry()
-            width = container_rect.width()
-            height = container_rect.height()
-            
-            win32gui.MoveWindow(self.panda_window_handle, 0, 0, width, height, True)
-            
-            win32gui.ShowWindow(self.panda_window_handle, win32con.SW_SHOW)
-            win32gui.UpdateWindow(self.panda_window_handle)
-                
-    
-    def resizeEvent(self, event):
-        self.update_panda_window_position()
-        super().resizeEvent(event)
-    
-    def show(self):
-        screen_geometry = self.qt_app.primaryScreen().geometry()
-        window_size = self.main_window.size()
-        x = (screen_geometry.width() - window_size.width()) // 2
-        y = (screen_geometry.height() - window_size.height()) // 2
-        self.main_window.move(x, y)
-        
-        self.main_window.show()
-        
-        self.init_timer.start(500)
-        
-        self.position_timer = QTimer()
-        self.position_timer.timeout.connect(self.update_panda_window_position)
-        self.position_timer.start(100)  
-        
-        self.main_window.raise_()
-        self.main_window.activateWindow()
-        
-    def run(self):
-        self.show()
-        return self.qt_app.exec_()
-    
-class CrashReportingApplication(QApplication):
-    """QApplication с перехватом исключений в слотах."""
-    def notify(self, receiver, event):
-        try:
-            return super().notify(receiver, event)
-        except Exception:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            reporter = TelegramCrashReporter(BOT_TOKEN, CHAT_ID)
-            reporter.report_exception(exc_type, exc_value, exc_traceback)
-            sys.exit(1)  # завершаем приложение после краша
-            return False
-
-def global_exception_handler(exc_type, exc_value, exc_traceback):
-    """Глобальный обработчик неперехваченных исключений."""
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-    reporter = TelegramCrashReporter(BOT_TOKEN, CHAT_ID)
-    reporter.report_exception(exc_type, exc_value, exc_traceback)
-    sys.exit(1)
-
-# Устанавливаем глобальный обработчик
-sys.excepthook = global_exception_handler
-
 class MyApp(ShowBase):
-    def __init__(self, tls_host="78.25.191.12", tls_port=9998):
+    def __init__(self, parent_hwnd: int,
+                 init_size: tuple = (1920, 1080),
+                 tls_host: str = "78.25.191.12",
+                 tls_port: int = 9998):
         self.render_pipeline = RenderPipeline()
         self.render_pipeline.pre_showbase_init()
         
-        loadPrcFileData("", "win-size 1920 1080")  
-        loadPrcFileData("", "window-type embedded")
+        w, h = init_size
+        loadPrcFileData("", f"win-size {w} {h}")
+        loadPrcFileData("", "window-type onscreen")
+        loadPrcFileData("", f"parent-window-handle {int(parent_hwnd)}")
         loadPrcFileData("", "fullscreen false")
-        loadPrcFileData("", "undecorated true")  
+        loadPrcFileData("", "undecorated true")
 
         ShowBase.__init__(self)
 
@@ -289,12 +158,38 @@ class MyApp(ShowBase):
         self.model_paths = {}
 
         self.setup_scene()
-        self.create_top_overlay()
+        # ---- Static base scene model -------------------------------------
+        # Loads base_without_ground.bam from <project>/models on every
+        # launch as the static environment of the scene.
+        try:
+            base_path = os.path.join(PROJECT_ROOT, "models",
+                                     "base_without_ground.bam")
+            if os.path.exists(base_path):
+                p3d_path = Filename.fromOsSpecific(base_path).getFullpath()
+                base_np = self.loader.load_model(p3d_path, noCache=True)
+                if base_np is not None:
+                    base_np.reparent_to(self.render)
+                    base_np.set_pos(0, 0, 0)
+                    base_np.set_shader_auto()
+                    self.base_static_model = base_np
+                    print(f"[Scene] base_without_ground.bam loaded from "
+                          f"{base_path}")
+                else:
+                    print(f"[Scene] loader returned None for {base_path}")
+            else:
+                print(f"[Scene] base_without_ground.bam not found at "
+                      f"{base_path}")
+        except Exception as exc:
+            print(f"[Scene] base_without_ground.bam load failed: {exc}")
+            self.base_static_model = None
+
+        # create_top_overlay() removed - the 'Время проезда' DirectFrame
+        # is no longer part of the new UI. self.top_overlay stays None.
+        self.top_overlay = None
 
         self.next_model_x = 0
 
         self.current_model_set = None
-        self.current_model_config = {}
 
         # временный флаг:
         self.particle_flag = False
@@ -381,6 +276,20 @@ class MyApp(ShowBase):
         self.renderer_utils = RendererUtils(self)
 
         self.mesh_reconstruction = MeshReconstruction(self, tls_client=self.tls_client)
+
+        # ------------------------------------------------------------------
+        # Camera bindings: override the legacy SPACE/SHIFT for up/down and
+        # mouse1-as-rotation behaviour with the editor-style FlyCamera
+        # (WASD, Q/E up/down, Shift sprint, RMB-look).
+        # ------------------------------------------------------------------
+        try:
+            for ev in ("space", "space-up", "shift", "shift-up",
+                       "mouse1", "mouse1-up"):
+                self.ignore(ev)
+            from camera_controller import FlyCamera
+            self.fly_cam = FlyCamera(self)
+        except Exception as exc:
+            print(f"[MyApp] FlyCamera init failed: {exc}")
 
         # try:
         #     print("send request to server")
@@ -595,9 +504,9 @@ class MyApp(ShowBase):
         # DGG.setDefaultFont(self.ui_font)
 
         # Цвета в формате (r, g, b, a) от 0 до 1
-        bg_color = (0.102, 0.102, 0.129, 0.0)        # #1a1a21
-        accent_color = (0.29, 0.50, 0.75, 0.0)       # #4a7fbe
-        text_color = (1.0, 1.0, 1.0, 0.0)            # белый
+        bg_color = (0.102, 0.102, 0.129, 1.0)        # #1a1a21
+        accent_color = (0.29, 0.50, 0.75, 1.0)       # #4a7fbe
+        text_color = (1.0, 1.0, 1.0, 1.0)            # белый
 
         panel_width = 500
         panel_height = 220                            # увеличено для заголовка
@@ -1329,7 +1238,6 @@ class MyApp(ShowBase):
         from panda3d.core import Texture, TextureStage, Material, GeomVertexFormat, GeomVertexData, \
             GeomVertexWriter, GeomTriangles, Geom, GeomNode, LPoint3f
 
-
         size_x = 2000.0
         size_y = 2000.0
         size_z = 2.0
@@ -1488,21 +1396,8 @@ class MyApp(ShowBase):
     def setup_scene(self):
         self.quarry_model = None
         
-        #self.create_perlin_noise_mesh()
-
-        file_path = "models/base.bam"
-
-        model_filename = Filename.from_os_specific(file_path)
-        
-        model_np = self.loader.load_model(model_filename, noCache=True) 
-        
-        model_np.reparent_to(self.render)
-        self.render_pipeline.prepare_scene(model_np)
-        model_np.set_pos(0, 0, 0)
-        model_np.set_hpr(0, 0, 0) 
-        model_np.set_scale(1)
-
-        #self.add_scene_points()
+        self.create_perlin_noise_mesh()
+        self.add_scene_points()
         self.taskMgr.do_method_later(0.5, self._set_initial_time, "set_initial_time")
         
         # # Очищаем существующие источники света
@@ -1874,7 +1769,6 @@ class MyApp(ShowBase):
             self.current_ground_plane_z = config['ground_plane']
         
         self.current_model_set = model_set_name
-        self.current_model_config = dict(config) if isinstance(config, dict) else {}
         self.update_overlay_info(model=model_set_name)
         
         if hasattr(self, 'perlin_model') and self.perlin_model:
@@ -1946,103 +1840,132 @@ class MyApp(ShowBase):
         
         self.loaded_models = models_to_keep
         
+
+    # ==================================================================
+    # Model-set caching (ported from legacy gui.py)
+    # ==================================================================
+    def get_cache_dir(self):
+        """Return the global cache dir for downloaded model sets."""
+        cache_dir = os.path.join(tempfile.gettempdir(), "vizutil_models_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def download_and_cache_model_set(self, set_name: str, set_config: dict) -> dict:
+        """
+        Download textures + cuzov/napolnitel/other .bam files for the given
+        model set into %TEMP%/vizutil_models_cache and return a dict with
+        absolute local paths and (max_volume, ground_plane) metadata.
+        Mirrors the legacy gui.py implementation.
+        """
+        if not isinstance(set_config, dict):
+            raise ValueError(f"set_config for '{set_name}' is not a dict")
+
+        cache_dir = self.get_cache_dir()
+        downloaded_paths = {}
+
+        # --- 1. Textures ------------------------------------------------
+        textures_dir_rel = set_config.get("textures_dir")
+        if textures_dir_rel:
+            textures_basename = os.path.basename(textures_dir_rel.rstrip("/\\"))
+            textures_cache_dir = os.path.join(cache_dir, textures_basename)
+            os.makedirs(textures_cache_dir, exist_ok=True)
+            try:
+                texture_files = self.tls_client.get_texture_list(textures_dir_rel)
+            except Exception as exc:
+                print(f"[cache] get_texture_list({textures_dir_rel}) failed: {exc}")
+                texture_files = []
+            for filename in texture_files:
+                local_tex_path = os.path.join(textures_cache_dir, filename)
+                if not os.path.exists(local_tex_path):
+                    try:
+                        self.tls_client.download_texture_file(
+                            textures_dir_rel, filename, local_tex_path
+                        )
+                    except Exception as exc:
+                        print(f"[cache] download_texture_file {filename} failed: {exc}")
+
+        # --- 2. Models (.bam) ------------------------------------------
+        for ftype in ("cuzov", "napolnitel", "other"):
+            if ftype not in set_config or not set_config[ftype]:
+                continue
+            remote_rel_path = set_config[ftype]
+            filename = os.path.basename(remote_rel_path)
+            local_file = os.path.join(cache_dir, filename)
+            if not os.path.exists(local_file):
+                try:
+                    self.tls_client.download_model_file(set_name, ftype, local_file)
+                except Exception as exc:
+                    print(f"[cache] download_model_file {ftype} for "
+                          f"'{set_name}' failed: {exc}")
+                    continue
+            downloaded_paths[ftype] = local_file
+
+        downloaded_paths["max_volume"] = set_config.get("max_volume")
+        downloaded_paths["ground_plane"] = set_config.get("ground_plane")
+        return downloaded_paths
+
+    def cache_and_load_model_set(self, set_name: str, set_config: dict) -> bool:
+        """
+        One-shot helper: download (if needed) + load the selected model set
+        into the active Panda3D scene. Replaces gui.py.load_selected_model_set.
+        """
+        try:
+            cached = self.download_and_cache_model_set(set_name, set_config)
+        except Exception as exc:
+            print(f"[cache] failed to cache '{set_name}': {exc}")
+            return False
+
+        model_config = {
+            "cuzov":        cached.get("cuzov"),
+            "napolnitel":   cached.get("napolnitel"),
+            "other":        cached.get("other"),
+            "max_volume":   cached.get("max_volume"),
+            "ground_plane": cached.get("ground_plane"),
+        }
+        try:
+            return bool(self.load_model_set(model_config, set_name))
+        except Exception as exc:
+            print(f"[cache] load_model_set('{set_name}') failed: {exc}")
+            return False
+
+
 def main():
-    app = CrashReportingApplication(sys.argv)
+    """
+    Entry point: build the new MainWindow first (so its `panda_container`
+    has a real HWND), then start `MyApp(ShowBase)` parented to that HWND.
+    """
+    # PyQt6 application + new top-level window
+    from PyQt6.QtWidgets import QApplication as _QApplication
+    from main_window import MainWindow
 
+    qt_app = _QApplication(sys.argv)
+
+    win = MainWindow()
+    win.show()
+
+    # Force Qt to actually allocate the native HWND before we ask Panda
+    # to embed into it.
+    qt_app.processEvents()
+    parent_hwnd = win.panda_container_hwnd()
+
+    # Resolve the active TLS server from tls_config.yaml (active=True),
+    # falling back to the legacy default.
     tls_host, tls_port = load_tls_config(base_path)
-    
-    main_window = QMainWindow()
-    main_window.setWindowTitle('3D simulator')
-    main_window.resize(1400, 800)               # начальный размер окна
-    main_window.setMinimumSize(1024, 600)       # минимальный размер
-    
-    central_widget = QWidget()
-    main_layout = QHBoxLayout(central_widget)
-    main_layout.setContentsMargins(0, 0, 0, 0)
-    main_layout.setSpacing(0)
-    
-    panda_container = QWidget()
-    panda_container.setMinimumSize(640, 480)    # минимальный размер для 3D‑вида
-    panda_container.setStyleSheet("background-color: #000000;")
-    
-    loadPrcFileData("", "win-size 1024 768")    # начальный размер окна Panda3D
-    loadPrcFileData("", "undecorated true")
-    loadPrcFileData("", "fullscreen false")
-    loadPrcFileData("", "window-type offscreen")
-    
-    panda_app = MyApp(tls_host=tls_host, tls_port=tls_port)
-    
-    control_panel = CameraControlGUI(panda_app, main_window=main_window)
-    panda_app.gui = control_panel
-    if hasattr(panda_app, 'perlin_generator'):
-        panda_app.perlin_generator.gui = control_panel
-    control_panel.setFixedWidth(380)             # ширина панели фиксирована
-    # Панель растягивается по высоте вместе с окном
-    control_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-    
-    main_layout.addWidget(panda_container, 1)    # контейнер занимает всё доступное место
-    main_layout.addWidget(control_panel, 0)      # панель с фиксированной шириной
-    
-    main_window.setCentralWidget(central_widget)
-    
-    def update_panda():
-        panda_app.taskMgr.step()
 
-    timer = QTimer()
-    timer.timeout.connect(update_panda)
-    timer.start(16)
-    
-    # Функция обновления размеров встроенного окна Panda3D
-    def update_panda_window():
-        if hasattr(panda_app, 'panda_hwnd') and panda_app.panda_hwnd:
-            if win32gui.IsWindow(panda_app.panda_hwnd):
-                rect = panda_container.geometry()
-                win32gui.MoveWindow(panda_app.panda_hwnd, 0, 0, rect.width(), rect.height(), True)
-    
-    def initialize_integration():
-        if hasattr(panda_app, 'win') and panda_app.win:
-            container_hwnd = int(panda_container.winId())
-            
-            def enum_windows_callback(hwnd, results):
-                if win32gui.IsWindowVisible(hwnd):
-                    class_name = win32gui.GetClassName(hwnd)
-                    window_text = win32gui.GetWindowText(hwnd)
-                    if 'Panda' in window_text or 'panda' in class_name.lower():
-                        results.append(hwnd)
-                return True
-            
-            results = []
-            win32gui.EnumWindows(enum_windows_callback, results)
-            
-            if results:
-                hwnd = results[0]
-                win32gui.SetParent(hwnd, container_hwnd)
-                
-                # Убираем заголовок и рамки
-                style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-                style = style & ~(win32con.WS_CAPTION | win32con.WS_THICKFRAME | 
-                                 win32con.WS_MINIMIZEBOX | win32con.WS_MAXIMIZEBOX | 
-                                 win32con.WS_SYSMENU | win32con.WS_BORDER | 
-                                 win32con.WS_DLGFRAME)
-                style = style | win32con.WS_CHILD
-                win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
-                
-                # Устанавливаем правильный размер и показываем
-                update_panda_window()
-                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-                win32gui.UpdateWindow(hwnd)
-                
-                panda_app.panda_hwnd = hwnd
-    
-    QTimer.singleShot(500, initialize_integration)
-    
-    # Таймер для синхронизации размеров при изменении окна
-    position_timer = QTimer()
-    position_timer.timeout.connect(update_panda_window)
-    position_timer.start(100)
-    
-    main_window.show()
-    sys.exit(app.exec_())
+    init_w = max(1, win.panda_container.width())
+    init_h = max(1, win.panda_container.height())
+
+    panda_app = MyApp(
+        parent_hwnd=parent_hwnd,
+        init_size=(init_w, init_h),
+        tls_host=tls_host,
+        tls_port=tls_port,
+    )
+
+    # Wire telemetry, controls hint, fly-cam, right panel into the Qt window.
+    win.attach_panda(panda_app)
+
+    sys.exit(qt_app.exec())
 
 
 if __name__ == "__main__":
