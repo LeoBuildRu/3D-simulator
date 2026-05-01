@@ -143,7 +143,10 @@ class Plugin(BasePlugin):
                 self.dist_shadow_stage.active = True
 
         if self.update_enabled:
-            self.camera_rig.update(Globals.base.camera, sun_vector)
+            try:
+                self.camera_rig.update(Globals.base.camera, sun_vector)
+            except:
+                print("bruh")
 
             # Eventually reset cache
             cache_diff = Globals.clock.get_frame_time() - self.last_cache_reset

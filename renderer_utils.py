@@ -449,11 +449,16 @@ class RendererUtils:
         
         # Добавляем Target_Volume
         if hasattr(self.panda_app, 'actual_volume_generated'):
-            render_metadata["target_volume"] = self.panda_app.actual_volume_generated
+            render_metadata["actual_volume"] = self.panda_app.actual_volume_generated
+        else:
+            render_metadata["actual_volume"] = None
+
+        if hasattr(self.panda_app, 'Target_Volume'):
+            render_metadata["target_volume"] = self.panda_app.Target_Volume
         else:
             render_metadata["target_volume"] = None
-        
-        #render_metadata["actual_volume"] =  self.panda_app.actual_volume_generated
+
+        render_metadata["time_of_day"] = self.panda_app.render_pipeline.daytime_mgr.time
 
         # Добавляем current_texture_set['diffuse']
         if (hasattr(self.panda_app, 'current_texture_set') and 
@@ -542,6 +547,7 @@ class RendererUtils:
         depthImg = self.stretch_to_1920x1080(depthImg)
         depthImg = self.fix_alpha_to_opaque(depthImg)
         
+        # note: all shit bellow ain't used anywhere :D
         output_path = self._process_render_image(
             img,
             depthImg, 
@@ -562,7 +568,8 @@ class RendererUtils:
                     "r": float(self.panda_app.camera.getR())
                 },
                 "model_set": self.panda_app.current_model_set if hasattr(self.panda_app, 'current_model_set') else None,
-                "target_volume": self.panda_app.Target_Volume
+                "target_volume": self.panda_app.Target_Volume,
+                "hello" : "world"
             }
         )
         
@@ -590,27 +597,30 @@ class RendererUtils:
         min_value = 1.0
         max_value = self.panda_app.max_volume
 
-        volume_steps = 10 # should be 2 or more
-        passes_per_volume = 1
+        volume_steps = 3 # should be 2 or more
+        time_of_day_passes = 5
 
         volume_step = (max_value - min_value) / (volume_steps - 1)
         
         volumes = [min_value + i * volume_step for i in range(volume_steps)] 
         
-        total_renders = len(volumes) * passes_per_volume
+        total_renders = len(volumes) * time_of_day_passes
 
         print(f"Rendering {total_renders} dataset renders")
 
         current_render = 0
         
         for i, volume in enumerate(volumes):
-            for pass_num in range(passes_per_volume):
+            for pass_num in range(time_of_day_passes):
                 current_render += 1
+
+                self.panda_app.gui.change_time_of_day(round(pass_num * 24.0 * 60.0 / time_of_day_passes))
                 
-                self.panda_app.Target_Volume = volume
-                self.panda_app.gui.target_volume_spinbox.setValue(volume)
-                
-                self.panda_app.gui.run_full_process()
+                if(i > 0):
+                    self.panda_app.Target_Volume = volume
+                    self.panda_app.gui.target_volume_spinbox.setValue(volume)
+                    
+                    self.panda_app.gui.run_full_process()
 
                 self.wait_panda_render()
                 

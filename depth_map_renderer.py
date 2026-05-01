@@ -7,7 +7,7 @@ class DepthMapRenderer:
         self.depth_texture = None
         self.overlay_node = None
         self.min_depth = 0.1
-        self.max_depth = 100.0
+        self.max_depth = 8.0
         self.gradient_start = 0.2
         self.gradient_end = 0.4
         self.depth_buffer = None

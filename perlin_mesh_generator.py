@@ -665,8 +665,7 @@ class PerlinMeshGenerator:
 
         # Применение текстур и материала (как было)
         self._apply_textures_and_material(self.panda_app.final_model)
-        self.panda_app.actual_volume_generated = self.panda_app.calculate_mesh_volume(self.panda_app.final_model)
-        print(self.panda_app.actual_volume_generated)
+        print(self.panda_app.calculate_mesh_volume(self.panda_app.final_model))
 
         if self.gui:
             self.gui.log_message("✅ Текстуры применены")
@@ -909,6 +908,8 @@ class PerlinMeshGenerator:
                     break
         
         mesh_np.setPos(0, 0, best_z)
+
+        self.panda_app.actual_volume_generated = best_volume
         
         if self.current_display_model is not None:
             self.current_display_model.removeNode()

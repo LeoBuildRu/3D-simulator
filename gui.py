@@ -1459,7 +1459,7 @@ class CameraControlGUI(QWidget):
         near_far_layout.addWidget(QLabel("Дальняя:"), 1, 0)
         self.max_depth_spinbox = QDoubleSpinBox()
         self.max_depth_spinbox.setRange(0.1, 10000.0)
-        self.max_depth_spinbox.setValue(100.0)
+        self.max_depth_spinbox.setValue(8.0)
         self.max_depth_spinbox.setSingleStep(1.0)
         self.max_depth_spinbox.valueChanged.connect(self.update_max_depth)
         near_far_layout.addWidget(self.max_depth_spinbox, 1, 1)
