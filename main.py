@@ -1488,9 +1488,9 @@ class MyApp(ShowBase):
     def setup_scene(self):
         self.quarry_model = None
         
-        #self.create_perlin_noise_mesh()
+        self.create_perlin_noise_mesh()
 
-        file_path = "models/base.bam"
+        file_path = "models/base_without_ground.bam"
 
         model_filename = Filename.from_os_specific(file_path)
         

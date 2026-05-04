@@ -597,8 +597,8 @@ class RendererUtils:
         min_value = 1.0
         max_value = self.panda_app.max_volume
 
-        volume_steps = 3 # should be 2 or more
-        time_of_day_passes = 5
+        volume_steps = 10 # should be 2 or more
+        time_of_day_passes = 10
 
         volume_step = (max_value - min_value) / (volume_steps - 1)
         
@@ -611,16 +611,16 @@ class RendererUtils:
         current_render = 0
         
         for i, volume in enumerate(volumes):
+            if(i > 0):
+                self.panda_app.Target_Volume = volume
+                self.panda_app.gui.target_volume_spinbox.setValue(volume)
+                
+                self.panda_app.gui.run_full_process()
+
             for pass_num in range(time_of_day_passes):
                 current_render += 1
 
                 self.panda_app.gui.change_time_of_day(round(pass_num * 24.0 * 60.0 / time_of_day_passes))
-                
-                if(i > 0):
-                    self.panda_app.Target_Volume = volume
-                    self.panda_app.gui.target_volume_spinbox.setValue(volume)
-                    
-                    self.panda_app.gui.run_full_process()
 
                 self.wait_panda_render()
                 
