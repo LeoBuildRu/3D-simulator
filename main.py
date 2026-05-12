@@ -583,19 +583,25 @@ class MyApp(ShowBase):
         )
 
     def update_overlay_info(self, model=None, texture=None, volume=None, car_number=None, initial_volume=None, time=None):
-        if model is not None:
+        # The legacy create_top_overlay() built model_label / texture_label /
+        # volume_label / etc. on the in-scene DirectFrame.  We removed that
+        # overlay - so all those attributes may be missing.  Each branch
+        # is now guarded with hasattr() so the function is a no-op when
+        # the labels don't exist (the new HUD shows the same info via Qt
+        # overlays / right-panel Details).
+        if model is not None and hasattr(self, "model_label") and self.model_label:
             self.model_label['text'] = f"Модель: {model}"
-        if texture is not None:
+        if texture is not None and hasattr(self, "texture_label") and self.texture_label:
             import os
             tex_name = os.path.basename(texture) if texture else "—"
             self.texture_label['text'] = f"Наполнитель: {tex_name}"
-        if volume is not None:
+        if volume is not None and hasattr(self, "volume_label") and self.volume_label:
             self.volume_label['text'] = f"Объём: {volume:.2f}"
-        if initial_volume is not None:
+        if initial_volume is not None and hasattr(self, "initial_volume_label") and self.initial_volume_label:
             self.initial_volume_label['text'] = f"Исходный объём: {initial_volume:.2f}"
-        if car_number is not None:
+        if car_number is not None and hasattr(self, "car_number_label") and self.car_number_label:
             self.car_number_label['text'] = f"Номер машины: {car_number}"
-        if time is not None:
+        if time is not None and hasattr(self, "time_label") and self.time_label:
             self.time_label['text'] = f"Время проезда: {time}"
 
 

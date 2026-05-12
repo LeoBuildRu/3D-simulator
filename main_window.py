@@ -384,6 +384,91 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             print(f"[MainWindow] camera-mode buttons init failed: {exc}")
 
+        # ---- Save-render row (count + button) ----------------------
+        try:
+            from PyQt6.QtWidgets import (
+                QSpinBox as _QSB,
+                QPushButton as _QPB2,
+                QHBoxLayout as _QHB2,
+                QLabel as _QL2,
+                QFrame as _QFr2,
+            )
+            from ui_theme import (
+                COLOR_TEXT as _RCT,
+                COLOR_TEXT_MUTED as _RCTM,
+                COLOR_HAIRLINE as _RCH,
+                FONT_MONO as _RFM,
+            )
+
+            save_holder = _QFr2()
+            save_holder.setStyleSheet(
+                "QFrame { background: transparent; border: none; }"
+            )
+            sh_lay = _QHB2(save_holder)
+            sh_lay.setContentsMargins(0, 6, 0, 0)
+            sh_lay.setSpacing(6)
+
+            sr_label = _QL2("СНИМОК")
+            sr_label.setStyleSheet(
+                f"color: {_RCTM}; font-size: 10px;"
+                f" letter-spacing: 0.6px; background: transparent;"
+            )
+
+            self.spn_render_count = _QSB()
+            self.spn_render_count.setRange(1, 50)
+            self.spn_render_count.setValue(1)
+            self.spn_render_count.setFixedHeight(22)
+            self.spn_render_count.setFixedWidth(56)
+            self.spn_render_count.setStyleSheet(
+                "QSpinBox {"
+                "  background: rgba(255,255,255,4);"
+                f"  color: {_RCT};"
+                f"  border: 1px solid {_RCH};"
+                "  border-radius: 4px;"
+                "  padding: 1px 4px;"
+                f"  font-family: {_RFM};"
+                "  font-size: 11px;"
+                "}"
+                "QSpinBox::up-button, QSpinBox::down-button { width: 0; }"
+            )
+
+            self.btn_save_render = _QPB2("Сохранить")
+            self.btn_save_render.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_save_render.setFixedHeight(22)
+            self.btn_save_render.setStyleSheet(
+                "QPushButton {"
+                "  background-color: rgba(0, 255, 136, 30);"
+                f"  color: {_RCT};"
+                "  border: 1px solid #00FF88;"
+                "  border-radius: 5px;"
+                "  padding: 2px 12px;"
+                "  font-size: 10px;"
+                "  font-weight: 600;"
+                "  letter-spacing: 0.4px;"
+                "}"
+                "QPushButton:hover {"
+                "  background-color: rgba(0, 255, 136, 55);"
+                "}"
+                "QPushButton:pressed {"
+                "  background-color: rgba(0, 255, 136, 90);"
+                "}"
+                "QPushButton:disabled {"
+                "  background: rgba(255, 255, 255, 4);"
+                f"  color: {_RCTM};"
+                f"  border: 1px solid {_RCH};"
+                "}"
+            )
+            self.btn_save_render.clicked.connect(self._on_save_render_clicked)
+
+            sh_lay.addWidget(sr_label, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_lay.addWidget(self.spn_render_count, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_lay.addStretch(1)
+            sh_lay.addWidget(self.btn_save_render, 0, Qt.AlignmentFlag.AlignVCenter)
+
+            self.telemetry.attach_extra(save_holder)
+        except Exception as exc:
+            print(f"[MainWindow] save-render row init failed: {exc}")
+
         self.controls = SceneOverlay(
             "Управление",
             anchor="top-left",
@@ -1285,6 +1370,118 @@ class MainWindow(QMainWindow):
                   f"hpr=({ch},{cp},{cr})")
         except Exception as exc:
             print(f"[Camera] onboard preset failed: {exc}")
+
+    # ==================================================================
+    # Save-render handler
+    # ==================================================================
+    def _on_save_render_clicked(self) -> None:
+        """
+        Walk the filling from `step` -> `max_volume` in N evenly-spaced
+        target_volume steps, run the full pipeline at each step and
+        save a render. Step formula matches the user's spec: for N=10
+        and max_volume=20 -> targets [2, 4, 6, 8, 10, 12, 14, 16, 18, 20].
+        """
+        if self.panda_app is None:
+            return
+        ru = getattr(self.panda_app, "renderer_utils", None)
+        if ru is None or not hasattr(ru, "save_single_render"):
+            print("[SaveRender] renderer_utils.save_single_render missing.")
+            return
+        try:
+            count = int(self.spn_render_count.value())
+        except Exception:
+            count = 1
+        count = max(1, count)
+
+        # Resolve current model + texture from the right panel and pull
+        # max_volume from the model's YAML config.
+        rp = getattr(self, "right_panel", None)
+        model_key   = rp.current_model_key()   if rp is not None else None
+        texture_key = rp.current_texture_key() if rp is not None else None
+        max_volume  = None
+        if model_key:
+            cfg = get_model_set_config(str(model_key))
+            if cfg and cfg.get("max_volume") is not None:
+                try:
+                    max_volume = float(cfg["max_volume"])
+                except (TypeError, ValueError):
+                    max_volume = None
+        if max_volume is None or max_volume <= 0:
+            print("[SaveRender] max_volume not available for current "
+                  "model set - falling back to spinbox-only count loop.")
+            max_volume = None
+
+        from PyQt6.QtWidgets import QApplication
+        self.btn_save_render.setEnabled(False)
+        original_text = self.btn_save_render.text()
+        ok_count = 0
+        try:
+            for i in range(count):
+                # Target ramp: step = max_volume/N, target = step*(i+1)
+                if max_volume is not None:
+                    target = (max_volume / count) * (i + 1)
+                else:
+                    # Fallback: just keep whatever Target_Volume the
+                    # right-panel spinbox holds.
+                    target = float(rp.current_target_volume()) if rp else 0.0
+
+                self.btn_save_render.setText(f"{i+1}/{count}")
+                QApplication.processEvents()
+
+                # Run the full pipeline at this target volume - same
+                # call MainWindow uses for the right-panel "Generate"
+                # button, just with a synthesised payload.
+                try:
+                    self._on_run_simulation({
+                        "model_key":     model_key,
+                        "texture_key":   texture_key,
+                        "target_volume": float(target),
+                    })
+                except Exception as exc:
+                    print(f"[SaveRender] pipeline {i+1} failed: {exc}")
+                    QApplication.processEvents()
+                    continue
+
+                # Let the pipeline's last few frames render before we
+                # screenshot - 2 event-loop passes is usually enough.
+                for _ in range(2):
+                    QApplication.processEvents()
+
+                # Save the SAME filling from BOTH the on-board view
+                # (cam_pos/cam_rot from models_config.yaml) and the
+                # stationary preset. Two screenshots per pipeline run.
+                shot_modes = (
+                    ("onboard",   self._apply_onboard_camera),
+                    ("stationary", self._apply_stationary_camera),
+                )
+                for mode_name, switch_to_mode in shot_modes:
+                    try:
+                        switch_to_mode()
+                    except Exception as exc:
+                        print(f"[SaveRender] cam-mode '{mode_name}' "
+                              f"failed: {exc}")
+                        continue
+                    # Let the new camera transform settle.
+                    for _ in range(2):
+                        QApplication.processEvents()
+                    try:
+                        if ru.save_single_render():
+                            ok_count += 1
+                            print(f"[SaveRender] frame {i+1}/{count} "
+                                  f"@ target={target:.2f} "
+                                  f"({mode_name}) saved")
+                        else:
+                            print(f"[SaveRender] frame {i+1} "
+                                  f"({mode_name}) returned False")
+                    except Exception as exc:
+                        print(f"[SaveRender] frame {i+1} "
+                              f"({mode_name}) save failed: {exc}")
+                    QApplication.processEvents()
+        finally:
+            self.btn_save_render.setText(original_text)
+            self.btn_save_render.setEnabled(True)
+        print(f"[SaveRender] saved {ok_count}/{count} render(s); "
+              f"max_volume={max_volume}")
 
     def _update_telemetry(self) -> None:
         if self.panda_app is None:
