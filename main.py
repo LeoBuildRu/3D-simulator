@@ -452,19 +452,25 @@ class MyApp(ShowBase):
         ts_rough = TextureStage("3-roughness")
         ts_rough.set_sort(3)
 
+        # Конвертация ОС-пути в Panda3D-Filename: без этого
+        # loader.loadTexture("C:\\...") падает с "Could not load texture",
+        # потому что строковый конструктор Filename ждёт Unix-слэши.
+        def _pf(path):
+            return Filename.fromOsSpecific(str(path))
+
         # Albedo
-        diffuse_tex = self.loader.loadTexture(diffuse_path)
+        diffuse_tex = self.loader.loadTexture(_pf(diffuse_path))
         setup_tex(diffuse_tex, srgb=True)
         model_np.set_texture(ts_color, diffuse_tex)
 
         # Normal map
-        normal_tex = self.loader.loadTexture(normal_path)
+        normal_tex = self.loader.loadTexture(_pf(normal_path))
         setup_tex(normal_tex)
         model_np.set_texture(ts_normal, normal_tex)
 
         # Metallic (всегда заполняем)
         if metallic_path and os.path.exists(metallic_path):
-            metal_tex = self.loader.loadTexture(metallic_path)
+            metal_tex = self.loader.loadTexture(_pf(metallic_path))
         else:
             metal_tex = Texture("dummy_metal")
             metal_tex.setup_2d_texture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
@@ -474,7 +480,7 @@ class MyApp(ShowBase):
 
         # Roughness (всегда заполняем заглушкой)
         if roughness_path and os.path.exists(roughness_path):
-            rough_tex = self.loader.loadTexture(roughness_path)
+            rough_tex = self.loader.loadTexture(_pf(roughness_path))
         else:
             rough_tex = Texture("dummy_rough")
             rough_tex.setup_2d_texture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
@@ -1943,6 +1949,7 @@ def main():
     # PyQt6 application + new top-level window
     from PyQt6.QtWidgets import QApplication as _QApplication
     from main_window import MainWindow
+    import panel_data as _panel_data
 
     qt_app = _QApplication(sys.argv)
 
@@ -1967,6 +1974,28 @@ def main():
         tls_host=tls_host,
         tls_port=tls_port,
     )
+
+    # ------------------------------------------------------------------
+    # Текстурные наборы теперь живут на сервере, в
+    # /home/leonid/operation-3d-service/config/textures_napolnitel_config.json
+    # Подтягиваем их один раз при старте и кладём в memory-кэш panel_data,
+    # из которого read-only считают RightPanel и _on_texture_set_changed.
+    # Сами файлы (диффуз / нормали / displacement / roughness) докачаются
+    # лениво при первом выборе соответствующего набора —
+    # см. ensure_texture_cached.
+    # ------------------------------------------------------------------
+    panda_app.texture_sets = {}
+    try:
+        tex_cfg = panda_app.tls_client.get_textures_config()
+        if isinstance(tex_cfg, dict) and tex_cfg:
+            panda_app.texture_sets = tex_cfg
+            _panel_data.set_texture_sets_cache(tex_cfg)
+            print(f"[main] textures config loaded from server "
+                  f"({len(tex_cfg)} keys)")
+        else:
+            print(f"[main] empty textures config from server")
+    except Exception as exc:
+        print(f"[main] не удалось получить textures config с сервера: {exc}")
 
     # Wire telemetry, controls hint, fly-cam, right panel into the Qt window.
     win.attach_panda(panda_app)

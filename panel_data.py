@@ -6,14 +6,16 @@
 # right_panel.py:
 #
 #   1. load_texture_sets()
-#        Reads `textures_config.yaml` from the project root and returns the
-#        list of texture sets the panel should offer.
+#        Возвращает список текстурных наборов, который должен отображать
+#        правый сайдбар. Источник — in-memory кэш модуля, который
+#        наполняется один раз при старте приложения через
+#        `TLS_client.get_textures_config()` (см. main.py); сам конфиг
+#        живёт на сервере в
+#        /home/leonid/operation-3d-service/config/textures_napolnitel_config.json.
 #
-#        Each entry's display label is the YAML's `name` field (e.g.
-#        "asphalt", "ground V2", "stones"). Entries without a `name` field
-#        fall back to their YAML key. The synthetic `default:` entry at
-#        the bottom of the file (which points at another set's key) is
-#        skipped.
+#        Display-label каждой записи — поле `name` (например, "asphalt",
+#        "ground V2", "stones"); при отсутствии — сам ключ. Синтетическая
+#        запись `default:` (указатель на другой ключ) пропускается.
 #
 #   2. load_model_sets()
 #        Mirrors what the legacy gui.py did:
@@ -59,11 +61,27 @@ import yaml
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-TEXTURES_CONFIG_PATH = os.path.join(PROJECT_ROOT, "textures_config.yaml")
 MODELS_CONFIG_PATH   = os.path.join(PROJECT_ROOT, "models_config.yaml")
 TLS_CONFIG_PATH      = os.path.join(PROJECT_ROOT, "tls_config.yaml")
 HEIGHT_EXAMPLES_DIR  = os.path.join(PROJECT_ROOT, "height_examples")
 PLY_EXAMPLES_DIR     = os.path.join(PROJECT_ROOT, "PLY_examples")
+
+# Локальный кэш для скачанных файлов текстур
+# (диффуз / нормали / displacement / roughness и т.д.).
+# Структура внутри: %TEMP%/vizutil_textures_cache/<подкаталог>/<имя_файла>,
+# где <подкаталог>/<имя_файла> — это путь из textures_napolnitel_config.json
+# с отрезанным префиксом 'textures/'.
+TEXTURES_CACHE_DIR = os.path.join(
+    tempfile.gettempdir(), "vizutil_textures_cache"
+)
+
+# Ключи в записях textures_napolnitel_config.json, значения которых —
+# относительные пути к файлам текстур. Используется при ленивой подмене
+# на локальные пути в MainWindow._on_texture_set_changed.
+TEXTURE_PATH_KEYS = (
+    "diffuse", "albedo", "normal", "displacement",
+    "roughness", "metallic", "height",
+)
 
 
 # Cached TLS_client import — kept lazy so that simply importing this
@@ -85,50 +103,61 @@ def _get_tls_client_cls():
 
 
 # ---------------------------------------------------------------------------
-# Texture sets
+# Texture sets — теперь хранятся в памяти, наполняются с сервера при старте
+# приложения (см. main.py → tls_client.get_textures_config()).
 # ---------------------------------------------------------------------------
+_TEXTURE_SETS_CACHE: Optional[Dict[str, Any]] = None
+
+
+def set_texture_sets_cache(cfg: Optional[Dict[str, Any]]) -> None:
+    """
+    Сохранить серверный конфиг текстурных наборов в памяти модуля.
+    Вызывается один раз при запуске приложения после успешного
+    `tls_client.get_textures_config()`. Передача None очищает кэш.
+    """
+    global _TEXTURE_SETS_CACHE
+    if cfg is None:
+        _TEXTURE_SETS_CACHE = None
+        return
+    if not isinstance(cfg, dict):
+        print(f"[panel_data] set_texture_sets_cache: ожидался dict, "
+              f"получен {type(cfg).__name__} — кэш не обновлён")
+        return
+    _TEXTURE_SETS_CACHE = cfg
+
+
+def get_texture_sets_cache() -> Dict[str, Any]:
+    """Текущий снимок кэша. Пустой dict, если ещё не инициализирован."""
+    return _TEXTURE_SETS_CACHE or {}
+
+
 def load_texture_sets() -> List[Tuple[str, str]]:
     """
-    Return [(yaml_key, display_name)] for every entry in textures_config.yaml,
-    skipping the synthetic `default:` pointer.
+    Вернуть [(key, display_name)] для каждой записи серверного конфига
+    текстурных наборов, пропуская синтетический ключ `default`.
 
-    `display_name` is the entry's `name` field; if missing, it falls back
-    to the yaml_key so nothing silently disappears from the combo.
+    `display_name` — поле `name` записи; при отсутствии — сам ключ
+    (чтобы запись не пропала из выпадающего списка).
     """
-    if not os.path.exists(TEXTURES_CONFIG_PATH):
-        print(f"[panel_data] textures_config.yaml not found at "
-              f"{TEXTURES_CONFIG_PATH}")
-        return []
-
-    try:
-        with open(TEXTURES_CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    except Exception as exc:
-        print(f"[panel_data] failed to parse textures_config.yaml: {exc}")
+    cfg = _TEXTURE_SETS_CACHE
+    if not cfg:
         return []
 
     out: List[Tuple[str, str]] = []
     for key, value in cfg.items():
         if key == "default":
             continue
-        # `default:` may also be expressed as a non-mapping value somewhere —
-        # skip anything that isn't a dict so we don't crash on malformed yaml.
         if not isinstance(value, dict):
             continue
         display = value.get("name") or key
         out.append((key, str(display)))
-
     return out
 
 
 def get_default_texture_set_key() -> Optional[str]:
-    """Return the key referenced by the `default:` pointer, or None."""
-    if not os.path.exists(TEXTURES_CONFIG_PATH):
-        return None
-    try:
-        with open(TEXTURES_CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    except Exception:
+    """Вернуть ключ, на который ссылается синтетическая запись `default:`."""
+    cfg = _TEXTURE_SETS_CACHE
+    if not cfg:
         return None
     val = cfg.get("default")
     return val if isinstance(val, str) else None
@@ -239,20 +268,78 @@ def get_model_set_config(key: str) -> Optional[Dict[str, Any]]:
 
 def get_texture_set_config(key: str) -> Optional[Dict[str, Any]]:
     """
-    Return the full dict for one texture set (diffuse / normal / roughness
-    paths + textureRepeatX/Y + strength + mesh_distributions list).
-    Returns None if the key is unknown or the YAML is missing.
+    Вернуть полный dict одного текстурного набора
+    (diffuse / normal / displacement / roughness, textureRepeatX/Y,
+    strength, mesh_distributions и т.д.) из in-memory кэша,
+    наполненного с сервера. Возвращает None, если ключа нет.
     """
-    if not key or not os.path.exists(TEXTURES_CONFIG_PATH):
+    if not key:
         return None
-    try:
-        with open(TEXTURES_CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    except Exception as exc:
-        print(f"[panel_data] failed to parse textures_config.yaml: {exc}")
-        return None
+    cfg = _TEXTURE_SETS_CACHE or {}
     val = cfg.get(key)
     return val if isinstance(val, dict) else None
+
+
+def _normalize_texture_rel_path(remote_path: str) -> str:
+    """
+    Привести относительный путь из textures_napolnitel_config.json к
+    каноничному виду без префикса 'textures/' и с прямыми слэшами.
+    """
+    p = (remote_path or "").strip().replace("\\", "/")
+    while p.startswith("/"):
+        p = p[1:]
+    if p.startswith("textures/"):
+        p = p[len("textures/"):]
+    return p
+
+
+def ensure_texture_cached(tls_client, remote_path: str) -> Optional[str]:
+    """
+    Гарантировать наличие файла текстуры в локальном кэше и вернуть
+    абсолютный локальный путь к нему. Если файл уже есть и непустой —
+    сразу возвращается без обращения к сети.
+
+    `remote_path` — относительный путь, как он лежит в
+    textures_napolnitel_config.json (например, "textures/asphalt_8k/diff.jpg"
+    или "asphalt_8k/diff.jpg"). Возвращает None, если скачать не удалось
+    и в кэше тоже ничего нет.
+    """
+    if not remote_path or not isinstance(remote_path, str):
+        return None
+    rel = _normalize_texture_rel_path(remote_path)
+    if not rel or ".." in rel.split("/"):
+        return None
+
+    local_path = os.path.join(TEXTURES_CACHE_DIR, *rel.split("/"))
+
+    try:
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return local_path
+    except OSError:
+        pass
+
+    if tls_client is None:
+        print(f"[panel_data] ensure_texture_cached: TLS-клиент не задан, "
+              f"кэш не пополнен ({remote_path})")
+        return None
+
+    try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        tls_client.download_texture_by_path(remote_path, local_path)
+    except Exception as exc:
+        print(f"[panel_data] ensure_texture_cached({remote_path}) failed: {exc}")
+        # Удаляем повисший пустой файл, чтобы при повторной попытке
+        # не считать его валидным кэшем.
+        try:
+            if os.path.exists(local_path) and os.path.getsize(local_path) == 0:
+                os.remove(local_path)
+        except Exception:
+            pass
+        return None
+
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        return local_path
+    return None
 
 
 # ---------------------------------------------------------------------------

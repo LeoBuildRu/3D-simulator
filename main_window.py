@@ -27,6 +27,7 @@ from typing import Any
 from panel_data import (
     get_model_set_config, get_texture_set_config,
     load_texture_sets, Reconstruction, download_server_image,
+    ensure_texture_cached, TEXTURE_PATH_KEYS, get_default_texture_set_key,
 )
 
 
@@ -509,6 +510,23 @@ class MainWindow(QMainWindow):
 
         self.right_panel = RightPanel(parent=self.panda_container)
         self.right_panel.attach()
+        # Если конфиг текстур уже подтянут с сервера (см. main.py), сразу
+        # перезаливаем выпадающий список. Безопасно вызывать и в случае,
+        # когда конфига нет — метод просто оставит комбо как есть.
+        try:
+            server_tex_cfg = getattr(panda_app, "texture_sets", None) or {}
+            if server_tex_cfg and hasattr(self.right_panel, "update_texture_sets"):
+                texture_sets_list = [
+                    (k, (v.get("name") or k) if isinstance(v, dict) else k)
+                    for k, v in server_tex_cfg.items()
+                    if k != "default" and isinstance(v, dict)
+                ]
+                self.right_panel.update_texture_sets(
+                    texture_sets_list,
+                    get_default_texture_set_key(),
+                )
+        except Exception as exc:
+            print(f"[MainWindow] update_texture_sets failed: {exc}")
         # NOTE: depth_renderer is created lazily by MyApp.init_depth_renderer
         # (taskMgr.do_method_later(0.5, ...)), so it is still None right
         # now. The actual depth-camera reparent + lens copy happens on the
@@ -572,19 +590,63 @@ class MainWindow(QMainWindow):
             print(f"[ModelSet] cache_and_load_model_set raised: {exc}")
 
     def _on_texture_set_changed(self, texture_key: str) -> None:
-        """User picked a texture set; push it through to MyApp."""
+        """
+        Пользователь выбрал текстурный набор в правой панели.
+
+        Конфиг набора берётся из in-memory кэша (его наполняет main.py
+        при старте). Перед тем как передавать набор в `panda_app.set_texture_set`,
+        каждый ключ-путь к файлу текстуры (diffuse / normal / displacement /
+        roughness / albedo / metallic / height) лениво докачивается в
+        локальный кэш `%TEMP%/vizutil_textures_cache` и заменяется
+        на абсолютный локальный путь, который Panda3D сможет открыть
+        напрямую без обращения к серверу при каждом кадре.
+        """
         if self.panda_app is None or not texture_key:
             return
         tex_cfg = get_texture_set_config(str(texture_key))
         if tex_cfg is None:
             print(f"[TextureSet] config not found for {texture_key!r}")
             return
-        if hasattr(self.panda_app, "set_texture_set"):
-            try:
-                self.panda_app.set_texture_set(tex_cfg)
-                print(f"[TextureSet] '{texture_key}' applied")
-            except Exception as exc:
-                print(f"[TextureSet] set_texture_set raised: {exc}")
+
+        # Сохраняем СЫРОЙ конфиг с относительными путями — он нужен
+        # серверу для displace-карты, передаётся через
+        # tls_client.generate_landscape(displacement_path=...).
+        # Materialized-версия в current_texture_set заменит пути на
+        # локальный кэш, который сервер использовать не сможет.
+        self.panda_app.current_texture_set_raw = dict(tex_cfg)
+
+        resolved = self._materialize_texture_set(tex_cfg)
+        if not hasattr(self.panda_app, "set_texture_set"):
+            return
+        try:
+            self.panda_app.set_texture_set(resolved)
+            print(f"[TextureSet] '{texture_key}' applied")
+        except Exception as exc:
+            print(f"[TextureSet] set_texture_set raised: {exc}")
+
+    def _materialize_texture_set(self, tex_cfg: dict) -> dict:
+        """
+        Скопировать `tex_cfg` и подменить относительные пути к текстурам
+        (по списку TEXTURE_PATH_KEYS) на локальные абсолютные пути из
+        кэша, при необходимости скачав файлы с сервера.
+
+        Не валит весь набор, если какая-то одна текстура не скачалась —
+        просто оставляет в этом ключе исходный относительный путь, и
+        дальше Panda3D отработает по своим резервным веткам.
+        """
+        out = dict(tex_cfg)
+        tls = getattr(self.panda_app, "tls_client", None)
+        for key in TEXTURE_PATH_KEYS:
+            val = tex_cfg.get(key)
+            if not isinstance(val, str) or not val:
+                continue
+            local = ensure_texture_cached(tls, val)
+            if local:
+                out[key] = local
+            else:
+                print(f"[TextureSet] не удалось закэшировать '{key}' "
+                      f"({val}) — оставляем исходный путь")
+        return out
 
     # ==================================================================
     # run_full_process - port of legacy gui.py
@@ -649,10 +711,14 @@ class MainWindow(QMainWindow):
         if texture_key and hasattr(self.panda_app, "set_texture_set"):
             tex_cfg = get_texture_set_config(str(texture_key))
             if tex_cfg is None:
-                print(f"[Run] WARN texture '{texture_key}' not in YAML")
+                print(f"[Run] WARN texture '{texture_key}' not in server config")
             else:
+                # Сохраняем сырой конфиг для серверного displace.
+                self.panda_app.current_texture_set_raw = dict(tex_cfg)
                 try:
-                    self.panda_app.set_texture_set(tex_cfg)
+                    self.panda_app.set_texture_set(
+                        self._materialize_texture_set(tex_cfg)
+                    )
                     print(f"[Run] OK texture set '{texture_key}' applied")
                 except Exception as exc:
                     print(f"[Run] ERR set_texture_set: {exc}")
@@ -758,8 +824,12 @@ class MainWindow(QMainWindow):
         if filler:
             tex_key, tex_cfg = self._find_texture_by_filler(filler)
             if tex_cfg is not None and hasattr(self.panda_app, "set_texture_set"):
+                # Сохраняем сырой конфиг для серверного displace.
+                self.panda_app.current_texture_set_raw = dict(tex_cfg)
                 try:
-                    self.panda_app.set_texture_set(tex_cfg)
+                    self.panda_app.set_texture_set(
+                        self._materialize_texture_set(tex_cfg)
+                    )
                     print(f"[Recon] texture set by filler: '{tex_key}'")
                 except Exception as exc:
                     print(f"[Recon] set_texture_set failed: {exc}")
@@ -1281,8 +1351,8 @@ class MainWindow(QMainWindow):
     # Camera mode handlers (free / stationary / onboard)
     # ==================================================================
     # Stationary preset — pinned by the user as a known-good viewpoint.
-    _STATIONARY_POS = (1.4, 0.7, 7.8)
-    _STATIONARY_HPR = (-269.5, -74.3, 0.0)   # h=yaw, p=pitch, r=roll
+    _STATIONARY_POS = (1.0, 1.1, 8.0)
+    _STATIONARY_HPR = (-627.9, -74.1, 0.0)   # h=yaw, p=pitch, r=roll
     _STATIONARY_FOV = 100.0
 
     def _on_camera_mode(self, mode: str) -> None:

@@ -163,11 +163,37 @@ class TLS_client:
                         output_format: str = "ply",
                         # Повторение текстуры
                         texture_repeat_x: float = 1.35,
-                        texture_repeat_y: float = 3.2
+                        texture_repeat_y: float = 3.2,
+                        # Серверная булева разность: путь к OBJ-наполнителю
+                        # из models_geometry_config.json (поле target_model)
+                        # и Z-сдвиг ландшафта перед операцией.
+                        target_model_path: Optional[str] = None,
+                        landscape_offset_z: float = 0.0,
+                        # Целевой объём (м³). Если задан и >0, сервер сам
+                        # подбирает Z ландшафта (coarse-перебор + golden
+                        # section), чтобы объём результата ≈ target_volume.
+                        # landscape_offset_z в этом режиме игнорируется.
+                        target_volume: Optional[float] = None,
+                        # Displace-карта для рельефа ландшафта.
+                        # `displacement_path` — относительный путь, как в
+                        # textures_napolnitel_config.json (например,
+                        # "textures/ground_8k/brown_mud_dry_disp_8k.jpg");
+                        # сервер сам зарезолвит его под g_textures_dir.
+                        # Накладывается на landscape ДО финальной булевой,
+                        # чтобы рельеф из карты не выпирал за границы
+                        # napolnitel'а. При пустом пути или strength==0 —
+                        # displace на сервере пропускается.
+                        displacement_path: Optional[str] = None,
+                        displacement_strength: float = 0.0
                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Генерирует ландшафт через Blender и возвращает:
-        vertices (N,3), triangles (M,3), normals (N,3), uvs (N,2)
+        vertices (N,3), triangles (M,3), normals (N,3), uvs (N,2).
+
+        Если задан target_model_path, сервер выполняет булеву разность
+        (target_model − landscape) и возвращает уже итоговый меш.
+        Если задан target_volume > 0, сервер дополнительно подбирает
+        Z-позицию ландшафта так, чтобы объём результата совпал с целевым.
         """
         if subdivisions_x is None:
             subdivisions_x = subdivisions
@@ -208,8 +234,16 @@ class TLS_client:
             "strata_type": strata_type,
             "output_format": output_format,
             "texture_repeat_x": texture_repeat_x,
-            "texture_repeat_y": texture_repeat_y
+            "texture_repeat_y": texture_repeat_y,
+            "landscape_offset_z": float(landscape_offset_z),
         }
+        if target_model_path:
+            payload["target_model_path"] = str(target_model_path)
+        if target_volume is not None and float(target_volume) > 0.0:
+            payload["target_volume"] = float(target_volume)
+        if displacement_path:
+            payload["displacement_path"] = str(displacement_path)
+            payload["displacement_strength"] = float(displacement_strength)
         response = self._post("generate_landscape", payload)
         if response.get("status") != "success":
             raise RuntimeError(f"Landscape generation failed: {response.get('error', 'Unknown')}")
@@ -303,6 +337,38 @@ class TLS_client:
         if response.get("status") != "success":
             raise RuntimeError(f"Ошибка получения конфига моделей: {response.get('error', 'Неизвестная ошибка')}")
         return response.get("config", {})
+
+    def get_textures_config(self) -> dict:
+        """
+        Запрашивает с сервера содержимое
+        /home/leonid/operation-3d-service/config/textures_napolnitel_config.json
+        и возвращает уже распарсенный словарь.
+        """
+        response = self._post("get_textures_config", {})
+        if response.get("status") != "success":
+            raise RuntimeError(f"Ошибка получения конфига текстур: {response.get('error', 'Неизвестная ошибка')}")
+        return response.get("config", {})
+
+    def download_texture_by_path(self, remote_path: str, local_path: str) -> None:
+        """
+        Скачивает один файл текстуры по относительному пути
+        (например, 'textures/asphalt_8k/diff.jpg' или
+        'asphalt_8k/diff.jpg') в локальный путь `local_path`.
+        Родительские каталоги создаются при необходимости.
+        """
+        import os as _os
+        params = {"path": remote_path}
+        url = f"{self.base_url}/download_texture_by_path"
+        try:
+            resp = requests.get(url, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            parent_dir = _os.path.dirname(local_path)
+            if parent_dir:
+                _os.makedirs(parent_dir, exist_ok=True)
+            with open(local_path, 'wb') as f:
+                f.write(resp.content)
+        except Exception as e:
+            raise RuntimeError(f"Ошибка скачивания текстуры {remote_path}: {e}")
 
     def download_model_file(self, set_name: str, file_type: str, local_path: str) -> None:
         url = f"{self.base_url}/download_model_file?set={urllib.parse.quote(set_name)}&type={urllib.parse.quote(file_type)}"

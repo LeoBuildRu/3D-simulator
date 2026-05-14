@@ -886,9 +886,11 @@ class RightPanel(QWidget):
         # ---- Load configs --------------------------------------------
         # Model sets come from the TLS server's `models_geometry_config.json`
         # (with a local `models_config.yaml` fallback); texture sets come
-        # from the local `textures_config.yaml`. Both lists carry the
-        # canonical backend key alongside the human-readable display name
-        # so we can emit the key on selection.
+        # from the TLS server's `textures_napolnitel_config.json`, which
+        # `main.py` pre-loads into panel_data's in-memory cache before
+        # this panel is constructed. Both lists carry the canonical
+        # backend key alongside the human-readable display name so we
+        # can emit the key on selection.
         model_sets   = load_model_sets()
         texture_sets = load_texture_sets()
         default_tex  = get_default_texture_set_key()
@@ -1510,6 +1512,54 @@ class RightPanel(QWidget):
         key = self.cmb_texture.itemData(idx)
         if key:
             self.textureSetChanged.emit(str(key))
+
+    # ==================================================================
+    # External hook: пересборка списка текстурных наборов
+    # ==================================================================
+    def update_texture_sets(self, texture_sets_list, default_key=None) -> None:
+        """
+        Перезалить выпадающий список текстурных наборов.
+
+        Принимает список пар (key, display_name); если есть `default_key`
+        и он встречается среди ключей — именно этот элемент становится
+        выбранным. Сигнал textureSetChanged во время перезалива не
+        эмитится: подписчики получают только финальное состояние
+        (если оно отличается от исходного — через стандартный
+        currentIndexChanged).
+
+        Используется из MainWindow.attach_panda после того, как клиент
+        получил с сервера актуальный textures_napolnitel_config.json.
+        """
+        if not hasattr(self, "cmb_texture"):
+            return
+
+        items = []
+        for entry in (texture_sets_list or []):
+            try:
+                key, display = entry
+            except (TypeError, ValueError):
+                continue
+            if not key or key == "default":
+                continue
+            items.append((str(key), str(display) if display else str(key)))
+
+        self.cmb_texture.blockSignals(True)
+        try:
+            self.cmb_texture.clear()
+            if items:
+                target_index = 0
+                for i, (key, display) in enumerate(items):
+                    self.cmb_texture.addItem(display, userData=key)
+                    if default_key and key == default_key:
+                        target_index = i
+                self.cmb_texture.setEnabled(True)
+                self.cmb_texture.setCurrentIndex(target_index)
+            else:
+                self.cmb_texture.addItem("— текстуры не найдены —",
+                                         userData=None)
+                self.cmb_texture.setEnabled(False)
+        finally:
+            self.cmb_texture.blockSignals(False)
 
     # ==================================================================
     # Public accessors
