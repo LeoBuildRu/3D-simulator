@@ -19,13 +19,13 @@ from panda3d.core import get_model_path, Filename
 base_path_p3d = Filename.fromOsSpecific(base_path).getFullpath()
 get_model_path().prepend_directory(base_path_p3d)
 
-models_path_p3d = Filename.fromOsSpecific(os.path.join(base_path, "models")).getFullpath()
+models_path_p3d = Filename.fromOsSpecific(os.path.join(base_path, "assets", "models")).getFullpath()
 get_model_path().prepend_directory(models_path_p3d)
 # -------------------------------------------------------------
 
 def load_tls_config(base_path):
     """Загружает активный TLS-сервер из tls_config.yaml"""
-    config_path = os.path.join(base_path, "tls_config.yaml")
+    config_path = os.path.join(base_path, "config", "tls_config.yaml")
     default_host = "78.25.191.12"
     default_port = 9998
 
@@ -51,15 +51,15 @@ def load_tls_config(base_path):
 
 # Теперь можно импортировать остальные модули
 # (gui import removed - new MainWindow lives in main_window.py)
-from panda_widget import Panda3DWidget
-from depth_map_renderer import DepthMapRenderer
-from perlin_mesh_generator import PerlinMeshGenerator
-from renderer_utils import RendererUtils
-from mesh_reconstruction import MeshReconstruction
-from mesh_distribution import MeshDistributor
-from crash_reporter import TelegramCrashReporter
-from TLS_client import TLS_client
-from falling_particles import WarpFallingParticles
+from src.ui.panda_widget import Panda3DWidget
+from src.rendering.depth_map_renderer import DepthMapRenderer
+from src.rendering.perlin_mesh_generator import PerlinMeshGenerator
+from src.rendering.renderer_utils import RendererUtils
+from src.rendering.mesh_reconstruction import MeshReconstruction
+from src.rendering.mesh_distribution import MeshDistributor
+from src.core.crash_reporter import TelegramCrashReporter
+from src.core.TLS_client import TLS_client
+from src.particles.falling_particles import WarpFallingParticles
 
 BOT_TOKEN = "8773064116:AAEiJdyHYysLpSnAx-gbDHG0DMbvV92IpsA"
 CHAT_ID = "-5295757150"
@@ -136,10 +136,10 @@ class MyApp(ShowBase):
         self.tls_client = TLS_client(host=tls_host, port=tls_port, timeout=300.0)
 
         self.current_texture_set = {
-            'diffuse': "textures/stones_8k/rocks_ground_01_diff_8k.jpg",
-            'displacement': "textures/stones_8k/rocks_ground_01_disp_8k.jpg",
-            'normal': "textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg",
-            'roughness': "textures/stones_8k/rocks_ground_01_rough_8k.jpg",
+            'diffuse': "assets/textures/stones_8k/rocks_ground_01_diff_8k.jpg",
+            'displacement': "assets/textures/stones_8k/rocks_ground_01_disp_8k.jpg",
+            'normal': "assets/textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg",
+            'roughness': "assets/textures/stones_8k/rocks_ground_01_rough_8k.jpg",
             'textureRepeatX': 1.35,
             'textureRepeatY': 3.2,
             'strength': 0.14,
@@ -162,7 +162,7 @@ class MyApp(ShowBase):
         # Loads base_without_ground.bam from <project>/models on every
         # launch as the static environment of the scene.
         try:
-            base_path = os.path.join(PROJECT_ROOT, "models",
+            base_path = os.path.join(PROJECT_ROOT, "assets", "models",
                                      "base_without_ground.bam")
             if os.path.exists(base_path):
                 p3d_path = Filename.fromOsSpecific(base_path).getFullpath()
@@ -286,7 +286,7 @@ class MyApp(ShowBase):
             for ev in ("space", "space-up", "shift", "shift-up",
                        "mouse1", "mouse1-up"):
                 self.ignore(ev)
-            from camera_controller import FlyCamera
+            from src.core.camera_controller import FlyCamera
             self.fly_cam = FlyCamera(self)
         except Exception as exc:
             print(f"[MyApp] FlyCamera init failed: {exc}")
@@ -346,7 +346,7 @@ class MyApp(ShowBase):
             self.particles = WarpFallingParticles(
                 showbase=self,
                 render_pipeline=self.render_pipeline,
-                texture="textures/leaf.png",
+                texture="assets/textures/leaf.png",
                 particle_count=1000,
                 spawn_min=(-30.0, -30.0, 14.0),
                 spawn_max=(30.0, 30.0, 15.0),
@@ -415,16 +415,16 @@ class MyApp(ShowBase):
         texset = self.current_texture_set
 
         # Пути к текстурам
-        diffuse_path = texset.get("diffuse") or texset.get("albedo") or "textures/concrete_8k/concrete_debris_diff_8k.jpg"
-        normal_path = texset.get("normal", "textures/concrete_8k/concrete_debris_nor_dx_8k.jpg")
+        diffuse_path = texset.get("diffuse") or texset.get("albedo") or "assets/textures/concrete_8k/concrete_debris_diff_8k.jpg"
+        normal_path = texset.get("normal", "assets/textures/concrete_8k/concrete_debris_nor_dx_8k.jpg")
         roughness_path = texset.get("roughness")
         metallic_path = texset.get("metallic")
 
         # Проверка существования файлов (с резервными)
         if not os.path.exists(diffuse_path):
-            diffuse_path = "textures/concrete_8k/concrete_debris_diff_8k.jpg"
+            diffuse_path = "assets/textures/concrete_8k/concrete_debris_diff_8k.jpg"
         if not os.path.exists(normal_path):
-            normal_path = "textures/concrete_8k/concrete_debris_nor_dx_8k.jpg"
+            normal_path = "assets/textures/concrete_8k/concrete_debris_nor_dx_8k.jpg"
 
         # Создаём PBR-материал
         mat = Material()
@@ -500,7 +500,7 @@ class MyApp(ShowBase):
 
         # Загрузка шрифта (один раз)
         if not hasattr(self, "ui_font"):
-            font_path = Filename.fromOsSpecific("fonts/JOST/static/Jost-Regular.ttf").getFullpath()
+            font_path = Filename.fromOsSpecific("assets/fonts/JOST/static/Jost-Regular.ttf").getFullpath()
             self.ui_font = loader.loadFont(font_path)
             self.ui_font.setPixelsPerUnit(60)
             self.ui_font.setMinfilter(SamplerState.FT_linear)
@@ -1317,9 +1317,9 @@ class MyApp(ShowBase):
         # ------------------------------------------------------------------
         # Прямое указание путей к текстурам в папке groundPerlin_8k
         # ------------------------------------------------------------------
-        diffuse_path = "textures/groundPerlin_8k/aerial_beach_03_diff_8k.jpg"
-        normal_path = "textures/groundPerlin_8k/aerial_beach_03_nor_dx_8k.jpg"
-        roughness_path = "textures/groundPerlin_8k/aerial_beach_03_rough_8k.jpg"
+        diffuse_path = "assets/textures/groundPerlin_8k/aerial_beach_03_diff_8k.jpg"
+        normal_path = "assets/textures/groundPerlin_8k/aerial_beach_03_nor_dx_8k.jpg"
+        roughness_path = "assets/textures/groundPerlin_8k/aerial_beach_03_rough_8k.jpg"
         metallic_path = None  # металличность не используется, будет заглушка
 
         # ------------------------------------------------------------------
@@ -1948,8 +1948,8 @@ def main():
     """
     # PyQt6 application + new top-level window
     from PyQt6.QtWidgets import QApplication as _QApplication
-    from main_window import MainWindow
-    import panel_data as _panel_data
+    from src.ui.main_window import MainWindow
+    import src.ui.panel_data as _panel_data
 
     qt_app = _QApplication(sys.argv)
 

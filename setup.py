@@ -13,17 +13,13 @@ sys.path.append(os.path.join(current_dir, "render_pipeline"))
 # INCLUDE FILES — кладём всё, что нужно EXE
 # -----------------------------------------------------
 include_files = [
-    ("models", "models"),
-    ("textures", "textures"),
-    ("PLY_examples", "PLY_examples"),
-    ("height_examples", "height_examples"),
-    ("fonts", "fonts"),
+    ("assets/models", "assets/models"),
+    ("assets/textures", "assets/textures"),
+    ("assets/height_examples", "assets/height_examples"),
+    ("assets/fonts", "assets/fonts"),
 
-    ("models_config.yaml", "models_config.yaml"),
-    ("textures_config.yaml", "textures_config.yaml"),
-
-    ("mesh_distribution.py", "mesh_distribution.py"),
-    ("falling_particles.py", "falling_particles.py"),
+    ("config", "config"),
+    ("src", "src"),
 
     # RenderPipeline целиком
     ("render_pipeline", "render_pipeline"),
