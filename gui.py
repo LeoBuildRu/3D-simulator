@@ -1879,6 +1879,8 @@ class CameraControlGUI(QWidget):
             textures_cache_dir = os.path.join(cache_dir, textures_basename)
             os.makedirs(textures_cache_dir, exist_ok=True)
 
+            print(textures_cache_dir)
+
             # Получаем список файлов из папки текстур на сервере
             try:
                 texture_files = self.panda_app.tls_client.get_texture_list(textures_dir_rel)
