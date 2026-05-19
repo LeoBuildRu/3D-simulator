@@ -1049,32 +1049,45 @@ class MyApp(ShowBase):
     def trimesh_to_panda(self, trimesh_mesh):
         vertices = trimesh_mesh.vertices
         faces = trimesh_mesh.faces
-        
+
         if not hasattr(trimesh_mesh, 'vertex_normals') or len(trimesh_mesh.vertex_normals) != len(vertices):
             trimesh_mesh.compute_vertex_normals()
-        
+
         normals = trimesh_mesh.vertex_normals
-        
+
+        # Planar UV-маппинг по XY-bbox меша. Без этого все texcoord = (0, 0)
+        # и текстура схлопывается в один тексел (видимо как однотонный цвет).
+        # Тот же подход в babylon-viewer.js (см. _loadObjMesh: UV считаются
+        # после загрузки OBJ от bbox по (X, Z) Babylon, что соответствует
+        # (X, Y) в наших OBJ-файлах Panda-конвенции).
+        verts_np = np.asarray(vertices, dtype=np.float64)
+        vmin_x, vmax_x = float(verts_np[:, 0].min()), float(verts_np[:, 0].max())
+        vmin_y, vmax_y = float(verts_np[:, 1].min()), float(verts_np[:, 1].max())
+        range_x = max(vmax_x - vmin_x, 1e-6)
+        range_y = max(vmax_y - vmin_y, 1e-6)
+
         format = GeomVertexFormat.getV3n3t2()
         format = GeomVertexFormat.registerFormat(format)
         vdata = GeomVertexData("trimesh_result", format, Geom.UHStatic)
-        
+
         vertex_writer = GeomVertexWriter(vdata, "vertex")
         normal_writer = GeomVertexWriter(vdata, "normal")
         texcoord_writer = GeomVertexWriter(vdata, "texcoord")
-        
+
         for i, vertex in enumerate(vertices):
             vertex_writer.addData3f(vertex[0], vertex[1], vertex[2])
-            
+
             if i < len(normals):
                 normal = normals[i]
                 if np.any(np.isnan(normal)) or np.linalg.norm(normal) < 0.1:
-                    normal = [0, 0, 1] 
+                    normal = [0, 0, 1]
                 normal_writer.addData3f(normal[0], normal[1], normal[2])
             else:
-                normal_writer.addData3f(0, 0, 1) 
-            
-            texcoord_writer.addData2f(0, 0) 
+                normal_writer.addData3f(0, 0, 1)
+
+            u = (float(vertex[0]) - vmin_x) / range_x
+            v = (float(vertex[1]) - vmin_y) / range_y
+            texcoord_writer.addData2f(u, v)
         
         prim = GeomTriangles(Geom.UHStatic)
         for face in faces:

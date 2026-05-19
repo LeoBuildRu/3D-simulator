@@ -1,0 +1,320 @@
+# main.py
+# ---------------------------------------------------------------------------
+# Toner · Digital Engineering Simulator — minimal entry point.
+#
+# Bare-bones setup:
+#   * Qt application + main window (see main_window.py)
+#   * Panda3D ShowBase with RenderPipeline
+#   * A single textured ground plane on the scene
+#   * One Qt overlay widget (Camera · Telemetry) anchored to the top-left
+#     of the embedded Panda3D viewport
+#
+# Everything else (scene loaders, particles, perlin generator,
+# mesh-reconstruction, depth-map renderer, legacy GUI, TLS client …)
+# has been intentionally stripped out to keep this file focused on
+# wiring up the render pipeline + the new HUD overlay.
+# ---------------------------------------------------------------------------
+
+from __future__ import annotations
+
+import os
+import sys
+
+# --- Path / Panda model search dirs ----------------------------------------
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PROJECT_ROOT)
+
+from panda3d.core import (
+    Filename, get_model_path,
+    loadPrcFileData,
+    Texture, TextureStage, Material,
+    GeomVertexFormat, GeomVertexData, GeomVertexWriter,
+    GeomTriangles, Geom, GeomNode, LPoint3f,
+)
+
+get_model_path().prepend_directory(Filename.fromOsSpecific(PROJECT_ROOT).getFullpath())
+get_model_path().prepend_directory(
+    Filename.fromOsSpecific(os.path.join(PROJECT_ROOT, "models")).getFullpath()
+)
+
+# render_pipeline lives in a sub-folder
+RP_PATH = os.path.join(PROJECT_ROOT, "render_pipeline")
+if RP_PATH not in sys.path:
+    sys.path.insert(0, RP_PATH)
+
+from direct.showbase.ShowBase import ShowBase
+from rpcore import RenderPipeline
+
+from PyQt6.QtWidgets import QApplication
+
+from main_window import MainWindow
+from camera_controller import FlyCamera
+
+
+# ---------------------------------------------------------------------------
+# Panda3D application
+# ---------------------------------------------------------------------------
+class MyApp(ShowBase):
+    """
+    Minimal Panda3D ShowBase wired up with RenderPipeline + a textured
+    ground plane.  No scene loaders, no particles, no GUI logic.
+    """
+
+    def __init__(self, parent_hwnd: int, init_size: tuple[int, int] = (1920, 1080)):
+        # 1) RenderPipeline must be configured before ShowBase is started.
+        self.render_pipeline = RenderPipeline()
+        self.render_pipeline.pre_showbase_init()
+
+        # Tell Panda to create its window AS A CHILD of the supplied
+        # Qt HWND. This is the proper way to embed — WM_SIZE messages
+        # and `requestProperties` resize calls actually work, unlike a
+        # post-hoc win32gui.SetParent dance.
+        w, h = init_size
+        loadPrcFileData("", f"win-size {w} {h}")
+        loadPrcFileData("", "window-type onscreen")
+        loadPrcFileData("", f"parent-window-handle {int(parent_hwnd)}")
+        loadPrcFileData("", "fullscreen false")
+        loadPrcFileData("", "undecorated true")
+
+        # 2) Standard ShowBase boot.
+        ShowBase.__init__(self)
+
+        # 3) Hand the running ShowBase to RP so it can attach its passes.
+        self.render_pipeline.create(self)
+
+        # Texture-repeat parameters used by the ground plane.
+        self.current_texture_set = {
+            "textureRepeatU": 160.0,
+            "textureRepeatV": 160.0,
+        }
+
+        # Target volume in m³ — fed by the right-panel "Run Simulation"
+        # button. The legacy gui.py `run_full_process` consumes this
+        # attribute when handing off to the Perlin/CSG generator; we
+        # keep the same name for source-level compatibility.
+        self.Target_Volume: float = 0.0
+
+        # Disable Panda's default camera trackball — we don't need it.
+        self.disable_mouse()
+
+        # 4) Build the only object on the scene: the ground plane.
+        self.create_ground_plane()
+
+        # 5) Editor-style fly camera (WASD + Q/E + Shift, RMB-look).
+        self.fly_cam = FlyCamera(self)
+
+        # 6) Set a sensible default time-of-day on RP's daytime manager.
+        self.taskMgr.do_method_later(0.5, self._set_initial_time, "set_initial_time")
+
+    # ------------------------------------------------------------------
+    def _set_initial_time(self, task):
+        if hasattr(self.render_pipeline, "daytime_mgr"):
+            self.render_pipeline.daytime_mgr.time = "06:40"
+        return task.done
+
+    # ------------------------------------------------------------------
+    # Ground plane (renamed from `create_perlin_noise_mesh`).
+    # Despite the old name, the geometry is just a flat 2000×2000 quad
+    # subdivided into a 64×64 grid; perlin displacement was never applied.
+    # ------------------------------------------------------------------
+    def create_ground_plane(self):
+        size_x = 2000.0
+        size_y = 2000.0
+        size_z = 2.0
+        position = LPoint3f(0.0, 0.0, -1.0)
+
+        tex_repeat_u = self.current_texture_set.get("textureRepeatU", 160.0)
+        tex_repeat_v = self.current_texture_set.get("textureRepeatV", 160.0)
+
+        # --- Geometry --------------------------------------------------
+        fmt = GeomVertexFormat.getV3n3t2()
+        fmt = GeomVertexFormat.registerFormat(fmt)
+        vdata = GeomVertexData("ground_plane_data", fmt, Geom.UHStatic)
+        vertex = GeomVertexWriter(vdata, "vertex")
+        normal = GeomVertexWriter(vdata, "normal")
+        texcoord = GeomVertexWriter(vdata, "texcoord")
+
+        grid_size = 64
+        step_x = size_x / (grid_size - 1)
+        step_y = size_y / (grid_size - 1)
+        half_x = size_x / 2.0
+        half_y = size_y / 2.0
+        z = position.getZ() + (size_z / 2.0)
+
+        for gy in range(grid_size):
+            for gx in range(grid_size):
+                wx = gx * step_x - half_x
+                wy = gy * step_y - half_y
+                vertex.addData3f(wx, wy, z)
+                normal.addData3f(0, 0, 1)
+                u_n = gx / (grid_size - 1)
+                v_n = gy / (grid_size - 1)
+                texcoord.addData2f(v_n * tex_repeat_u, -u_n * tex_repeat_v)
+
+        prim = GeomTriangles(Geom.UHStatic)
+        for gy in range(grid_size - 1):
+            for gx in range(grid_size - 1):
+                i1 = gy * grid_size + gx
+                i2 = gy * grid_size + (gx + 1)
+                i3 = (gy + 1) * grid_size + gx
+                i4 = (gy + 1) * grid_size + (gx + 1)
+                prim.addVertices(i1, i2, i3)
+                prim.addVertices(i2, i4, i3)
+        prim.closePrimitive()
+
+        geom = Geom(vdata)
+        geom.addPrimitive(prim)
+        node = GeomNode("ground_plane")
+        node.addGeom(geom)
+
+        self.ground_plane = self.render.attachNewNode(node)
+        self.ground_plane.setPos(0, 0, 0)
+
+        # --- Material + textures (RP-compatible) -----------------------
+        # Pull diffuse / normal / roughness paths from the active texture
+        # set when present; otherwise fall back to the original beach
+        # default. This is what makes the texture combo actually swap
+        # the look of the ground plane after `set_texture_set`.
+        diffuse_path = (
+            self.current_texture_set.get("diffuse")
+            or "textures/groundPerlin_8k/aerial_beach_03_diff_8k.jpg"
+        )
+        normal_path = (
+            self.current_texture_set.get("normal")
+            or "textures/groundPerlin_8k/aerial_beach_03_nor_dx_8k.jpg"
+        )
+        rough_path = (
+            self.current_texture_set.get("roughness")
+            or "textures/groundPerlin_8k/aerial_beach_03_rough_8k.jpg"
+        )
+
+        mat = Material()
+        mat.set_base_color((1, 1, 1, 1))      # white base — required for PBR
+        mat.set_emission((0, 1, 0, 0))         # activates the normal-map slot
+        self.ground_plane.set_material(mat)
+
+        def setup_tex(tex, srgb=False):
+            if srgb:
+                tex.set_format(Texture.F_srgb)
+            tex.set_minfilter(Texture.FTLinearMipmapLinear)
+            tex.set_magfilter(Texture.FTLinear)
+            tex.set_wrap_u(Texture.WMRepeat)
+            tex.set_wrap_v(Texture.WMRepeat)
+
+        # Strict order required by RP: 0=color, 1=normal, 2=metal, 3=rough.
+        ts_color = TextureStage("0-color")
+        ts_color.set_sort(0); ts_color.set_priority(0)
+
+        ts_normal = TextureStage("1-normal")
+        ts_normal.set_sort(1); ts_normal.set_priority(1)
+
+        ts_metal = TextureStage("2-metallic")
+        ts_metal.set_sort(2); ts_metal.set_priority(2)
+
+        ts_rough = TextureStage("3-roughness")
+        ts_rough.set_sort(3); ts_rough.set_priority(3)
+
+        diffuse_tex = self.loader.loadTexture(diffuse_path)
+        if diffuse_tex:
+            setup_tex(diffuse_tex, srgb=True)
+            self.ground_plane.set_texture(ts_color, diffuse_tex)
+
+        normal_tex = self.loader.loadTexture(normal_path)
+        if normal_tex:
+            setup_tex(normal_tex)
+            self.ground_plane.set_texture(ts_normal, normal_tex)
+
+        # 1×1 black "no-metal" placeholder.
+        metal_tex = Texture("dummy_metal")
+        metal_tex.setup2dTexture(1, 1, Texture.T_unsigned_byte, Texture.F_luminance)
+        metal_tex.setRamImage(b"\x00")
+        setup_tex(metal_tex)
+        self.ground_plane.set_texture(ts_metal, metal_tex)
+
+        rough_tex = self.loader.loadTexture(rough_path)
+        if rough_tex:
+            setup_tex(rough_tex)
+            self.ground_plane.set_texture(ts_rough, rough_tex)
+
+        # RP-required render flags.
+        self.ground_plane.set_shader_auto()
+        self.ground_plane.set_two_sided(True)
+        self.ground_plane.setBin("fixed", 0)
+        self.ground_plane.setDepthOffset(1)
+
+    # ------------------------------------------------------------------
+    # Texture set hot-swap
+    # ------------------------------------------------------------------
+    # Used by run_full_process — the legacy gui.py called the equivalent
+    # `panda_app.set_texture_set(texture_config)` to apply a YAML entry
+    # like:
+    #     {"diffuse": "...", "normal": "...", "roughness": "...",
+    #      "textureRepeatX": 1.2, "textureRepeatY": 4.2, ...}
+    #
+    # We pull the new texture-repeat values into `current_texture_set`
+    # and re-create the ground plane so the texture stages pick up the
+    # new diffuse / normal / roughness textures referenced by paths
+    # under PROJECT_ROOT.
+    # ------------------------------------------------------------------
+    def set_texture_set(self, texture_config: dict) -> None:
+        if not isinstance(texture_config, dict):
+            return
+
+        # Stash the new repeat values + texture paths so the next ground-
+        # plane build picks them up.
+        self.current_texture_set = {
+            "textureRepeatU": float(texture_config.get(
+                "textureRepeatX",
+                self.current_texture_set.get("textureRepeatU", 160.0),
+            )),
+            "textureRepeatV": float(texture_config.get(
+                "textureRepeatY",
+                self.current_texture_set.get("textureRepeatV", 160.0),
+            )),
+            "diffuse":       texture_config.get("diffuse"),
+            "normal":        texture_config.get("normal"),
+            "roughness":     texture_config.get("roughness"),
+            "displacement":  texture_config.get("displacement"),
+            "strength":      texture_config.get("strength"),
+        }
+
+        # Tear down the previous plane and rebuild — simplest way to make
+        # sure the new TextureStages take effect.
+        if hasattr(self, "ground_plane") and self.ground_plane is not None:
+            try:
+                self.ground_plane.removeNode()
+            except Exception:
+                pass
+            self.ground_plane = None
+
+        self.create_ground_plane()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main():
+    app = QApplication(sys.argv)
+
+    # 1) Qt main window FIRST — Panda needs its HWND to embed into.
+    win = MainWindow()
+    win.show()
+
+    # 2) Force Qt to actually allocate native handles for the QFrame.
+    #    .winId() implicitly calls QWidget::create() if not yet created.
+    app.processEvents()
+    parent_hwnd = win.panda_container_hwnd()
+
+    # 3) Panda3D as a CHILD of that HWND from the very start.
+    init_w = max(1, win.panda_container.width())
+    init_h = max(1, win.panda_container.height())
+    panda_app = MyApp(parent_hwnd=parent_hwnd, init_size=(init_w, init_h))
+
+    # 4) Wire telemetry, controls, fly cam tick into the live window.
+    win.attach_panda(panda_app)
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
