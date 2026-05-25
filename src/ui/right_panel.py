@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent, QSize, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent, QSize, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QPainter, QPen, QBrush, QPixmap, QIcon, QFontMetrics,
     QPainterPath,
@@ -62,7 +62,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QComboBox,
     QListWidget, QListWidgetItem, QGroupBox, QPushButton, QFrame,
     QScrollArea, QSizePolicy, QGraphicsDropShadowEffect, QDialog,
-    QGridLayout, QDoubleSpinBox,
+    QGridLayout, QDoubleSpinBox, QMenu, QApplication,
 )
 
 from src.ui.ui_theme import (
@@ -281,6 +281,40 @@ def _make_view_icon(size: int = 14, color: str = COLOR_TEXT_MUTED) -> QIcon:
     p.setPen(QPen(QColor(color), 1.8, Qt.PenStyle.SolidLine,
                   Qt.PenCapStyle.RoundCap))
     p.drawLine(QPointF(sx, sy), QPointF(ex, ey))
+
+    p.end()
+    pm.setDevicePixelRatio(scale)
+    return QIcon(pm)
+
+
+def _make_copy_icon(size: int = 14, color: str = COLOR_TEXT_MUTED) -> QIcon:
+    """Two overlapping rounded rectangles — the classic 'copy' glyph."""
+    s = size
+    scale = 2
+    pm = QPixmap(s * scale, s * scale)
+    pm.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.scale(scale, scale)
+
+    pen = QPen(QColor(color), 1.3)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+
+    # Back sheet (top-right).
+    back = QRectF(s * 0.32, s * 0.16, s * 0.50, s * 0.55)
+    p.drawRoundedRect(back, 1.5, 1.5)
+    # Front sheet (bottom-left), slightly larger to overlap.
+    front = QRectF(s * 0.16, s * 0.30, s * 0.50, s * 0.55)
+    # Clear the part of the back sheet that the front sheet covers so the
+    # two outlines don't visually merge into a single shape.
+    p.save()
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+    p.fillRect(front, Qt.GlobalColor.transparent)
+    p.restore()
+    p.drawRoundedRect(front, 1.5, 1.5)
 
     p.end()
     pm.setDevicePixelRatio(scale)
@@ -998,6 +1032,12 @@ class RightPanel(QWidget):
 
         self.lst_recon.currentItemChanged.connect(self._on_recon_changed)
         self.lst_recon.itemClicked.connect(self._on_recon_clicked)
+        self.lst_recon.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.lst_recon.customContextMenuRequested.connect(
+            self._on_recon_context_menu
+        )
         # ---- Reset + Generate row (above the Recon list) -----------
         # Used to live in a footer at the very bottom; moved up so the
         # primary scene-pipeline trigger sits right next to the controls
@@ -1274,6 +1314,25 @@ class RightPanel(QWidget):
         if hasattr(self, "btn_run_recon"):
             self.btn_run_recon.setEnabled(True)
 
+    def _on_recon_context_menu(self, pos: QPoint) -> None:
+        """Right-click menu on a recon row: copy its file name to clipboard."""
+        item = self.lst_recon.itemAt(pos)
+        if item is None:
+            return
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(idx, int) or not (0 <= idx < len(self._recons)):
+            return
+        rec = self._recons[idx]
+        name = str(rec.name or "").strip()
+        if not name:
+            return
+
+        menu = QMenu(self.lst_recon)
+        act_copy = menu.addAction("Скопировать имя файла")
+        chosen = menu.exec(self.lst_recon.viewport().mapToGlobal(pos))
+        if chosen is act_copy:
+            QApplication.clipboard().setText(name)
+
     def _on_view_requested(self, idx: int) -> None:
         """
         Per-row "open" button handler — pops the photo viewer modal over
@@ -1487,7 +1546,60 @@ class RightPanel(QWidget):
             else:
                 v.setProperty("role", "muted")
 
-            self._details_form.addRow(k, v)
+            if label == "ФАЙЛ" and value and value != "—":
+                # Pair the file name with a small copy-to-clipboard button.
+                # The button is allowed to be QLabel-sized so it lines up
+                # with the first text line even when the file name wraps.
+                v.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse
+                )
+                cell = QWidget()
+                cell_lay = QHBoxLayout(cell)
+                cell_lay.setContentsMargins(0, 0, 0, 0)
+                cell_lay.setSpacing(6)
+                cell_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+                cell_lay.addWidget(v, 1)
+
+                btn_copy = QPushButton()
+                btn_copy.setIcon(_make_copy_icon(14, COLOR_TEXT_MUTED))
+                btn_copy.setIconSize(QSize(14, 14))
+                btn_copy.setFixedSize(22, 22)
+                btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_copy.setToolTip("Скопировать имя файла")
+                btn_copy.setStyleSheet(
+                    "QPushButton {"
+                    "  background: transparent;"
+                    "  border: 1px solid transparent; border-radius: 5px;"
+                    "  padding: 0; min-width: 22px; max-width: 22px;"
+                    "  min-height: 22px; max-height: 22px;"
+                    "}"
+                    "QPushButton:hover {"
+                    "  background-color: rgba(255,255,255,12);"
+                    f"  border-color: {COLOR_HAIRLINE};"
+                    "}"
+                    "QPushButton:pressed {"
+                    "  background-color: rgba(0,255,136,18);"
+                    f"  border-color: {COLOR_ACCENT};"
+                    "}"
+                )
+                btn_copy.clicked.connect(
+                    lambda _checked=False, _name=value, _b=btn_copy:
+                        self._copy_filename_to_clipboard(_name, _b)
+                )
+                cell_lay.addWidget(btn_copy, 0, Qt.AlignmentFlag.AlignTop)
+                self._details_form.addRow(k, cell)
+            else:
+                self._details_form.addRow(k, v)
+
+    def _copy_filename_to_clipboard(self, name: str,
+                                    btn: QPushButton) -> None:
+        """Copy `name` to clipboard and briefly flash the button tooltip."""
+        QApplication.clipboard().setText(name)
+        btn.setToolTip("Скопировано")
+        QTimer.singleShot(
+            1200,
+            lambda b=btn: b.setToolTip("Скопировать имя файла"),
+        )
 
     # ==================================================================
     # Combo handlers
@@ -1566,6 +1678,39 @@ class RightPanel(QWidget):
     # ==================================================================
     def current_model_key(self):
         return self.cmb_model.itemData(self.cmb_model.currentIndex())
+
+    def set_current_model_key(self, key) -> bool:
+        """
+        Програмно выставить выбранный model set в комбо-боксе.
+        Используется, когда модель загружается в сцену в обход юзера
+        (например, при запуске реконструкции из JSON) — комбо тогда
+        отставал, и current_model_key() возвращал устаревшее значение.
+
+        Сигналы блокируются, чтобы не триггерить повторный
+        cache_and_load_model_set (модель уже загружена вызывающим кодом).
+        Однако спинбокс target-volume и details-форму синхронизируем
+        вручную — как это сделал бы _on_model_index_changed.
+
+        Возвращает True, если ключ найден в комбо и индекс выставлен.
+        """
+        if key is None:
+            return False
+        for i in range(self.cmb_model.count()):
+            if self.cmb_model.itemData(i) == key:
+                self.cmb_model.blockSignals(True)
+                try:
+                    self.cmb_model.setCurrentIndex(i)
+                finally:
+                    self.cmb_model.blockSignals(False)
+                if hasattr(self, "spn_target"):
+                    mc = get_model_set_config(str(key))
+                    if mc and mc.get("max_volume") is not None:
+                        try:
+                            self.spn_target.setValue(float(mc["max_volume"]))
+                        except (TypeError, ValueError):
+                            pass
+                return True
+        return False
 
     def current_texture_key(self):
         return self.cmb_texture.itemData(self.cmb_texture.currentIndex())

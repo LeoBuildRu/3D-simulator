@@ -13,6 +13,8 @@ sys.path.append(os.path.join(current_dir, "render_pipeline"))
 # INCLUDE FILES — кладём всё, что нужно EXE
 # -----------------------------------------------------
 include_files = [
+    # assets/models содержит base.bam + base_without_ground.bam + текстуры в
+    # подпапке tex. Копируется рекурсивно — не разбивать на отдельные строки.
     ("assets/models", "assets/models"),
     ("assets/textures", "assets/textures"),
     ("assets/height_examples", "assets/height_examples"),
@@ -53,6 +55,10 @@ packages = [
     "pyopengltk", "python_utils", "rtree", "skimage",
     "tifffile", "typing_extensions", "wrapt",
 
+    # PyQt6 — основа UI (src/ui/*.py, src/core/crash_reporter.py).
+    # Без явного указания cx_Freeze автоопределяет, но эксплицитно надёжнее.
+    "PyQt6",
+
     # RenderPipeline
     "render_pipeline",
     "render_pipeline.rpcore",
@@ -88,6 +94,10 @@ build_exe_options = {
 
     # Для Windows (MSVC runtime)
     "include_msvcr": True,
+
+    # Билд кладём отдельно от исходников проекта, чтобы toner_project/
+    # оставался чистым (никаких build/ внутри репозитория).
+    "build_exe": r"C:\Users\larle\compile_vizUtil_cx_Freeze",
 }
 
 # -----------------------------------------------------

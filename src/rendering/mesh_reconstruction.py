@@ -199,7 +199,10 @@ class MeshReconstruction:
         где зелёный канал интерпретируется как сила нормалей (см.
         main.py:_apply_textures_and_material).
         """
-        from panda3d.core import Texture, TextureStage, Material, Filename
+        from panda3d.core import (
+            Texture, TextureStage, Material, Filename,
+            GeomNode, GeomVertexReader, GeomVertexWriter,
+        )
         import os
 
         tex_dir       = os.path.join("assets", "textures", "groundV2_4k")
@@ -211,8 +214,44 @@ class MeshReconstruction:
             self.log(f"⚠️ Не найдена {diffuse_path} — меш без текстуры")
             return
 
-        # Babylon-параметры тайлинга, см. GROUND_V2_4K в babylon-viewer.js.
-        U_SCALE, V_SCALE = 0.7, 1.8
+        # Тайлинг берём из текущего набора текстур (textures_napolnitel_config.json
+        # на сервере), а не из жёстко зашитых Babylon-констант — иначе правка
+        # textureRepeatX/Y на сервере не влияет на меш реконструкции.
+        # Fallback на исторические Babylon-значения, если по какой-то причине
+        # current_texture_set ещё не подъехал.
+        tex_set = getattr(self.panda_app, "current_texture_set", None) or {}
+        try:
+            U_SCALE = float(tex_set.get("textureRepeatX", 0.7))
+        except (TypeError, ValueError):
+            U_SCALE = 0.7
+        try:
+            V_SCALE = float(tex_set.get("textureRepeatY", 1.8))
+        except (TypeError, ValueError):
+            V_SCALE = 1.8
+
+        # RenderPipeline подменяет панда-шейдеры, и matrix у TextureStage
+        # (setTexScale) в его пайплайн НЕ доезжает — текстура всегда видна
+        # 1:1 как при scale=(1,1). Поэтому масштаб мы запекаем напрямую в
+        # texcoord: trimesh_to_panda кладёт UV в диапазон [0, 1] планарным
+        # маппингом по XY-bbox, умножаем их на (U_SCALE, V_SCALE) и режим
+        # WMRepeat у текстуры даёт нужное число повторов.
+        gn = node_path.node()
+        if isinstance(gn, GeomNode):
+            for gi in range(gn.getNumGeoms()):
+                geom  = gn.modifyGeom(gi)
+                vdata = geom.modifyVertexData()
+                n_rows = vdata.getNumRows()
+                if n_rows <= 0:
+                    continue
+                reader = GeomVertexReader(vdata, "texcoord")
+                uvs = []
+                for _ in range(n_rows):
+                    uv = reader.getData2f()
+                    uvs.append((uv[0] * U_SCALE, uv[1] * V_SCALE))
+                del reader
+                writer = GeomVertexWriter(vdata, "texcoord")
+                for u, v in uvs:
+                    writer.setData2f(u, v)
 
         loader = self.panda_app.loader
 
@@ -231,14 +270,14 @@ class MeshReconstruction:
 
         # Слоты как в main.py:_apply_textures_and_material — иначе RP-шейдер
         # не подберёт нужные сэмплеры по их sort-индексам.
+        # NOTE: setTexScale здесь НЕ вызываем — масштаб уже зашит в UV выше,
+        # а RenderPipeline всё равно не уважает texture-matrix у стейджа.
         ts_color = TextureStage("0-color");     ts_color.setSort(0)
         node_path.setTexture(ts_color, _make_tex(diffuse_path, srgb=True), 1)
-        node_path.setTexScale(ts_color, U_SCALE, V_SCALE)
 
         if os.path.isfile(normal_path):
             ts_normal = TextureStage("1-normal"); ts_normal.setSort(1)
             node_path.setTexture(ts_normal, _make_tex(normal_path), 1)
-            node_path.setTexScale(ts_normal, U_SCALE, V_SCALE)
 
         # Metallic — заглушка с нулевой металличностью (как в main.py).
         ts_metal = TextureStage("2-metallic"); ts_metal.setSort(2)
@@ -252,7 +291,6 @@ class MeshReconstruction:
         if os.path.isfile(rough_path):
             ts_rough = TextureStage("3-roughness"); ts_rough.setSort(3)
             node_path.setTexture(ts_rough, _make_tex(rough_path), 1)
-            node_path.setTexScale(ts_rough, U_SCALE, V_SCALE)
 
         mat = Material()
         mat.set_base_color((1, 1, 1, 1))

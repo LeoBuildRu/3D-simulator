@@ -31,7 +31,7 @@ class FlyCamera:
     """Per-frame fly camera driven from Panda3D's input system."""
 
     # ---- Tunables ----------------------------------------------------
-    MOVE_SPEED   = 60.0   # world units / sec
+    MOVE_SPEED   = 10.0   # world units / sec
     SPRINT_MULT  = 4.0
     LOOK_SENS    = 0.18   # degrees per pixel of mouse delta
     PITCH_LIMIT  = 89.0   # ± degrees

@@ -140,12 +140,7 @@ class PerlinMeshGenerator:
             mv = max(tv * 1.5, 20.0)
 
         ratio = max(0.05, min(1.5, tv / mv if mv > 0 else 0.5))
-        # Множитель 0.6 (было 1.5) даёт более низкий ANT-перлин, чтобы
-        # макро-«горки» были не выше ~0.5м даже при полностью заполненном
-        # napolnitel'е. Высокую детализацию добавляет уже серверный
-        # DISPLACE-модификатор поверх — он работает с 4K-картой на
-        # subdivided сетке (~270k вершин при number_cuts=10).
-        height_blender = max(0.05, min(1.0, ratio * 0.6))
+        height_blender = 1.2
 
         noise_scale_blender = 1.36 + random.uniform(-0.30, 0.30)
         distortion_blender = 1.39 + random.uniform(-0.35, 0.35)

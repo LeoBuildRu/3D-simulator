@@ -849,6 +849,25 @@ class MainWindow(QMainWindow):
                         ))
                         print(f"[Recon] model set "
                               f"'{model_key}' loaded: {ok}")
+                        # Синхронизируем выбор в правой панели: иначе
+                        # right_panel.current_model_key() продолжает
+                        # возвращать прежний (дефолтный) ключ, и
+                        # _apply_onboard_camera берёт камеру не той модели.
+                        if ok:
+                            rp = getattr(self, "right_panel", None)
+                            if rp is not None and hasattr(
+                                rp, "set_current_model_key"
+                            ):
+                                rp.set_current_model_key(model_key)
+                            # Если на момент реконструкции уже включён
+                            # бортовой вид — пересобираем pos/hpr камеры
+                            # под новую модель сразу, чтобы пользователю
+                            # не пришлось переключать режим вручную.
+                            if getattr(self, "_camera_mode", None) == "onboard":
+                                try:
+                                    self._apply_onboard_camera()
+                                except Exception as exc:
+                                    print(f"[Recon] reapply onboard: {exc}")
                     except Exception as exc:
                         print(f"[Recon] cache_and_load_model_set: {exc}")
                 else:
@@ -1354,6 +1373,37 @@ class MainWindow(QMainWindow):
     _STATIONARY_POS = (1.0, 1.1, 8.0)
     _STATIONARY_HPR = (-627.9, -74.1, 0.0)   # h=yaw, p=pitch, r=roll
     _STATIONARY_FOV = 100.0
+    # Стандартное FOV из RenderPipeline (см. rpcore/render_pipeline.py:476 —
+    # self._showbase.camLens.set_fov(125)). При входе в бортовой режим
+    # _apply_stationary_camera мог оставить FOV=100 от предыдущего STATIC,
+    # из-за чего бортовая камера выглядела неправильно. Возвращаем на pipeline-дефолт.
+    _ONBOARD_FOV = 125.0
+
+    # Depth-pass presets per camera mode: (near, far, gradient_start, gradient_end).
+    _STATIONARY_DEPTH = (0.01, 64.0, 0.10, 0.25)
+    _ONBOARD_DEPTH    = (0.01, 58.0, 0.01, 0.19)
+
+    def _apply_depth_preset(self, preset: tuple) -> None:
+        """Drive the depth-settings spin boxes; their valueChanged signals
+        propagate to the depth_renderer."""
+        try:
+            near, far, g_a, g_b = preset
+        except (TypeError, ValueError):
+            return
+        # Order: far before near to avoid a transient where new near > old far
+        # would clamp the spin box; same logic for grad start/end.
+        for spin, value in (
+            (getattr(self, "spn_far", None),  far),
+            (getattr(self, "spn_near", None), near),
+            (getattr(self, "spn_g_b", None),  g_b),
+            (getattr(self, "spn_g_a", None),  g_a),
+        ):
+            if spin is None:
+                continue
+            try:
+                spin.setValue(float(value))
+            except Exception as exc:
+                print(f"[Depth] preset set failed: {exc}")
 
     def _on_camera_mode(self, mode: str) -> None:
         if self.panda_app is None:
@@ -1400,6 +1450,7 @@ class MainWindow(QMainWindow):
                   f"hpr={self._STATIONARY_HPR} fov={self._STATIONARY_FOV}")
         except Exception as exc:
             print(f"[Camera] stationary preset failed: {exc}")
+        self._apply_depth_preset(self._STATIONARY_DEPTH)
 
     # ------------------------------------------------------------------
     def _apply_onboard_camera(self) -> None:
@@ -1436,10 +1487,18 @@ class MainWindow(QMainWindow):
         try:
             cam.set_pos(cx, cy, cz)
             cam.set_hpr(ch, cp, cr)
+            # Восстанавливаем pipeline-дефолтный FOV (RenderPipeline
+            # инициализирует camLens c set_fov(125)). Без этого после
+            # STATIC-режима, который ставил 100, бортовая камера наследовала
+            # его FOV и картинка выглядела неверно.
+            lens = self.panda_app.cam.node().get_lens()
+            if lens is not None and hasattr(lens, "set_fov"):
+                lens.set_fov(self._ONBOARD_FOV)
             print(f"[Camera] ONBOARD '{key}' pos=({cx},{cy},{cz}) "
-                  f"hpr=({ch},{cp},{cr})")
+                  f"hpr=({ch},{cp},{cr}) fov={self._ONBOARD_FOV}")
         except Exception as exc:
             print(f"[Camera] onboard preset failed: {exc}")
+        self._apply_depth_preset(self._ONBOARD_DEPTH)
 
     # ==================================================================
     # Save-render handler
