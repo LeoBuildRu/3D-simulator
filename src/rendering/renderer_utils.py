@@ -238,6 +238,16 @@ class RendererUtils:
         img_distorted = self.barrel_distortion(img, k1=k1, k2=k2)
         img_cropped = self.crop_image(img_distorted, left=crop_left, top=crop_top, right=crop_right, bottom=crop_bottom)
         img_final = self.stretch_to_1920x1080(img_cropped)
+
+        # Те же самые искажения применяем к карте глубины,
+        # чтобы цветной и depth кадры попиксельно совпадали.
+        depth_distorted = self.barrel_distortion(depthImg, k1=k1, k2=k2)
+        depth_cropped = self.crop_image(
+            depth_distorted, left=crop_left, top=crop_top,
+            right=crop_right, bottom=crop_bottom,
+        )
+        depth_final = self.stretch_to_1920x1080(depth_cropped)
+        depth_final = self.fix_alpha_to_opaque(depth_final)
         
         # Преобразуем 2D точки с учетом всех примененных трансформаций
         transformed_points_2d = []
@@ -356,7 +366,7 @@ class RendererUtils:
         
         # Сохраняем финальное изображение
         img_final.write(Filename.from_os_specific(output_path))
-        depthImg.write(Filename.from_os_specific(output_path_depth))
+        depth_final.write(Filename.from_os_specific(output_path_depth))
         
         # Формируем render_metadata только с необходимыми данными
         render_metadata = {}
@@ -420,10 +430,19 @@ class RendererUtils:
         else:
             render_metadata["texture_diffuse"] = None
         
+        # Сливаем пользовательские метаданные (variant, camera state и т.п.),
+        # которые раньше передавались, но игнорировались.
+        if metadata:
+            for k, v in metadata.items():
+                if k not in render_metadata:
+                    render_metadata[k] = v
+                else:
+                    render_metadata[f"extra_{k}"] = v
+
         json_path = output_path.replace(".png", ".json")
         with open(json_path, 'w') as f:
             json.dump(render_metadata, f, indent=2)
-        
+
         return output_path
     
     def create_video_from_frames(self, output_dir="renders/datasets_metric_/", video_name="camera_rotation.mp4", fps=20):
@@ -461,11 +480,16 @@ class RendererUtils:
             if os.path.exists(list_file):
                 os.remove(list_file)
 
-    def wait_panda_render(self):    
-        for i in range(2):
+    def wait_panda_render(self, ticks=12):
+        # Больше ручных тиков RenderPipeline -> постэффекты (TAA, motion blur,
+        # bloom и т.п.) успевают сойтись к стационарной картинке, иначе
+        # на скриншотах остаётся "смаз" после движения камеры/смены света.
+        for _ in range(max(1, int(ticks))):
             self.panda_app.graphicsEngine.renderFrame()
-    
-    def save_single_render(self):
+
+    def save_single_render(self, output_dir="renders/single",
+                           filename_prefix="single_render",
+                           extra_metadata=None):
         lens = self.panda_app.cam.node().getLens()
         if isinstance(lens, PerspectiveLens):
             fov = lens.getFov()
@@ -474,53 +498,67 @@ class RendererUtils:
         else:
             camera_fov_x = camera_fov_y = None
         
+        # Скрываем depth overlay, ждём пока кадр устаканится, делаем
+        # цветной скриншот. Увеличенный wait_panda_render + sleep здесь
+        # нужны, чтобы убрать моушн-блюр от только что выполненных
+        # движений камеры / смены освещения.
         self.panda_app.depth_renderer.set_overlay_visibility(False)
-        self.wait_panda_render()
+        self.wait_panda_render(ticks=14)
+        time.sleep(1.0)
+        self.wait_panda_render(ticks=6)
 
         img = PNMImage()
         if not self.panda_app.win.getScreenshot(img):
+            self.panda_app.depth_renderer.set_overlay_visibility(False)
             return False
-            
+
         self.panda_app.depth_renderer.set_overlay_visibility(True)
+        self.wait_panda_render(ticks=10)
+        time.sleep(1.0)
+        self.wait_panda_render(ticks=6)
 
-        time.sleep(0.5)
-
-        self.wait_panda_render()
-        
         depthImg = PNMImage()
         if not self.panda_app.win.getScreenshot(depthImg):
+            self.panda_app.depth_renderer.set_overlay_visibility(False)
             return False
-        
+
         self.panda_app.depth_renderer.set_overlay_visibility(False)
-        
+
         img = self.stretch_to_1920x1080(img)
         depthImg = self.stretch_to_1920x1080(depthImg)
         depthImg = self.fix_alpha_to_opaque(depthImg)
-        
+
+        metadata = {
+            "render_type": "single",
+            "camera_position": {
+                "x": float(self.panda_app.camera.getX()),
+                "y": float(self.panda_app.camera.getY()),
+                "z": float(self.panda_app.camera.getZ()),
+            },
+            "camera_rotation": {
+                "h": float(self.panda_app.camera.getH()),
+                "p": float(self.panda_app.camera.getP()),
+                "r": float(self.panda_app.camera.getR()),
+            },
+            "model_set": (
+                self.panda_app.current_model_set
+                if hasattr(self.panda_app, 'current_model_set') else None
+            ),
+            "target_volume": getattr(self.panda_app, 'Target_Volume', None),
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+
         output_path = self._process_render_image(
             img,
-            depthImg, 
+            depthImg,
             camera_fov_x=camera_fov_x,
             camera_fov_y=camera_fov_y,
-            output_dir="renders/single",
-            filename_prefix="single_render",
-            metadata={
-                "render_type": "single",
-                "camera_position": {
-                    "x": float(self.panda_app.camera.getX()),
-                    "y": float(self.panda_app.camera.getY()),
-                    "z": float(self.panda_app.camera.getZ())
-                },
-                "camera_rotation": {
-                    "h": float(self.panda_app.camera.getH()),
-                    "p": float(self.panda_app.camera.getP()),
-                    "r": float(self.panda_app.camera.getR())
-                },
-                "model_set": self.panda_app.current_model_set if hasattr(self.panda_app, 'current_model_set') else None,
-                "target_volume": self.panda_app.Target_Volume
-            }
+            output_dir=output_dir,
+            filename_prefix=filename_prefix,
+            metadata=metadata,
         )
-        
+
         return True
     
     def save_dataset_render(self):

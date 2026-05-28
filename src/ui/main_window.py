@@ -20,6 +20,9 @@ from src.ui.overlay_widgets import SceneOverlay, DepthMapOverlay
 from src.ui.right_panel import RightPanel
 import os
 import json
+import math
+import random
+import time
 import shutil
 import tempfile
 from typing import Any
@@ -1544,22 +1547,53 @@ class MainWindow(QMainWindow):
         self.btn_save_render.setEnabled(False)
         original_text = self.btn_save_render.text()
         ok_count = 0
+
+        # Freeze fly-cam for the whole dataset run, чтобы наши setPos /
+        # setHpr на каждом варианте не сбивались тиком fly_cam.
+        fc = getattr(self.panda_app, "fly_cam", None)
+        prev_frozen = None
+        if fc is not None and hasattr(fc, "set_frozen"):
+            try:
+                prev_frozen = (
+                    fc.is_frozen() if hasattr(fc, "is_frozen") else None
+                )
+                fc.set_frozen(True)
+            except Exception:
+                prev_frozen = None
+
+        base_daytime_mins = 6 * 60 + 40
+        if hasattr(self, "daytime_slider"):
+            try:
+                base_daytime_mins = int(self.daytime_slider.value())
+            except Exception:
+                pass
+
+        def _set_daytime(mins: int) -> None:
+            mins = int(mins) % 1440
+            hh, mm = mins // 60, mins % 60
+            txt = f"{hh:02d}:{mm:02d}"
+            try:
+                rp = getattr(self.panda_app, "render_pipeline", None)
+                dt_mgr = getattr(rp, "daytime_mgr", None) if rp else None
+                if dt_mgr is not None:
+                    dt_mgr.time = txt
+            except Exception as exc:
+                print(f"[SaveRender] daytime set failed: {exc}")
+
         try:
             for i in range(count):
-                # Target ramp: step = max_volume/N, target = step*(i+1)
+                # Target ramp: step = max_volume/N, target = step*(i+1).
+                # Чем больше N (текущий индекс), тем больше объём
+                # наполнения — та же логика, что и раньше.
                 if max_volume is not None:
                     target = (max_volume / count) * (i + 1)
                 else:
-                    # Fallback: just keep whatever Target_Volume the
-                    # right-panel spinbox holds.
                     target = float(rp.current_target_volume()) if rp else 0.0
 
                 self.btn_save_render.setText(f"{i+1}/{count}")
                 QApplication.processEvents()
 
-                # Run the full pipeline at this target volume - same
-                # call MainWindow uses for the right-panel "Generate"
-                # button, just with a synthesised payload.
+                # Сгенерировать новое наполнение для этой итерации.
                 try:
                     self._on_run_simulation({
                         "model_key":     model_key,
@@ -1571,46 +1605,177 @@ class MainWindow(QMainWindow):
                     QApplication.processEvents()
                     continue
 
-                # Let the pipeline's last few frames render before we
-                # screenshot - 2 event-loop passes is usually enough.
-                for _ in range(2):
+                # Подождать, пока финальные кадры пайплайна успеют
+                # отрисоваться.
+                for _ in range(4):
+                    QApplication.processEvents()
+                    time.sleep(0.05)
+
+                # Базовое состояние камеры — то, что выбрал пользователь
+                # (free / stationary / onboard уже выставил позицию).
+                cam = self.panda_app.camera
+                base_pos = cam.getPos()
+                base_hpr = cam.getHpr()
+                base_pos_t = (float(base_pos.x),
+                              float(base_pos.y),
+                              float(base_pos.z))
+                base_hpr_t = (float(base_hpr.x),
+                              float(base_hpr.y),
+                              float(base_hpr.z))
+
+                # 10 равномерно распределённых временных меток
+                # (0:00, 2:24, ... 21:36).
+                tod_list = [int(round(k * 1440.0 / 10.0)) for k in range(10)]
+
+                # Один "альтернативный" момент времени, гарантированно
+                # отличающийся от базового хотя бы на 2 часа.
+                far_choices = [
+                    t for t in range(0, 1440, 30)
+                    if abs(t - base_daytime_mins) >= 120
+                ]
+                alt_time = random.choice(far_choices) if far_choices else 0
+
+                # 5 см → 0.05 единицы Panda (проект работает в метрах).
+                OFFSET_M = 0.05
+                ANG_DEG = 10.0
+
+                variants: list[tuple[str, dict]] = [
+                    ("orig",          {}),
+                    ("light_alt",     {"time": alt_time}),
+                    ("h_plus10",      {"dh":  +ANG_DEG}),
+                    ("h_minus10",     {"dh":  -ANG_DEG}),
+                    ("p_plus10",      {"dp":  +ANG_DEG}),
+                    ("p_minus10",     {"dp":  -ANG_DEG}),
+                    ("lat_plus5cm",   {"lat": +OFFSET_M}),
+                    ("lat_minus5cm",  {"lat": -OFFSET_M}),
+                    ("vert_plus5cm",  {"vert": +OFFSET_M}),
+                    ("vert_minus5cm", {"vert": -OFFSET_M}),
+                ]
+                for t in tod_list:
+                    variants.append((f"tod_{t:04d}m", {"time": t}))
+                variants.append((
+                    "random_combined",
+                    {
+                        "dh":   random.uniform(-ANG_DEG,  ANG_DEG),
+                        "dp":   random.uniform(-ANG_DEG,  ANG_DEG),
+                        "lat":  random.uniform(-OFFSET_M, OFFSET_M),
+                        "vert": random.uniform(-OFFSET_M, OFFSET_M),
+                        "time": random.randint(0, 1439),
+                    },
+                ))
+
+                for v_idx, (v_name, p) in enumerate(variants):
+                    # 1) Восстанавливаем базовую позу
+                    cam.setPos(*base_pos_t)
+                    cam.setHpr(*base_hpr_t)
+
+                    # 2) Угловые отклонения (heading = горизонталь,
+                    #    pitch = вертикаль).
+                    dh = float(p.get("dh", 0.0))
+                    dp = float(p.get("dp", 0.0))
+                    if dh or dp:
+                        cam.setHpr(
+                            base_hpr_t[0] + dh,
+                            base_hpr_t[1] + dp,
+                            base_hpr_t[2],
+                        )
+
+                    # 3) Смещения в локальном фрейме камеры:
+                    #    +X — вправо, +Z — вверх.
+                    lat = float(p.get("lat", 0.0))
+                    vert = float(p.get("vert", 0.0))
+                    if lat or vert:
+                        cam.setPos(cam, lat, 0.0, vert)
+
+                    # 4) Время суток
+                    t_val = p.get("time", None)
+                    if t_val is None:
+                        _set_daytime(base_daytime_mins)
+                    else:
+                        _set_daytime(int(t_val))
+
+                    # Дать UI/Panda обработать setPos/setHpr и обновлённое
+                    # освещение перед тем как звать save_single_render
+                    # (внутри он сам делает дополнительные ручные тики
+                    # против motion blur).
+                    for _ in range(3):
+                        QApplication.processEvents()
+                        time.sleep(0.05)
+
+                    self.btn_save_render.setText(
+                        f"{i+1}/{count} · {v_idx+1}/{len(variants)}"
+                    )
                     QApplication.processEvents()
 
-                # Save the SAME filling from BOTH the on-board view
-                # (cam_pos/cam_rot from models_config.yaml) and the
-                # stationary preset. Two screenshots per pipeline run.
-                shot_modes = (
-                    ("onboard",   self._apply_onboard_camera),
-                    ("stationary", self._apply_stationary_camera),
-                )
-                for mode_name, switch_to_mode in shot_modes:
+                    applied_time = (
+                        int(t_val) if t_val is not None
+                        else int(base_daytime_mins)
+                    )
+                    extra_meta = {
+                        "render_type": "dataset",
+                        "iteration": i,
+                        "iteration_total": count,
+                        "variant": v_name,
+                        "variant_index": v_idx,
+                        "variant_params": p,
+                        "camera_mode": getattr(self, "_camera_mode", None),
+                        "base_camera_position": {
+                            "x": base_pos_t[0],
+                            "y": base_pos_t[1],
+                            "z": base_pos_t[2],
+                        },
+                        "base_camera_rotation": {
+                            "h": base_hpr_t[0],
+                            "p": base_hpr_t[1],
+                            "r": base_hpr_t[2],
+                        },
+                        "base_daytime_minutes": int(base_daytime_mins),
+                        "applied_daytime_minutes": applied_time,
+                        "target_volume": float(target),
+                        "model_key":   model_key,
+                        "texture_key": texture_key,
+                    }
+
+                    prefix = (
+                        f"i{i:03d}_vol{target:07.2f}_"
+                        f"v{v_idx:02d}_{v_name}"
+                    )
+
                     try:
-                        switch_to_mode()
-                    except Exception as exc:
-                        print(f"[SaveRender] cam-mode '{mode_name}' "
-                              f"failed: {exc}")
-                        continue
-                    # Let the new camera transform settle.
-                    for _ in range(2):
-                        QApplication.processEvents()
-                    try:
-                        if ru.save_single_render():
+                        ok = ru.save_single_render(
+                            output_dir="renders/dataset",
+                            filename_prefix=prefix,
+                            extra_metadata=extra_meta,
+                        )
+                        if ok:
                             ok_count += 1
-                            print(f"[SaveRender] frame {i+1}/{count} "
-                                  f"@ target={target:.2f} "
-                                  f"({mode_name}) saved")
+                            print(f"[SaveRender] {i+1}/{count} "
+                                  f"v={v_name} target={target:.2f} saved")
                         else:
-                            print(f"[SaveRender] frame {i+1} "
-                                  f"({mode_name}) returned False")
+                            print(f"[SaveRender] {i+1}/{count} "
+                                  f"v={v_name} returned False")
                     except Exception as exc:
-                        print(f"[SaveRender] frame {i+1} "
-                              f"({mode_name}) save failed: {exc}")
+                        print(f"[SaveRender] {i+1}/{count} "
+                              f"v={v_name} save failed: {exc}")
                     QApplication.processEvents()
+
+                # Восстановить базовую позу и время после всех вариантов
+                # текущей итерации, чтобы следующий _on_run_simulation
+                # стартовал с того же состояния, что и пользователь видит.
+                cam.setPos(*base_pos_t)
+                cam.setHpr(*base_hpr_t)
+                _set_daytime(base_daytime_mins)
         finally:
+            # Вернуть fly_cam в его прежнее состояние.
+            if fc is not None and hasattr(fc, "set_frozen") and prev_frozen is not None:
+                try:
+                    fc.set_frozen(bool(prev_frozen))
+                except Exception:
+                    pass
             self.btn_save_render.setText(original_text)
             self.btn_save_render.setEnabled(True)
-        print(f"[SaveRender] saved {ok_count}/{count} render(s); "
-              f"max_volume={max_volume}")
+        print(f"[SaveRender] saved {ok_count} render(s) across "
+              f"{count} iteration(s); max_volume={max_volume}")
 
     def _update_telemetry(self) -> None:
         if self.panda_app is None:
