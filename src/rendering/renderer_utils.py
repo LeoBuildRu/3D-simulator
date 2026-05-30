@@ -528,6 +528,19 @@ class RendererUtils:
         depthImg = self.stretch_to_1920x1080(depthImg)
         depthImg = self.fix_alpha_to_opaque(depthImg)
 
+        # Клиентский пересчёт объёма реально сгенерированного меша
+        # наполнения (в старой версии писался как actual_volume).
+        # Берём final_model — туда perlin_mesh_generator / mesh_reconstruction
+        # кладут текущую горку наполнителя.
+        actual_volume = None
+        calc = getattr(self.panda_app, 'calculate_mesh_volume', None)
+        final_model = getattr(self.panda_app, 'final_model', None)
+        if callable(calc) and final_model is not None:
+            try:
+                actual_volume = float(calc(final_model))
+            except Exception as exc:
+                print(f"[Render] actual_volume calc failed: {exc}")
+
         metadata = {
             "render_type": "single",
             "camera_position": {
@@ -545,6 +558,7 @@ class RendererUtils:
                 if hasattr(self.panda_app, 'current_model_set') else None
             ),
             "target_volume": getattr(self.panda_app, 'Target_Volume', None),
+            "actual_volume": actual_volume,
         }
         if extra_metadata:
             metadata.update(extra_metadata)
