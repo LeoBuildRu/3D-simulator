@@ -9,6 +9,10 @@ env/
 # Настройки VS Code
 .vscode/
 
+# Per-machine graphics preset (auto-detected on first run; must NOT be
+# shared between machines or the Intel auto-fallback won't trigger)
+config/graphics.json
+
 # Логи и отчеты об ошибках
 *.log
 

@@ -257,7 +257,7 @@ class MainWindow(QMainWindow):
             )
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(0, 1439)              # minutes in a day
-            slider.setValue(6 * 60 + 40)          # 06:40 default
+            slider.setValue(13 * 60)              # 13:00 default (bright sun)
             slider.setFixedHeight(18)
             slider.setStyleSheet(
                 "QSlider::groove:horizontal {"
@@ -277,7 +277,7 @@ class MainWindow(QMainWindow):
                 "}"
             )
 
-            value_lbl = _QLabel("06:40")
+            value_lbl = _QLabel("13:00")
             value_lbl.setStyleSheet(
                 f"color: {_CT}; font-family: {_FM};"
                 f"font-size: 11px; background: transparent;"
@@ -298,12 +298,17 @@ class MainWindow(QMainWindow):
                 mm = mins % 60
                 txt = f"{hh:02d}:{mm:02d}"
                 _vlbl.setText(txt)
-                # Push to RenderPipeline's daytime manager.
+                # Prefer MyApp.set_time_of_day — it drives RenderPipeline's
+                # daytime manager (ultra/medium) OR moves the simplepbr sun
+                # (performance). Fall back to the RP daytime manager directly.
                 try:
-                    rp = getattr(_app, "render_pipeline", None)
-                    dt_mgr = getattr(rp, "daytime_mgr", None) if rp else None
-                    if dt_mgr is not None:
-                        dt_mgr.time = txt
+                    if hasattr(_app, "set_time_of_day"):
+                        _app.set_time_of_day(int(mins))
+                    else:
+                        rp = getattr(_app, "render_pipeline", None)
+                        dt_mgr = getattr(rp, "daytime_mgr", None) if rp else None
+                        if dt_mgr is not None:
+                            dt_mgr.time = txt
                 except Exception as exc:
                     print(f"[Daytime] set failed: {exc}")
 
@@ -630,6 +635,11 @@ class MainWindow(QMainWindow):
         self.right_panel.reconstructionRunRequested.connect(
             self._on_reconstruction_run
         )
+        # Graphics preset: persist the choice and prompt for a restart
+        # (the rendering engine is chosen before the Panda window exists).
+        self.right_panel.graphicsPresetChanged.connect(
+            self._on_graphics_preset_changed
+        )
 
         # ---- Camera-alignment reference overlay --------------------
         # Full-viewport translucent layer that shows a captured stand
@@ -684,6 +694,30 @@ class MainWindow(QMainWindow):
         self._telemetry_timer = QTimer(self)
         self._telemetry_timer.timeout.connect(self._update_telemetry)
         self._telemetry_timer.start(80)
+
+    # ==================================================================
+    # Graphics preset
+    # ==================================================================
+    def _on_graphics_preset_changed(self, preset_key: str) -> None:
+        """
+        Persist the chosen graphics preset and tell the user a restart is
+        needed. The rendering engine (RenderPipeline vs simplepbr) is built
+        before the Panda3D window exists, so it cannot be swapped live.
+        """
+        from src.core import graphics_settings
+        from PyQt6.QtWidgets import QMessageBox
+
+        graphics_settings.save(str(preset_key))
+        name = graphics_settings.get_preset(str(preset_key)).get(
+            "name", preset_key
+        )
+        print(f"[Graphics] preset saved: {preset_key}")
+        QMessageBox.information(
+            self,
+            "Графика",
+            f"Выбран пресет: {name}.\n\n"
+            "Изменения вступят в силу после перезапуска приложения.",
+        )
 
     # ==================================================================
     # Model / texture combo handlers

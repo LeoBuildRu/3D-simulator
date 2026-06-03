@@ -59,7 +59,16 @@ from src.rendering.mesh_reconstruction import MeshReconstruction
 from src.rendering.mesh_distribution import MeshDistributor
 from src.core.crash_reporter import TelegramCrashReporter
 from src.core.TLS_client import TLS_client
-from src.particles.falling_particles import WarpFallingParticles
+from src.core import graphics_settings
+
+# Particles depend on NVIDIA Warp (CUDA). On machines without it (e.g. the
+# Intel-iGPU target of the "performance" preset) the import must not abort
+# startup, so it is optional — particle creation is also gated on the preset.
+try:
+    from src.particles.falling_particles import WarpFallingParticles
+except Exception as _particles_exc:  # noqa: BLE001
+    WarpFallingParticles = None
+    print(f"[main] particles unavailable (warp/CUDA missing?): {_particles_exc}")
 
 BOT_TOKEN = "8773064116:AAEiJdyHYysLpSnAx-gbDHG0DMbvV92IpsA"
 CHAT_ID = "-5295757150"
@@ -118,20 +127,64 @@ class MyApp(ShowBase):
     def __init__(self, parent_hwnd: int,
                  init_size: tuple = (1920, 1080),
                  tls_host: str = "78.25.191.12",
-                 tls_port: int = 9998):
-        self.render_pipeline = RenderPipeline()
-        self.render_pipeline.pre_showbase_init()
-        
+                 tls_port: int = 9998,
+                 graphics_preset: str = "ultra"):
+        # ------------------------------------------------------------------
+        # Graphics preset decides the rendering engine. This MUST happen
+        # before ShowBase exists, because RenderPipeline has to be built
+        # before the window. See src/core/graphics_settings.py.
+        #   ultra / medium -> tobspr RenderPipeline (deferred, heavy)
+        #   performance    -> panda3d-simplepbr (forward PBR + sun shadows)
+        # ------------------------------------------------------------------
+        self.graphics_preset = graphics_preset
+        preset = graphics_settings.get_preset(graphics_preset)
+        self.use_render_pipeline = preset["engine"] == "render_pipeline"
+        self.pbr_pipeline = None
+        print(f"[MyApp] graphics preset = '{graphics_preset}' "
+              f"(engine={preset['engine']})")
+
         w, h = init_size
-        loadPrcFileData("", f"win-size {w} {h}")
-        loadPrcFileData("", "window-type onscreen")
-        loadPrcFileData("", f"parent-window-handle {int(parent_hwnd)}")
-        loadPrcFileData("", "fullscreen false")
-        loadPrcFileData("", "undecorated true")
 
-        ShowBase.__init__(self)
+        if self.use_render_pipeline:
+            self.render_pipeline = RenderPipeline()
+            # MEDIUM points RP at a trimmed config dir (fewer plugins /
+            # smaller shadows) — must be set before the VFS is mounted.
+            rp_config_dir = preset.get("rp_config_dir")
+            if rp_config_dir and os.path.isdir(rp_config_dir):
+                self.render_pipeline.mount_mgr.config_dir = rp_config_dir
+                print(f"[MyApp] RenderPipeline config dir -> {rp_config_dir}")
+            self.render_pipeline.pre_showbase_init()
 
-        self.render_pipeline.create(self)
+            loadPrcFileData("", f"win-size {w} {h}")
+            loadPrcFileData("", "window-type onscreen")
+            loadPrcFileData("", f"parent-window-handle {int(parent_hwnd)}")
+            loadPrcFileData("", "fullscreen false")
+            loadPrcFileData("", "undecorated true")
+
+            ShowBase.__init__(self)
+
+            self.render_pipeline.create(self)
+        else:
+            # PERFORMANCE: plain ShowBase with our own window flags (we do
+            # NOT load RenderPipeline's panda3d-config.prc, which forces GL
+            # 4.3 + compute shaders), then a lightweight simplepbr renderer.
+            self.render_pipeline = None
+            msaa = int(preset.get("msaa", 0))
+            loadPrcFileData("", f"win-size {w} {h}")
+            loadPrcFileData("", "window-type onscreen")
+            loadPrcFileData("", f"parent-window-handle {int(parent_hwnd)}")
+            loadPrcFileData("", "fullscreen false")
+            loadPrcFileData("", "undecorated true")
+            loadPrcFileData("", "sync-video #f")
+            loadPrcFileData("", "show-frame-rate-meter #f")
+            loadPrcFileData("", "textures-power-2 none")
+            loadPrcFileData("", f"multisamples {msaa}")
+            if msaa > 0:
+                loadPrcFileData("", "framebuffer-multisample #t")
+
+            ShowBase.__init__(self)
+
+            self._init_lightweight_renderer(preset)
 
         self.tls_client = TLS_client(host=tls_host, port=tls_port, timeout=300.0)
 
@@ -170,7 +223,7 @@ class MyApp(ShowBase):
                 if base_np is not None:
                     base_np.reparent_to(self.render)
                     base_np.set_pos(0, 0, 0)
-                    base_np.set_shader_auto()
+                    self._apply_auto_shader(base_np)
                     self.base_static_model = base_np
                     print(f"[Scene] base_without_ground.bam loaded from "
                           f"{base_path}")
@@ -342,24 +395,215 @@ class MyApp(ShowBase):
         #     print("ERROR during landscape generation:")
         #     traceback.print_exc()
 
+        # Particles use the RenderPipeline instancing effect (+ NVIDIA Warp),
+        # so they only run under the RP-based presets and when Warp imported.
+        if self.use_render_pipeline and WarpFallingParticles is not None:
+            try:
+                self.particles = WarpFallingParticles(
+                    showbase=self,
+                    render_pipeline=self.render_pipeline,
+                    texture="assets/textures/leaf.png",
+                    particle_count=1000,
+                    spawn_min=(-30.0, -30.0, 14.0),
+                    spawn_max=(30.0, 30.0, 15.0),
+                    respawn_threshold=-0.1,
+                    rotation_mode=WarpFallingParticles.RANDOM_ROTATION,
+                    size_range=(0.05, 0.20),
+                    speed_range=(1.5, 3.0),
+                    parent=self.render,
+                    alpha_blend=False,
+                    auto_start=True
+                )
+            except Exception as e:
+                traceback.print_exc()
+
+    # ==================================================================
+    # Lightweight renderer (PERFORMANCE preset) — no RenderPipeline
+    # ==================================================================
+    def _init_lightweight_renderer(self, preset):
+        """
+        Set up the "performance" preset rendering: panda3d-simplepbr
+        (forward PBR with per-pixel lighting, normal maps and a
+        shadow-casting directional sun) instead of the heavy deferred
+        RenderPipeline. Targets Intel iGPUs (20-30 fps @ 1080p).
+
+        If simplepbr cannot be imported/initialised we fall back to
+        Panda's built-in auto-shader so the scene is still lit.
+        """
+        from panda3d.core import (AmbientLight, DirectionalLight, Fog,
+                                  Vec4)
+
+        # Clip planes sized for the large (2000u) ground; natural FOV.
+        self.camLens.set_near_far(0.1, 10000.0)
+        self.camLens.set_fov(70)
+
+        shadow_res = int(preset.get("shadow_resolution", 2048))
         try:
-            self.particles = WarpFallingParticles(
-                showbase=self,
-                render_pipeline=self.render_pipeline,
-                texture="assets/textures/leaf.png",
-                particle_count=1000,
-                spawn_min=(-30.0, -30.0, 14.0),
-                spawn_max=(30.0, 30.0, 15.0),
-                respawn_threshold=-0.1,
-                rotation_mode=WarpFallingParticles.RANDOM_ROTATION,
-                size_range=(0.05, 0.20),
-                speed_range=(1.5, 3.0),
-                parent=self.render,
-                alpha_blend=False,
-                auto_start=True
+            import simplepbr
+            self.pbr_pipeline = simplepbr.init(
+                use_normal_maps=True,
+                enable_shadows=True,
+                enable_fog=bool(preset.get("enable_fog", True)),
+                max_lights=int(preset.get("max_lights", 4)),
+                msaa_samples=int(preset.get("msaa", 0)),
+                use_emission_maps=False,
+                use_occlusion_maps=True,
             )
-        except Exception as e:
-            traceback.print_exc()
+            print("[MyApp] simplepbr renderer initialised")
+        except Exception as exc:
+            self.pbr_pipeline = None
+            print(f"[MyApp] simplepbr init failed ({exc}); "
+                  f"falling back to auto-shader")
+            self.render.set_shader_auto()
+
+        # Sky colour + very light distance fog (subtle aerial depth only —
+        # the ground is ~2000u across, so density must stay low or the
+        # scene washes out). set_time_of_day keeps the fog colour in sync
+        # with the sky.
+        self._perf_fog = None
+        self.set_background_color(0.52, 0.62, 0.74, 1.0)
+        if preset.get("enable_fog", True):
+            fog = Fog("perf_distance_fog")
+            fog.set_color(0.60, 0.68, 0.78)
+            fog.set_exp_density(0.00035)
+            self.render.set_fog(fog)
+            self._perf_fog = fog
+
+        # Sun: directional, shadow-casting. DirectionalLight's default lens
+        # is orthographic, so set_film_size is in world units — sized to
+        # frame the area where models sit (around the origin).
+        sun = DirectionalLight("perf_sun")
+        sun.set_color(Vec4(1.0, 0.96, 0.88, 1.0))
+        sun.set_shadow_caster(True, shadow_res, shadow_res)
+        sun_lens = sun.get_lens()
+        sun_lens.set_film_size(90, 90)
+        sun_lens.set_near_far(1.0, 400.0)
+        self.sun = sun
+        self.sun_np = self.render.attach_new_node(sun)
+        self.render.set_light(self.sun_np)
+
+        # Low cool ambient fill — keeps shadows dark for contrast while not
+        # being pure black. set_time_of_day adjusts this with the sun.
+        amb = AmbientLight("perf_ambient")
+        amb.set_color(Vec4(0.13, 0.14, 0.18, 1.0))
+        self.ambient_light = amb
+        self.ambient_np = self.render.attach_new_node(amb)
+        self.render.set_light(self.ambient_np)
+
+        # Position the sun to match the daytime slider's default (13:00 —
+        # a high, bright afternoon sun so lighting and shadows read clearly).
+        try:
+            self.set_time_of_day(13 * 60)
+        except Exception as exc:
+            print(f"[MyApp] initial set_time_of_day failed: {exc}")
+
+    def _apply_auto_shader(self, np):
+        """
+        Apply the right shader for the active engine to a scene node.
+
+        * RenderPipeline presets: keep the legacy behaviour (set_shader_auto;
+          RP overrides at the render root anyway).
+        * simplepbr preset: do nothing — the node inherits simplepbr's
+          shader from `render`. Only if simplepbr failed to initialise do
+          we fall back to Panda's auto-shader.
+        """
+        if self.use_render_pipeline or not getattr(self, "pbr_pipeline", None):
+            np.set_shader_auto()
+
+    def set_time_of_day(self, minutes: int):
+        """
+        Set the time of day from minutes-since-midnight (0..1439).
+
+        * RenderPipeline presets: drive RP's DayTime manager.
+        * performance preset: rotate/recolour the directional sun and tweak
+          ambient so the scene goes warm at dawn/dusk and dim at night.
+        """
+        minutes = max(0, min(1439, int(minutes)))
+        hh, mm = minutes // 60, minutes % 60
+
+        if self.use_render_pipeline:
+            rp = getattr(self, "render_pipeline", None)
+            dt_mgr = getattr(rp, "daytime_mgr", None) if rp else None
+            if dt_mgr is not None:
+                dt_mgr.time = f"{hh:02d}:{mm:02d}"
+            return
+
+        sun_np = getattr(self, "sun_np", None)
+        if sun_np is None:
+            return
+        from panda3d.core import Vec4
+
+        # Sun elevation: below horizon before 06:00 / after 18:00.
+        day_frac = minutes / 1440.0
+        elevation = math.sin((minutes - 360) / 720.0 * math.pi)  # -1..1
+        # Azimuth sweeps east->west across the day.
+        azimuth = -120.0 + 240.0 * day_frac
+
+        # Distance is irrelevant for direction but frames the shadow lens.
+        sun_np.set_pos(80.0 * math.sin(math.radians(azimuth)),
+                       -80.0 * math.cos(math.radians(azimuth)),
+                       max(8.0, 120.0 * max(0.05, elevation)))
+        sun_np.look_at(0, 0, 0)
+
+        # Colour: warm and dim near the horizon, bright white at noon.
+        warmth = max(0.0, min(1.0, elevation))
+        if elevation <= 0.0:                       # night
+            self.sun.set_color(Vec4(0.05, 0.06, 0.10, 1.0))
+            self.ambient_light.set_color(Vec4(0.10, 0.12, 0.18, 1.0))
+            bg = (0.06, 0.07, 0.11)
+        else:
+            g = 0.80 + 0.18 * warmth
+            b = 0.62 + 0.30 * warmth
+            # Strong directional sun + low ambient floor → high light/shadow
+            # contrast. In simplepbr a shadowed fragment only keeps the
+            # ambient term, so a low ambient is what makes shadows read dark.
+            intensity = 1.15 + 0.75 * warmth
+            self.sun.set_color(Vec4(intensity, g * intensity,
+                                    b * intensity, 1.0))
+            self.ambient_light.set_color(Vec4(0.09 + 0.05 * warmth,
+                                              0.10 + 0.05 * warmth,
+                                              0.13 + 0.06 * warmth, 1.0))
+            bg = (0.34 + 0.20 * warmth,
+                  0.45 + 0.20 * warmth,
+                  0.58 + 0.18 * warmth)
+
+        self.set_background_color(bg[0], bg[1], bg[2], 1.0)
+        # Keep the distance fog the same colour as the sky so it reads as
+        # aerial haze, not a grey veil (and stays dark at night).
+        if getattr(self, "_perf_fog", None) is not None:
+            self._perf_fog.set_color(bg[0], bg[1], bg[2])
+
+    def _apply_pbr_surface(self, model_np, diffuse_path, roughness=0.85,
+                           srgb_diffuse=True):
+        """
+        simplepbr-friendly material for hand-built meshes (PERFORMANCE preset).
+
+        Binds the diffuse map as the base-colour texture on the default
+        (modulate) stage — which simplepbr reads as `p3d_TextureBaseColor` —
+        plus a scalar-roughness, non-metallic PBR Material. We deliberately
+        avoid RenderPipeline's `emission=(0,1,0,0)` convention (simplepbr
+        would render it as a green glow) and skip normal/metal/rough map
+        stages: these meshes have no tangents, so a normal map would produce
+        artifacts. glTF models keep their full PBR maps via simplepbr.
+        """
+        from panda3d.core import Texture, Material
+
+        mat = Material()
+        mat.set_base_color((1, 1, 1, 1))
+        mat.set_roughness(float(roughness))
+        mat.set_metallic(0.0)
+        model_np.set_material(mat, 1)
+
+        if diffuse_path and os.path.exists(diffuse_path):
+            tex = self.loader.loadTexture(Filename.fromOsSpecific(str(diffuse_path)))
+            if tex:
+                if srgb_diffuse:
+                    tex.set_format(Texture.F_srgb)
+                tex.set_minfilter(Texture.FTLinearMipmapLinear)
+                tex.set_magfilter(Texture.FTLinear)
+                tex.set_wrap_u(Texture.WMRepeat)
+                tex.set_wrap_v(Texture.WMRepeat)
+                model_np.set_texture(tex, 1)
 
     def create_mesh_from_data(self, vertices: np.ndarray, triangles: np.ndarray,
                             normals: np.ndarray, uvs: np.ndarray):
@@ -400,7 +644,7 @@ class MyApp(ShowBase):
         node.addGeom(geom)
 
         np_node = self.render.attachNewNode(node)
-        np_node.setShaderAuto()
+        self._apply_auto_shader(np_node)
         np_node.setTwoSided(False)
 
         # 4. Применение PBR-текстур
@@ -425,6 +669,13 @@ class MyApp(ShowBase):
             diffuse_path = "assets/textures/concrete_8k/concrete_debris_diff_8k.jpg"
         if not os.path.exists(normal_path):
             normal_path = "assets/textures/concrete_8k/concrete_debris_nor_dx_8k.jpg"
+
+        # PERFORMANCE preset (simplepbr): use the PBR-friendly path instead
+        # of RenderPipeline's green-emission / 4-stage convention.
+        if not self.use_render_pipeline:
+            self._apply_pbr_surface(model_np, diffuse_path)
+            model_np.set_two_sided(True)
+            return
 
         # Создаём PBR-материал
         mat = Material()
@@ -664,43 +915,6 @@ class MyApp(ShowBase):
             self.perlin_generator.create_mesh_from_perlin_data()
 
         return new_texture_set
-
-    def add_scene_points(self):
-        top_points = [(-1.03, -2.22, 2.4), (-1.03, 2.4, 2.4), (1.045, 2.4, 2.4), (1.045, -2.22, 2.4)]
-        
-        points_node = self.render.attachNewNode("scene_points")
-        
-        def create_point(pos, color, name, point_size=5):
-            format = GeomVertexFormat.getV3n3cp()
-            vdata = GeomVertexData(name, format, Geom.UHStatic)
-            
-            vertex = GeomVertexWriter(vdata, 'vertex')
-            normal = GeomVertexWriter(vdata, 'normal')
-            color_writer = GeomVertexWriter(vdata, 'color')
-            
-            vertex.addData3f(0, 0, 0)
-            normal.addData3f(0, 0, 1)
-            color_writer.addData4f(color[0], color[1], color[2], color[3])
-            
-            points = GeomPoints(Geom.UHStatic)
-            points.addVertex(0)
-            points.closePrimitive()
-            
-            geom = Geom(vdata)
-            geom.addPrimitive(points)
-            
-            node = GeomNode(name)
-            node.addGeom(geom)
-            
-            np = points_node.attachNewNode(node)
-            np.setPos(pos[0], pos[1], pos[2])
-            
-            np.setAttrib(RenderModeAttrib.make(RenderModeAttrib.M_point, point_size))
-            
-            return np
-        
-        for i, point in enumerate(top_points):
-            create_point(point, (1, 0, 0, 1), f"top_point_{i}", 5) 
 
     def init_depth_renderer(self):
         self.taskMgr.do_method_later(0.5, self._delayed_depth_init, "delayed_depth_init")
@@ -976,7 +1190,7 @@ class MyApp(ShowBase):
         material.setSpecular((0.5, 0.5, 0.5, 1))
         material.setShininess(50)
         csg_result_panda.setMaterial(material)
-        csg_result_panda.setShaderAuto()
+        self._apply_auto_shader(csg_result_panda)
 
         # Заменяем старую ground_plane на результат CSG
         old_pos_plane = self.ground_plane.getPos()
@@ -1213,12 +1427,18 @@ class MyApp(ShowBase):
         material.setAmbient((0, 0.3, 0, 1))
         material.setSpecular((0.5, 0.5, 0.5, 1))
         material.setShininess(50)
+        # simplepbr reads base_color/roughness/metallic rather than the
+        # legacy diffuse/specular, so set those too for the PERFORMANCE preset.
+        if not self.use_render_pipeline:
+            material.set_base_color((0, 0.7, 0, 1))
+            material.set_roughness(0.8)
+            material.set_metallic(0.0)
         self.ground_plane.setMaterial(material)
         
         self.ground_plane.setPos(0, 0, 0)
-        
-        self.ground_plane.setShaderAuto()
-        
+
+        self._apply_auto_shader(self.ground_plane)
+
         self.ground_plane.setTwoSided(True)
 
     def set_plane_size_x(self, size_x):
@@ -1335,6 +1555,14 @@ class MyApp(ShowBase):
         roughness_path = "assets/textures/groundPerlin_8k/aerial_beach_03_rough_8k.jpg"
         metallic_path = None  # металличность не используется, будет заглушка
 
+        # PERFORMANCE preset (simplepbr): PBR-friendly base-colour material;
+        # skip RP's green-emission, 4-stage setup and the "fixed" depth bin
+        # so the ground depth-tests normally under the forward renderer.
+        if not self.use_render_pipeline:
+            self._apply_pbr_surface(self.perlin_model, diffuse_path)
+            self.perlin_model.set_two_sided(True)
+            return
+
         # ------------------------------------------------------------------
         # Материал, совместимый с RP
         # ------------------------------------------------------------------
@@ -1405,7 +1633,7 @@ class MyApp(ShowBase):
         # ------------------------------------------------------------------
         # Обязательные флаги для RP
         # ------------------------------------------------------------------
-        self.perlin_model.set_shader_auto()
+        self._apply_auto_shader(self.perlin_model)
         self.perlin_model.set_two_sided(True)
 
         # Дополнительные настройки из оригинального метода
@@ -1415,14 +1643,13 @@ class MyApp(ShowBase):
     def _set_initial_time(self, task):
         """Установка начального времени суток"""
         if hasattr(self, 'render_pipeline') and hasattr(self.render_pipeline, 'daytime_mgr'):
-            self.render_pipeline.daytime_mgr.time = "06:40"
+            self.render_pipeline.daytime_mgr.time = "13:00"
         return task.done
 
     def setup_scene(self):
         self.quarry_model = None
         
         self.create_perlin_noise_mesh()
-        self.add_scene_points()
         self.taskMgr.do_method_later(0.5, self._set_initial_time, "set_initial_time")
         
         # # Очищаем существующие источники света
@@ -1735,9 +1962,16 @@ class MyApp(ShowBase):
         model_np = self.loader.load_model(model_filename, noCache=True) 
         
         model_np.reparent_to(self.render)
-        self.render_pipeline.prepare_scene(model_np)
+        # RenderPipeline converts Panda lights/materials to RP equivalents.
+        # In the simplepbr (performance) preset the glTF PBR materials are
+        # rendered directly, so we skip it and let the node inherit the
+        # simplepbr shader from render.
+        if self.use_render_pipeline and self.render_pipeline is not None:
+            self.render_pipeline.prepare_scene(model_np)
+        else:
+            self._apply_auto_shader(model_np)
         model_np.set_pos(0, 0, 0)
-        model_np.set_hpr(0, 0, 0) 
+        model_np.set_hpr(0, 0, 0)
         model_np.set_scale(1)
         
         self.loaded_models.append(model_np)
@@ -1981,11 +2215,16 @@ def main():
     init_w = max(1, win.panda_container.width())
     init_h = max(1, win.panda_container.height())
 
+    # Resolve the graphics preset (saved choice, or auto-detected on first
+    # run — "performance" on integrated Intel graphics, "ultra" otherwise).
+    graphics_preset = graphics_settings.resolve_startup_preset()
+
     panda_app = MyApp(
         parent_hwnd=parent_hwnd,
         init_size=(init_w, init_h),
         tls_host=tls_host,
         tls_port=tls_port,
+        graphics_preset=graphics_preset,
     )
 
     # ------------------------------------------------------------------

@@ -76,6 +76,7 @@ from src.ui.panel_data import (
     get_model_set_config, get_texture_set_config, download_server_image,
     SERVER_IMAGE_CACHE_DIR, RECON_PAGE_SIZE,
 )
+from src.core import graphics_settings
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +887,10 @@ class RightPanel(QWidget):
     # legacy `run_full_process` (target volume → texture set → ground
     # plane → AABB plane → Perlin mesh from CSG).
     runRequested             = pyqtSignal(dict)
+    # Emitted when the user picks a graphics preset (ultra/medium/performance).
+    # MainWindow persists it and prompts for a restart (the rendering engine
+    # is chosen before the window exists).
+    graphicsPresetChanged    = pyqtSignal(str)
 
     PANEL_WIDTH = 320
 
@@ -1005,6 +1010,30 @@ class RightPanel(QWidget):
         col.addWidget(self._make_card(
             "Текстуры",
             self._make_row("Текстура", self.cmb_texture),
+        ))
+
+        # ---- Section: Graphics preset --------------------------------
+        # ultra / medium use RenderPipeline; performance uses simplepbr.
+        # Switching the engine requires a restart (RP is built before the
+        # window), so MainWindow only persists the choice + asks to restart.
+        self.cmb_graphics = QComboBox()
+        cur_preset = (graphics_settings.load_saved()
+                      or graphics_settings.DEFAULT_PRESET)
+        graphics_index = 0
+        for i, pkey in enumerate(graphics_settings.PRESET_ORDER):
+            self.cmb_graphics.addItem(
+                graphics_settings.PRESETS[pkey]["name"], userData=pkey
+            )
+            if pkey == cur_preset:
+                graphics_index = i
+        self.cmb_graphics.setCurrentIndex(graphics_index)
+        self.cmb_graphics.currentIndexChanged.connect(
+            self._on_graphics_index_changed
+        )
+        col.addWidget(self._make_card(
+            "Графика",
+            self._make_row("Качество", self.cmb_graphics),
+            status="Перезапуск",
         ))
 
         # ---- Section: Fill (target volume) --------------------------
@@ -1988,6 +2017,11 @@ class RightPanel(QWidget):
         key = self.cmb_texture.itemData(idx)
         if key:
             self.textureSetChanged.emit(str(key))
+
+    def _on_graphics_index_changed(self, idx: int) -> None:
+        key = self.cmb_graphics.itemData(idx)
+        if key:
+            self.graphicsPresetChanged.emit(str(key))
 
     # ==================================================================
     # External hook: пересборка списка текстурных наборов
