@@ -37,7 +37,7 @@ from src.ui.panel_data import (
 )
 
 # Where the 3 user camera presets (position + FOV) are persisted.
-CAMERA_PRESETS_PATH = os.path.join(PROJECT_ROOT, "config", "camera_presets.json")
+CAMERA_PRESETS_PATH = os.path.join(PROJECT_ROOT, "presets", "camera_presets.json")
 
 
 def _is_child_of(hwnd: int, parent_hwnd: int) -> bool:
