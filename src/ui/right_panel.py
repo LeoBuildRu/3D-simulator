@@ -62,7 +62,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QComboBox,
     QListWidget, QListWidgetItem, QGroupBox, QPushButton, QFrame,
     QScrollArea, QSizePolicy, QGraphicsDropShadowEffect, QDialog,
-    QGridLayout, QDoubleSpinBox, QMenu, QApplication,
+    QGridLayout, QDoubleSpinBox, QMenu, QApplication, QSlider, QDial,
+    QToolButton,
 )
 
 from src.ui.ui_theme import (
@@ -117,6 +118,11 @@ def _resolve_image_path(rec: Reconstruction) -> str | None:
                      reuse it. Otherwise return None and let the caller
                      trigger `download_server_image()` explicitly.
     """
+    # Stand snapshots carry an explicit absolute colour-frame path.
+    color_path = (getattr(rec, "color_path", "") or "").strip()
+    if color_path and os.path.exists(color_path):
+        return color_path
+
     img = (rec.img_file or "").strip()
     if not img:
         return None
@@ -228,6 +234,24 @@ def _make_dtype_icon(data_type: str, size: int = 18) -> QPixmap:
         p.drawLine(int(top[0]),    int(top[1]),    int(center[0]), int(center[1]))
         p.drawLine(int(tr[0]),     int(tr[1]),     int(center[0]), int(center[1]))
         p.drawLine(int(tl[0]),     int(tl[1]),     int(center[0]), int(center[1]))
+    elif data_type == "stand":
+        # Camera glyph — body + lens — for a captured reference snapshot.
+        col = QColor(COLOR_ACCENT)
+        pen = QPen(col, 1.3)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        pad = 3
+        body = QRectF(pad, pad + s * 0.12,
+                      s - 2 * pad, s - 2 * pad - s * 0.12)
+        p.drawRoundedRect(body, 2, 2)
+        # Viewfinder bump on top-left.
+        p.drawRoundedRect(
+            QRectF(pad + s * 0.12, pad - s * 0.02, s * 0.28, s * 0.16),
+            1, 1,
+        )
+        # Lens.
+        p.drawEllipse(QPointF(s / 2, s / 2 + s * 0.06), s * 0.18, s * 0.18)
     else:
         col = QColor(COLOR_WARN)
         pen = QPen(col, 1.2)
@@ -433,7 +457,7 @@ class ReconRowWidget(QWidget):
         type_text = (rec.data_type or "—").upper()
         # Color-code the tag like the icon: accent for height, muted for ply.
         tag_color = (
-            COLOR_ACCENT if rec.data_type == "height"
+            COLOR_ACCENT if rec.data_type in ("height", "stand")
             else COLOR_TEXT_MUTED if rec.data_type == "ply"
             else COLOR_WARN
         )
@@ -832,6 +856,26 @@ class RightPanel(QWidget):
     # dataclass. MainWindow consumes this to drive
     # `panda_app.mesh_reconstruction.run_2d_to_3d_reconstruction_from`.
     reconstructionRunRequested = pyqtSignal(object)
+    # Emitted when the selected recon is (or stops being) a "stand"
+    # snapshot. Payload is the Reconstruction when a stand row is
+    # selected, or None when selection moves to a non-stand row. The
+    # MainWindow uses it to show/hide the full-screen camera-alignment
+    # reference overlay.
+    standReferenceSelected     = pyqtSignal(object)
+    # Emitted when the FOV slider moves. Payload is the new FOV (degrees).
+    fovChanged                 = pyqtSignal(float)
+    # Emitted when the roll dial moves. Payload is the new roll (degrees,
+    # rotation about the view axis / centre of the screen).
+    rollChanged                = pyqtSignal(float)
+    # Emitted when the reference-overlay opacity slider moves (0..1).
+    referenceOpacityChanged    = pyqtSignal(float)
+    # Emitted when the reference-overlay visibility toggle flips.
+    referenceVisibleToggled    = pyqtSignal(bool)
+    # Emitted when the "pick bed corners" toggle flips (start/stop the
+    # 4-point picking mode used for depth-fill reconstruction).
+    pointPickingToggled        = pyqtSignal(bool)
+    # Emitted when the user asks to clear the picked points / reconstruction.
+    pointsResetRequested       = pyqtSignal()
     # Emitted when the user presses "Run Simulation". Payload is a dict:
     #   {
     #     "model_key":     str | None,   # current model set key
@@ -1087,6 +1131,13 @@ class RightPanel(QWidget):
             status="Подробно",
         ))
 
+        # ---- Camera controls card (FOV + reference overlay) ---------
+        col.addWidget(self._make_card(
+            "Камера · Выравнивание",
+            self._build_camera_controls(),
+            status="FOV",
+        ))
+
         # ---- Bottom row: Load more + Reconstruct -------------------
         # Both buttons are kept here so they share the same horizontal
         # rhythm as the Reset/Generate row above the recon list.
@@ -1202,6 +1253,307 @@ class RightPanel(QWidget):
         return v
 
     # ------------------------------------------------------------------
+    # Camera-alignment controls (FOV + reference overlay)
+    # ------------------------------------------------------------------
+    _FOV_MIN = 20
+    _FOV_MAX = 150
+    _FOV_DEFAULT = 100
+
+    # Roll (rotation about the view axis / centre of the screen), degrees.
+    _ROLL_MIN = -180
+    _ROLL_MAX = 180
+
+    @staticmethod
+    def _thin_slider_qss() -> str:
+        return (
+            "QSlider::groove:horizontal {"
+            f"  background: {COLOR_HAIRLINE};"
+            "  height: 3px; border-radius: 1px;"
+            "}"
+            "QSlider::sub-page:horizontal {"
+            f"  background: {COLOR_ACCENT}; height: 3px; border-radius: 1px;"
+            "}"
+            "QSlider::handle:horizontal {"
+            f"  background: {COLOR_ACCENT};"
+            "  width: 10px; height: 10px;"
+            "  margin: -4px 0; border-radius: 5px;"
+            "}"
+            "QSlider::handle:horizontal:hover { background: #00FFAA; }"
+            "QSlider:disabled { }"
+            "QSlider::sub-page:horizontal:disabled {"
+            f"  background: {COLOR_TEXT_DIM};"
+            "}"
+            "QSlider::handle:horizontal:disabled {"
+            f"  background: {COLOR_TEXT_DIM};"
+            "}"
+        )
+
+    def _build_camera_controls(self) -> QWidget:
+        """
+        Build the camera-alignment controls:
+          • FOV slider (20..150°) — always active, drives the live lens.
+          • Reference-overlay opacity slider + show/hide toggle — active
+            only while a `stand` snapshot is selected (the overlay shows
+            that snapshot's colour frame over the 3D viewport so the user
+            can match the camera by hand).
+        """
+        holder = QWidget()
+        holder.setStyleSheet("background: transparent;")
+        v = QVBoxLayout(holder)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+
+        def _caption(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color: {COLOR_TEXT_MUTED}; font-size: 10px;"
+                f" letter-spacing: 1.0px; background: transparent;"
+            )
+            return lbl
+
+        def _value_lbl(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color: {COLOR_TEXT}; font-family: {FONT_MONO};"
+                f" font-size: 11px; background: transparent;"
+            )
+            lbl.setMinimumWidth(40)
+            lbl.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            return lbl
+
+        # ----- FOV row ------------------------------------------------
+        fov_row = QHBoxLayout()
+        fov_row.setContentsMargins(0, 0, 0, 0)
+        fov_row.setSpacing(8)
+
+        self.fov_slider = QSlider(Qt.Orientation.Horizontal)
+        self.fov_slider.setRange(self._FOV_MIN, self._FOV_MAX)
+        self.fov_slider.setValue(self._FOV_DEFAULT)
+        self.fov_slider.setFixedHeight(18)
+        self.fov_slider.setStyleSheet(self._thin_slider_qss())
+
+        self.fov_value_lbl = _value_lbl(f"{self._FOV_DEFAULT}°")
+
+        def _on_fov(val: int):
+            self.fov_value_lbl.setText(f"{int(val)}°")
+            self.fovChanged.emit(float(val))
+
+        self.fov_slider.valueChanged.connect(_on_fov)
+
+        fov_row.addWidget(_caption("FOV"), 0, Qt.AlignmentFlag.AlignVCenter)
+        fov_row.addWidget(self.fov_slider, 1, Qt.AlignmentFlag.AlignVCenter)
+        fov_row.addWidget(self.fov_value_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        v.addLayout(fov_row)
+
+        # ----- Roll dial ("крутилка" about the view axis) -------------
+        roll_row = QHBoxLayout()
+        roll_row.setContentsMargins(0, 0, 0, 0)
+        roll_row.setSpacing(8)
+
+        self.roll_dial = QDial()
+        self.roll_dial.setRange(self._ROLL_MIN, self._ROLL_MAX)
+        self.roll_dial.setValue(0)
+        self.roll_dial.setWrapping(True)       # angle wraps -180 <-> 180
+        self.roll_dial.setNotchesVisible(True)
+        self.roll_dial.setFixedSize(46, 46)
+        self.roll_dial.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.roll_dial.setToolTip(
+            "Крен камеры (поворот вокруг центра экрана).\n"
+            "Кнопка ⟲ справа — сбросить в 0"
+        )
+        self.roll_dial.setStyleSheet(
+            "QDial { background: transparent; }"
+        )
+
+        self.roll_value_lbl = _value_lbl("0°")
+
+        def _on_roll(val: int):
+            self.roll_value_lbl.setText(f"{int(val)}°")
+            self.rollChanged.emit(float(val))
+
+        self.roll_dial.valueChanged.connect(_on_roll)
+
+        # Reset-to-zero affordance (the default presets also zero it).
+        self.btn_roll_reset = QToolButton()
+        self.btn_roll_reset.setText("⟲")
+        self.btn_roll_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_roll_reset.setToolTip("Сбросить крен в 0")
+        self.btn_roll_reset.setStyleSheet(
+            "QToolButton {"
+            "  background: transparent;"
+            f"  color: {COLOR_TEXT_MUTED};"
+            f"  border: 1px solid {COLOR_HAIRLINE};"
+            "  border-radius: 5px; padding: 2px 6px; font-size: 13px;"
+            "}"
+            "QToolButton:hover {"
+            "  background: rgba(255,255,255,8);"
+            f"  color: {COLOR_TEXT};"
+            "}"
+        )
+        # setValue(0) fires valueChanged -> _on_roll -> emits rollChanged,
+        # so the camera actually rolls back to level.
+        self.btn_roll_reset.clicked.connect(lambda: self.roll_dial.setValue(0))
+
+        roll_row.addWidget(_caption("КРЕН"), 0, Qt.AlignmentFlag.AlignVCenter)
+        roll_row.addStretch(1)
+        roll_row.addWidget(self.roll_dial, 0, Qt.AlignmentFlag.AlignVCenter)
+        roll_row.addWidget(self.roll_value_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        roll_row.addWidget(self.btn_roll_reset, 0, Qt.AlignmentFlag.AlignVCenter)
+        v.addLayout(roll_row)
+
+        # ----- Reference-overlay controls (stand snapshots only) ------
+        self._ref_controls_holder = QWidget()
+        self._ref_controls_holder.setStyleSheet("background: transparent;")
+        self._ref_controls_holder.setEnabled(False)
+        rc = QVBoxLayout(self._ref_controls_holder)
+        rc.setContentsMargins(0, 0, 0, 0)
+        rc.setSpacing(8)
+
+        # Opacity row.
+        op_row = QHBoxLayout()
+        op_row.setContentsMargins(0, 0, 0, 0)
+        op_row.setSpacing(8)
+
+        self.ref_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.ref_opacity_slider.setRange(0, 100)   # percent (0 = invisible)
+        self.ref_opacity_slider.setValue(50)
+        self.ref_opacity_slider.setFixedHeight(18)
+        self.ref_opacity_slider.setStyleSheet(self._thin_slider_qss())
+
+        self.ref_opacity_lbl = _value_lbl("50%")
+
+        def _on_opacity(val: int):
+            self.ref_opacity_lbl.setText(f"{int(val)}%")
+            self.referenceOpacityChanged.emit(float(val) / 100.0)
+
+        self.ref_opacity_slider.valueChanged.connect(_on_opacity)
+
+        op_row.addWidget(_caption("ПРОЗР"), 0, Qt.AlignmentFlag.AlignVCenter)
+        op_row.addWidget(self.ref_opacity_slider, 1,
+                         Qt.AlignmentFlag.AlignVCenter)
+        op_row.addWidget(self.ref_opacity_lbl, 0,
+                         Qt.AlignmentFlag.AlignVCenter)
+        rc.addLayout(op_row)
+
+        # Show/hide toggle.
+        self.btn_ref_toggle = QPushButton("Скрыть снимок")
+        self.btn_ref_toggle.setCheckable(True)
+        self.btn_ref_toggle.setChecked(True)
+        self.btn_ref_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ref_toggle.setStyleSheet(self._soft_accent_button_qss())
+
+        def _on_toggle(checked: bool):
+            self.btn_ref_toggle.setText(
+                "Скрыть снимок" if checked else "Показать снимок"
+            )
+            self.referenceVisibleToggled.emit(bool(checked))
+
+        self.btn_ref_toggle.toggled.connect(_on_toggle)
+        rc.addWidget(self.btn_ref_toggle)
+
+        # ----- Bed-corner picking + reconstruction --------------------
+        pick_row = QHBoxLayout()
+        pick_row.setContentsMargins(0, 0, 0, 0)
+        pick_row.setSpacing(6)
+
+        self.btn_pick_points = QPushButton("Выбрать точки")
+        self.btn_pick_points.setCheckable(True)
+        self.btn_pick_points.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pick_points.setToolTip(
+            "Включите и кликайте опорные точки на кузове (любое число).\n"
+            "ПКМ или Esc — завершить выбор и построить наполнение."
+        )
+        self.btn_pick_points.setStyleSheet(self._soft_accent_button_qss())
+        self.btn_pick_points.toggled.connect(
+            lambda checked: self.pointPickingToggled.emit(bool(checked))
+        )
+
+        self.btn_pick_reset = QToolButton()
+        self.btn_pick_reset.setText("⟲")
+        self.btn_pick_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pick_reset.setToolTip("Сбросить точки и реконструкцию")
+        self.btn_pick_reset.setStyleSheet(
+            "QToolButton {"
+            "  background: transparent;"
+            f"  color: {COLOR_TEXT_MUTED};"
+            f"  border: 1px solid {COLOR_HAIRLINE};"
+            "  border-radius: 5px; padding: 4px 8px; font-size: 13px;"
+            "}"
+            "QToolButton:hover {"
+            "  background: rgba(255,255,255,8);"
+            f"  color: {COLOR_TEXT};"
+            "}"
+        )
+        self.btn_pick_reset.clicked.connect(
+            lambda _=False: self.pointsResetRequested.emit()
+        )
+
+        pick_row.addWidget(self.btn_pick_points, 1)
+        pick_row.addWidget(self.btn_pick_reset, 0)
+        rc.addLayout(pick_row)
+
+        v.addWidget(self._ref_controls_holder)
+        return holder
+
+    def set_point_count(self, n: int) -> None:
+        """Update the pick-button label with the current point count."""
+        btn = getattr(self, "btn_pick_points", None)
+        if btn is not None:
+            n = max(0, int(n))
+            btn.setText("Выбрать точки" if n == 0
+                        else f"Выбрать точки ({n})")
+
+    def set_picking_active(self, active: bool) -> None:
+        """Reflect picking state on the toggle without re-emitting."""
+        btn = getattr(self, "btn_pick_points", None)
+        if btn is None:
+            return
+        blocked = btn.blockSignals(True)
+        btn.setChecked(bool(active))
+        btn.blockSignals(blocked)
+
+    def set_fov_value(self, fov: float) -> None:
+        """Sync the FOV slider to an externally-applied lens FOV without
+        re-emitting `fovChanged` (used when camera modes change FOV)."""
+        sl = getattr(self, "fov_slider", None)
+        if sl is None:
+            return
+        try:
+            v = int(round(float(fov)))
+        except (TypeError, ValueError):
+            return
+        v = max(self._FOV_MIN, min(self._FOV_MAX, v))
+        blocked = sl.blockSignals(True)
+        sl.setValue(v)
+        sl.blockSignals(blocked)
+        if hasattr(self, "fov_value_lbl"):
+            self.fov_value_lbl.setText(f"{v}°")
+
+    def set_roll_value(self, roll: float) -> None:
+        """Sync the roll dial to an externally-applied camera roll without
+        re-emitting `rollChanged` (used when camera modes / presets set
+        roll)."""
+        d = getattr(self, "roll_dial", None)
+        if d is None:
+            return
+        try:
+            v = int(round(float(roll)))
+        except (TypeError, ValueError):
+            return
+        # Normalise into the dial's [-180, 180] wrapping range.
+        while v > self._ROLL_MAX:
+            v -= 360
+        while v < self._ROLL_MIN:
+            v += 360
+        blocked = d.blockSignals(True)
+        d.setValue(v)
+        d.blockSignals(blocked)
+        if hasattr(self, "roll_value_lbl"):
+            self.roll_value_lbl.setText(f"{v}°")
+
+    # ------------------------------------------------------------------
     # IQoko-style card builders (replacing the old QGroupBox approach).
     # ------------------------------------------------------------------
     def _make_card(self, title: str, content: QWidget,
@@ -1297,6 +1649,7 @@ class RightPanel(QWidget):
         if hasattr(self, "btn_run_recon"):
             self.btn_run_recon.setEnabled(True)
         self.reconstructionSelected.emit(str(rec.name))
+        self._emit_stand_reference(rec)
 
     def _on_recon_clicked(self, item: QListWidgetItem) -> None:
         """
@@ -1313,6 +1666,17 @@ class RightPanel(QWidget):
         self._populate_details(self._selected_rec)
         if hasattr(self, "btn_run_recon"):
             self.btn_run_recon.setEnabled(True)
+        self._emit_stand_reference(self._selected_rec)
+
+    def _emit_stand_reference(self, rec: Reconstruction | None) -> None:
+        """Tell the MainWindow to show the alignment overlay for `stand`
+        snapshots, or hide it for any other selection."""
+        is_stand = bool(rec is not None and rec.data_type == "stand")
+        self.standReferenceSelected.emit(rec if is_stand else None)
+        # Keep the reference-controls card enabled only while a stand row
+        # is the active selection.
+        if hasattr(self, "_ref_controls_holder"):
+            self._ref_controls_holder.setEnabled(is_stand)
 
     def _on_recon_context_menu(self, pos: QPoint) -> None:
         """Right-click menu on a recon row: copy its file name to clipboard."""
@@ -1492,9 +1856,9 @@ class RightPanel(QWidget):
             self._details_form.addRow(empty)
             return
 
-        # Type chip — accent for height, idle for ply, warn otherwise.
+        # Type chip — accent for height/stand, idle for ply, warn otherwise.
         type_chip_role = (
-            "chip-live" if rec.data_type == "height"
+            "chip-live" if rec.data_type in ("height", "stand")
             else "chip-idle" if rec.data_type == "ply"
             else "chip-err"
         )

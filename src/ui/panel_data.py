@@ -64,7 +64,19 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 MODELS_CONFIG_PATH   = os.path.join(PROJECT_ROOT, "config", "models_config.yaml")
 TLS_CONFIG_PATH      = os.path.join(PROJECT_ROOT, "config", "tls_config.yaml")
 HEIGHT_EXAMPLES_DIR  = os.path.join(PROJECT_ROOT, "assets", "height_examples")
+# Snapshot pairs (colour frame + depth map) for manual camera alignment.
+STAND_EXAMPLES_DIR   = os.path.join(HEIGHT_EXAMPLES_DIR, "stand")
 PLY_EXAMPLES_DIR     = os.path.join(PROJECT_ROOT, "assets", "PLY_examples")
+
+# Local truck models the user drops into assets/models/trucks. They are
+# listed in the model-set combo alongside the server-served sets. Their
+# config keys are namespaced with LOCAL_MODEL_PREFIX so they never collide
+# with server keys, and they carry "local": True so the loader knows to
+# load the .bam/.gltf/... straight from disk (no server round-trip, and no
+# reference points / camera presets — those simply aren't provided).
+TRUCKS_MODELS_DIR    = os.path.join(PROJECT_ROOT, "assets", "models", "trucks")
+LOCAL_MODEL_PREFIX   = "local:"
+_TRUCK_MODEL_EXTS    = (".bam", ".gltf", ".glb", ".egg.pz", ".egg", ".obj")
 
 # Локальный кэш для скачанных файлов текстур
 # (диффуз / нормали / displacement / roughness и т.д.).
@@ -215,6 +227,84 @@ def _fetch_model_sets_from_server() -> Optional[dict]:
     return None
 
 
+def _truck_model_display(stem: str) -> str:
+    """Human-readable name for a local truck model file/folder."""
+    pretty = stem.replace("_", " ").replace("-", " ").strip()
+    return pretty or stem
+
+
+def _is_truck_model_file(name: str) -> bool:
+    low = name.lower()
+    return any(low.endswith(ext) for ext in _TRUCK_MODEL_EXTS)
+
+
+def _strip_truck_model_ext(name: str) -> str:
+    low = name.lower()
+    for ext in _TRUCK_MODEL_EXTS:
+        if low.endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
+def _scan_local_truck_models() -> Dict[str, dict]:
+    """
+    Scan `assets/models/trucks/` for local truck models and return
+    {set_key: config}. Two layouts are supported:
+
+        trucks/<name>.bam            -> single self-contained model file
+        trucks/<name>/<model>.gltf   -> a model living in its own folder
+                                        (first recognised file is used)
+
+    Each config is minimal — just enough for `load_model_set` to drop the
+    model into the scene:
+        {"model": <display>, "cuzov": <abs path>, "local": True}
+
+    No ground_plane / max_volume / cam_* keys: per spec, local models
+    don't need reference points or camera presets.
+    """
+    out: Dict[str, dict] = {}
+    if not os.path.isdir(TRUCKS_MODELS_DIR):
+        return out
+
+    try:
+        entries = sorted(os.listdir(TRUCKS_MODELS_DIR))
+    except OSError as exc:
+        print(f"[panel_data] failed to list models/trucks/: {exc}")
+        return out
+
+    for entry in entries:
+        full = os.path.join(TRUCKS_MODELS_DIR, entry)
+        model_path = None
+        display_stem = entry
+
+        if os.path.isfile(full) and _is_truck_model_file(entry):
+            model_path = full
+            display_stem = _strip_truck_model_ext(entry)
+        elif os.path.isdir(full):
+            try:
+                sub_entries = sorted(os.listdir(full))
+            except OSError:
+                sub_entries = []
+            for sub in sub_entries:
+                sub_full = os.path.join(full, sub)
+                if os.path.isfile(sub_full) and _is_truck_model_file(sub):
+                    model_path = sub_full
+                    display_stem = entry
+                    break
+
+        if not model_path:
+            continue
+
+        rel = os.path.relpath(model_path, TRUCKS_MODELS_DIR).replace("\\", "/")
+        key = f"{LOCAL_MODEL_PREFIX}{rel}"
+        out[key] = {
+            "model": f"{_truck_model_display(display_stem)} (локальная)",
+            "cuzov": model_path,
+            "local": True,
+        }
+    return out
+
+
 def _load_local_models_yaml() -> dict:
     """Fallback: parse `models_config.yaml` from the project root."""
     if not os.path.exists(MODELS_CONFIG_PATH):
@@ -247,6 +337,11 @@ def load_model_sets() -> List[Tuple[str, str]]:
             continue
         display = value.get("model") or key
         out.append((key, str(display)))
+
+    # Local truck models from assets/models/trucks — listed after the
+    # server sets so both sources live in the same combo.
+    for key, value in _scan_local_truck_models().items():
+        out.append((key, str(value.get("model") or key)))
     return out
 
 
@@ -261,6 +356,9 @@ def get_model_set_config(key: str) -> Optional[Dict[str, Any]]:
     """
     if not key:
         return None
+    # Local truck models resolve straight from disk — no server lookup.
+    if str(key).startswith(LOCAL_MODEL_PREFIX):
+        return _scan_local_truck_models().get(str(key))
     cfg = _fetch_model_sets_from_server() or _load_local_models_yaml()
     val = cfg.get(key)
     return val if isinstance(val, dict) else None
@@ -381,6 +479,12 @@ class Reconstruction:
     ply_file: Optional[str] = None
     filler: str = ""
     target_volume: Optional[float] = None
+    # Stand snapshots (data_type == "stand") carry the absolute paths to
+    # their colour frame and matching depth map. `color_path` is what the
+    # manual camera-alignment overlay shows; `depth_path` stays available
+    # for the depth pipeline.
+    color_path: str = ""
+    depth_path: str = ""
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -482,6 +586,66 @@ def _scan_local_height_examples() -> List[Reconstruction]:
     return out
 
 
+# Suffix marking the depth map inside a stand snapshot pair, e.g.
+# "example-1.png" (colour) <-> "example-1_depth_da3.png" (depth).
+_STAND_DEPTH_SUFFIX = "_depth_da3"
+
+
+def _scan_local_stand_examples() -> List[Reconstruction]:
+    """
+    Scan `height_examples/stand/` for snapshot PAIRS and return one
+    Reconstruction per colour frame:
+
+        <name>.png            -> the regular camera frame (color_path)
+        <name>_depth_da3.png  -> the matching depth map (depth_path)
+
+    Tagged data_type="stand". A colour frame without a matching depth
+    map is still listed (depth_path left empty) so the alignment overlay
+    keeps working. Stand entries have no timestamp, so they sort to the
+    bottom of the merged reconstruction list — same place the old local
+    examples appeared.
+    """
+    out: List[Reconstruction] = []
+    if not os.path.isdir(STAND_EXAMPLES_DIR):
+        return out
+
+    try:
+        pngs = [f for f in os.listdir(STAND_EXAMPLES_DIR)
+                if f.lower().endswith(".png")]
+    except OSError as exc:
+        print(f"[panel_data] failed to list stand/: {exc}")
+        return out
+
+    depth_files = {
+        f for f in pngs
+        if os.path.splitext(f)[0].endswith(_STAND_DEPTH_SUFFIX)
+    }
+    color_files = [f for f in pngs if f not in depth_files]
+
+    for color_name in sorted(color_files):
+        stem = os.path.splitext(color_name)[0]
+        color_path = os.path.join(STAND_EXAMPLES_DIR, color_name)
+        depth_path = os.path.join(
+            STAND_EXAMPLES_DIR, f"{stem}{_STAND_DEPTH_SUFFIX}.png"
+        )
+        if not os.path.exists(depth_path):
+            depth_path = ""
+        rec = Reconstruction(
+            name=color_name,
+            path=color_path,
+            data_type="stand",
+            is_local=True,
+            model="Опорный кадр",
+            car_number=stem,
+            img_file=color_name,
+            color_path=color_path,
+            depth_path=depth_path,
+            raw={"color": color_path, "depth": depth_path},
+        )
+        out.append(rec)
+    return out
+
+
 RECON_PAGE_SIZE = 25
 
 
@@ -530,6 +694,8 @@ def load_reconstructions(limit: int = 25) -> List[Reconstruction]:
 
     # Local entries (always included).
     out.extend(_scan_local_height_examples())
+    # Stand snapshot pairs (colour + depth) for manual camera alignment.
+    out.extend(_scan_local_stand_examples())
 
     # Newest first; entries with unparseable dates fall to the bottom.
     out.sort(key=lambda r: r.datetime, reverse=True)

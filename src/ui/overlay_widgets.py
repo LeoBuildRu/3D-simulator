@@ -26,7 +26,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QPoint, QEvent
+from PyQt6.QtCore import Qt, QPoint, QEvent, QRect
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QGraphicsDropShadowEffect,
@@ -295,6 +295,185 @@ class SceneOverlay(QWidget):
 
 from PyQt6.QtCore import pyqtSignal as _pyqtSignal
 from PyQt6.QtWidgets import QPushButton as _QPushButton
+
+
+class CameraReferenceOverlay(QWidget):
+    """
+    Full-viewport, click-through, translucent reference-image layer.
+
+    Used to manually line the live camera up with a captured snapshot:
+    the colour frame of a stand snapshot is shown semi-transparently over
+    the 3D viewport so the user can fly the camera until the rendered
+    scene matches the photo.
+
+    Like the HUD overlays it is a top-level frameless `Qt.Tool` window
+    owned by the main window. Crucially it is CLICK-THROUGH
+    (WA_TransparentForMouseEvents) so WASD / RMB-look still reach the
+    embedded Panda HWND underneath. The interactive controls (opacity /
+    show-hide) live on the right panel, which is re-raised above this
+    layer by the main window.
+    """
+
+    def __init__(self, parent: QWidget, margin: int = 0):
+        assert parent is not None, "CameraReferenceOverlay needs an anchor"
+
+        owner_window = parent.window() or parent
+        flags = (
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        super().__init__(owner_window, flags)
+
+        self._owner = parent
+        self._margin = margin
+        self._src = None            # original QPixmap (unscaled)
+
+        # Translucent + click-through so the 3D scene stays interactive.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        # The photo is painted directly in paintEvent (no child QLabel /
+        # layout) so the window NEVER grows to fit an oversized pixmap and
+        # the image is always clipped to the window bounds — it can't spill
+        # onto the desktop / other apps.
+        self.set_opacity(0.5)
+
+    # -- Public API ---------------------------------------------------
+    def attach(self) -> None:
+        """Install event filters so the layer tracks the viewport; stays
+        hidden until `show_overlay` is called."""
+        owner = self._owner
+        if owner is None:
+            return
+        owner.installEventFilter(self)
+        top = owner.window()
+        if top is not None and top is not owner:
+            top.installEventFilter(self)
+
+    def set_image(self, path: str) -> None:
+        """Load the colour frame to display (no-op if it can't be read)."""
+        from PyQt6.QtGui import QPixmap
+        pm = QPixmap(path) if path else QPixmap()
+        self._src = None if pm.isNull() else pm
+        self.update()
+
+    def set_opacity(self, value: float) -> None:
+        """0..1 — how solid the reference image is over the scene
+        (0 = fully transparent / invisible)."""
+        try:
+            v = max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return
+        self.setWindowOpacity(v)
+
+    def show_overlay(self) -> None:
+        self._reposition()
+        self.show()
+        # WA_TransparentForMouseEvents alone is NOT enough for a top-level
+        # window on Windows — the OS still delivers clicks here (swallowing
+        # them and stealing focus from the embedded Panda HWND, which kills
+        # WASD/RMB-look). Force real OS-level pass-through via WS_EX_TRANSPARENT.
+        self._apply_native_click_through()
+        self.raise_()
+
+    def hide_overlay(self) -> None:
+        self.hide()
+
+    # -- Internals ----------------------------------------------------
+    def _apply_native_click_through(self) -> None:
+        """On Windows, OR WS_EX_TRANSPARENT (+ WS_EX_LAYERED) into the
+        native window's extended style so mouse input falls through to the
+        3D viewport beneath. No-op on non-Windows / if win32 is missing."""
+        try:
+            import win32gui
+            import win32con
+        except Exception:
+            return
+        try:
+            hwnd = int(self.winId())
+            ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            new_ex = ex | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+            if new_ex != ex:
+                win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, new_ex)
+        except Exception as exc:
+            print(f"[ReferenceOverlay] click-through setup failed: {exc}")
+
+    def paintEvent(self, event):
+        # Draw the photo scaled to the FULL window WIDTH, centred vertically,
+        # clipped to the window. The live camera pins its HORIZONTAL FOV and
+        # lets the vertical follow the window aspect (set_fov(single) +
+        # set_aspect_ratio on resize), so the rendered scene scales by window
+        # width — scaling the photo by width keeps it matched at any window
+        # size without the user touching the camera. Overflow top/bottom is
+        # clipped exactly like the camera crops vertically.
+        if self._src is None:
+            return
+        from PyQt6.QtGui import QPainter
+        w = self.width()
+        h = self.height()
+        if w <= 0 or h <= 0:
+            return
+        sw = self._src.width()
+        sh = self._src.height()
+        if sw <= 0 or sh <= 0:
+            return
+        draw_w = w
+        draw_h = int(round(w * sh / sw))
+        x = 0
+        y = (h - draw_h) // 2          # centre vertically (camera principal pt)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawPixmap(QRect(x, y, draw_w, draw_h), self._src)
+        p.end()
+
+    def _reposition(self) -> None:
+        owner = self._owner
+        if owner is None:
+            return
+        pw, ph = owner.width(), owner.height()
+        m = self._margin
+        gp = owner.mapToGlobal(QPoint(m, m))
+        x, y = gp.x(), gp.y()
+        w = max(1, pw - 2 * m)
+        h = max(1, ph - 2 * m)
+        # Clamp to the owner's top-level frame so the layer can never spill
+        # beyond the app window onto the desktop / other applications.
+        top = owner.window()
+        if top is not None:
+            tg = top.frameGeometry()
+            right = min(x + w, tg.x() + tg.width())
+            bottom = min(y + h, tg.y() + tg.height())
+            x = max(x, tg.x())
+            y = max(y, tg.y())
+            w = max(1, right - x)
+            h = max(1, bottom - y)
+        self.setGeometry(x, y, w, h)
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update()
+
+    def eventFilter(self, obj, event):
+        owner = self._owner
+        if owner is None:
+            return super().eventFilter(obj, event)
+        et = event.type()
+        top = owner.window()
+        if et in (
+            QEvent.Type.Resize,
+            QEvent.Type.Move,
+            QEvent.Type.Show,
+            QEvent.Type.WindowStateChange,
+        ):
+            if self.isVisible():
+                self._reposition()
+        if obj is top:
+            if et == QEvent.Type.Hide:
+                self.hide()
+        return super().eventFilter(obj, event)
 
 
 class DepthMapOverlay(QWidget):

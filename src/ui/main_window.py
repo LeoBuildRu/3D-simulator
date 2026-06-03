@@ -16,7 +16,9 @@ from PyQt6.QtWidgets import (
 )
 
 from src.ui.ui_theme import apply_theme
-from src.ui.overlay_widgets import SceneOverlay, DepthMapOverlay
+from src.ui.overlay_widgets import (
+    SceneOverlay, DepthMapOverlay, CameraReferenceOverlay,
+)
 from src.ui.right_panel import RightPanel
 import os
 import json
@@ -31,7 +33,11 @@ from src.ui.panel_data import (
     get_model_set_config, get_texture_set_config,
     load_texture_sets, Reconstruction, download_server_image,
     ensure_texture_cached, TEXTURE_PATH_KEYS, get_default_texture_set_key,
+    PROJECT_ROOT,
 )
+
+# Where the 3 user camera presets (position + FOV) are persisted.
+CAMERA_PRESETS_PATH = os.path.join(PROJECT_ROOT, "config", "camera_presets.json")
 
 
 def _is_child_of(hwnd: int, parent_hwnd: int) -> bool:
@@ -388,6 +394,82 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             print(f"[MainWindow] camera-mode buttons init failed: {exc}")
 
+        # ---- Custom camera presets (3 user slots: position + FOV) ---
+        try:
+            from PyQt6.QtWidgets import (
+                QPushButton as _PPB,
+                QHBoxLayout as _PHB,
+                QFrame as _PFr,
+                QLabel as _PL,
+            )
+            from src.ui.ui_theme import (
+                COLOR_TEXT_MUTED as _PCTM,
+            )
+
+            # Per-slot state: dict {"pos", "hpr", "fov"} or None. Loaded
+            # from disk so user presets survive restarts.
+            self._cam_presets = self._load_cam_presets()
+            self._preset_save_armed = False
+            self._selected_preset = None      # currently active slot
+            # Blink timer: while save mode is armed all 3 slots pulse to
+            # invite the user to pick a slot to save into.
+            self._preset_blink_on = False
+            self._preset_blink_timer = QTimer(self)
+            self._preset_blink_timer.timeout.connect(self._on_preset_blink_tick)
+
+            preset_holder = _PFr()
+            preset_holder.setStyleSheet(
+                "QFrame { background: transparent; border: none; }"
+            )
+            ph_lay = _PHB(preset_holder)
+            ph_lay.setContentsMargins(0, 6, 0, 0)
+            ph_lay.setSpacing(4)
+
+            lbl = _PL("МОИ")
+            lbl.setStyleSheet(
+                f"color: {_PCTM}; font-size: 9px; letter-spacing: 1.0px;"
+                f" background: transparent;"
+            )
+            ph_lay.addWidget(lbl, 0)
+
+            self._preset_btns: dict = {}
+            for slot in (0, 1, 2):
+                btn = _PPB(str(slot + 1))
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setFixedHeight(22)
+                btn.setToolTip(
+                    "ЛКМ — загрузить пресет\n"
+                    "В режиме «Сохр» — записать текущую камеру\n"
+                    "ПКМ — сохранить/очистить"
+                )
+                btn.setContextMenuPolicy(
+                    Qt.ContextMenuPolicy.CustomContextMenu
+                )
+                btn.customContextMenuRequested.connect(
+                    lambda _p, s=slot: self._on_preset_context_menu(s)
+                )
+                btn.clicked.connect(
+                    lambda _c=False, s=slot: self._on_preset_clicked(s)
+                )
+                self._preset_btns[slot] = btn
+                ph_lay.addWidget(btn, 1)
+
+            self._btn_preset_save = _PPB("Сохр")
+            self._btn_preset_save.setCheckable(True)
+            self._btn_preset_save.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._btn_preset_save.setFixedHeight(22)
+            self._btn_preset_save.setToolTip(
+                "Нажмите — слоты замигают; затем выберите слот 1/2/3,\n"
+                "чтобы сохранить туда текущую позицию, FOV и крен"
+            )
+            self._btn_preset_save.toggled.connect(self._on_preset_save_armed)
+            ph_lay.addWidget(self._btn_preset_save, 1)
+
+            self.telemetry.attach_extra(preset_holder)
+            self._apply_preset_styles()
+        except Exception as exc:
+            print(f"[MainWindow] camera preset buttons init failed: {exc}")
+
         # ---- Save-render row (count + button) ----------------------
         try:
             from PyQt6.QtWidgets import (
@@ -548,6 +630,45 @@ class MainWindow(QMainWindow):
         self.right_panel.reconstructionRunRequested.connect(
             self._on_reconstruction_run
         )
+
+        # ---- Camera-alignment reference overlay --------------------
+        # Full-viewport translucent layer that shows a captured stand
+        # snapshot's colour frame so the user can match the live camera.
+        self.reference_overlay = CameraReferenceOverlay(
+            parent=self.panda_container
+        )
+        self.reference_overlay.attach()
+        self.right_panel.standReferenceSelected.connect(
+            self._on_stand_reference_selected
+        )
+        self.right_panel.fovChanged.connect(self._on_fov_changed)
+        self.right_panel.rollChanged.connect(self._on_roll_changed)
+        self.right_panel.referenceOpacityChanged.connect(
+            self._on_reference_opacity_changed
+        )
+        self.right_panel.referenceVisibleToggled.connect(
+            self._on_reference_visible_toggled
+        )
+
+        # ---- Depth-fill reconstruction (N-point picking) -----------
+        self._active_stand_rec = None
+        self._last_auto_recon_depth = ""   # de-dupe auto-reconstruct calls
+        try:
+            from src.rendering.depth_reconstruction import DepthReconstructor
+            self.depth_reconstructor = DepthReconstructor(panda_app)
+            self.depth_reconstructor.on_count = self._on_pick_count
+            self.depth_reconstructor.on_finished = self._on_reconstruct_finished
+            self.depth_reconstructor.on_picking_state = self._on_picking_state
+        except Exception as exc:
+            self.depth_reconstructor = None
+            print(f"[MainWindow] DepthReconstructor init failed: {exc}")
+        self.right_panel.pointPickingToggled.connect(
+            self._on_point_picking_toggled
+        )
+        self.right_panel.pointsResetRequested.connect(
+            self._on_points_reset
+        )
+
         # Fire an initial load so the default model is on the scene before
         # the user even picks anything.
         try:
@@ -580,6 +701,21 @@ class MainWindow(QMainWindow):
         if cfg is None:
             print(f"[ModelSet] config not found for {model_key!r}")
             return
+
+        # Local truck models (assets/models/trucks) load straight from disk:
+        # no server download, and no reference points / camera presets.
+        if cfg.get("local"):
+            if not hasattr(self.panda_app, "load_model_set"):
+                print("[ModelSet] panda_app.load_model_set missing.")
+                return
+            print(f"[ModelSet] loading local model '{model_key}' ...")
+            try:
+                ok = bool(self.panda_app.load_model_set(cfg, str(model_key)))
+                print(f"[ModelSet] {'OK' if ok else 'FAILED'} '{model_key}'")
+            except Exception as exc:
+                print(f"[ModelSet] local load_model_set raised: {exc}")
+            return
+
         if not hasattr(self.panda_app, "cache_and_load_model_set"):
             print(f"[ModelSet] panda_app.cache_and_load_model_set missing.")
             return
@@ -1226,6 +1362,12 @@ class MainWindow(QMainWindow):
             self._arm_continuous_depth_pass(dr)
             self._depth_pass_armed = True
 
+        # Keep the depth camera's lens FOV mirrored to the main lens. The
+        # depth camera has its OWN lens (reparented onto the main camera in
+        # _arm_continuous_depth_pass), so FOV-slider / camera-mode changes
+        # don't reach it automatically. Cheap, and covers every FOV source.
+        self._mirror_depth_camera_fov(dr)
+
         try:
             import numpy as np
             from PyQt6.QtGui import QImage
@@ -1434,6 +1576,9 @@ class MainWindow(QMainWindow):
         fc = getattr(self.panda_app, "fly_cam", None)
         if fc is not None and hasattr(fc, "set_frozen"):
             fc.set_frozen(False)
+        # Default presets straighten the camera (roll = 0).
+        self._apply_camera_roll(0.0)
+        self._sync_roll_dial(0.0)
 
     # ------------------------------------------------------------------
     def _apply_stationary_camera(self) -> None:
@@ -1449,6 +1594,11 @@ class MainWindow(QMainWindow):
             lens = self.panda_app.cam.node().get_lens()
             if lens is not None and hasattr(lens, "set_fov"):
                 lens.set_fov(self._STATIONARY_FOV)
+            self._sync_fov_slider(self._STATIONARY_FOV)
+            # Default preset → roll = 0 (also resets the fly cam's stored
+            # roll so a later free-fly doesn't inherit a stale value).
+            self._apply_camera_roll(0.0)
+            self._sync_roll_dial(0.0)
             print(f"[Camera] STATIC pos={self._STATIONARY_POS} "
                   f"hpr={self._STATIONARY_HPR} fov={self._STATIONARY_FOV}")
         except Exception as exc:
@@ -1497,11 +1647,562 @@ class MainWindow(QMainWindow):
             lens = self.panda_app.cam.node().get_lens()
             if lens is not None and hasattr(lens, "set_fov"):
                 lens.set_fov(self._ONBOARD_FOV)
+            self._sync_fov_slider(self._ONBOARD_FOV)
+            # On-board roll comes from the model config (cam_rot_r, normally
+            # 0). Keep the fly cam + dial in sync with it so no custom roll
+            # is carried over from a previous view.
+            self._apply_camera_roll(cr)
+            self._sync_roll_dial(cr)
             print(f"[Camera] ONBOARD '{key}' pos=({cx},{cy},{cz}) "
                   f"hpr=({ch},{cp},{cr}) fov={self._ONBOARD_FOV}")
         except Exception as exc:
             print(f"[Camera] onboard preset failed: {exc}")
         self._apply_depth_preset(self._ONBOARD_DEPTH)
+
+    # ==================================================================
+    # Custom camera presets (3 user slots: position + FOV)
+    # ==================================================================
+    def _load_cam_presets(self) -> list:
+        """Read the 3 user presets from disk. Always returns a 3-element
+        list of (dict | None)."""
+        presets: list = [None, None, None]
+        try:
+            if os.path.exists(CAMERA_PRESETS_PATH):
+                with open(CAMERA_PRESETS_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                items = data.get("presets") if isinstance(data, dict) else data
+                if isinstance(items, list):
+                    for i in range(min(3, len(items))):
+                        item = items[i]
+                        if isinstance(item, dict) and "pos" in item:
+                            presets[i] = item
+        except Exception as exc:
+            print(f"[Preset] load failed: {exc}")
+        return presets
+
+    def _save_cam_presets(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(CAMERA_PRESETS_PATH), exist_ok=True)
+            with open(CAMERA_PRESETS_PATH, "w", encoding="utf-8") as f:
+                json.dump({"presets": self._cam_presets}, f,
+                          ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"[Preset] save failed: {exc}")
+
+    @staticmethod
+    def _preset_qss(state: str) -> str:
+        """QSS for a preset slot / save button in a given visual state:
+        'selected' | 'filled' | 'empty' | 'blink_on' | 'blink_off' |
+        'save_armed' | 'save_idle'."""
+        from src.ui.ui_theme import (
+            COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_HAIRLINE, COLOR_ACCENT,
+        )
+
+        def _btn(bg, fg, border, weight=600, hover_bg=None):
+            css = (
+                "QPushButton {"
+                f"  background: {bg};"
+                f"  color: {fg};"
+                f"  border: {border};"
+                "  border-radius: 5px;"
+                "  padding: 4px 6px;"
+                "  font-size: 10px;"
+                f"  font-weight: {weight};"
+                "  letter-spacing: 0.6px;"
+                "}"
+            )
+            if hover_bg is not None:
+                css += f"QPushButton:hover {{ background: {hover_bg}; }}"
+            return css
+
+        if state == "selected":
+            return _btn("rgba(0,255,136,55)", COLOR_TEXT,
+                        f"1px solid {COLOR_ACCENT}", 700)
+        if state == "filled":
+            return _btn("transparent", COLOR_ACCENT,
+                        f"1px solid {COLOR_ACCENT}", 600,
+                        hover_bg="rgba(0,255,136,18)")
+        if state == "blink_on":
+            return _btn("rgba(0,255,136,70)", COLOR_TEXT,
+                        f"1px dashed {COLOR_ACCENT}", 700)
+        if state == "blink_off":
+            return _btn("transparent", COLOR_TEXT_MUTED,
+                        f"1px dashed {COLOR_HAIRLINE}", 600)
+        if state == "save_armed":
+            return _btn("rgba(0,255,136,55)", COLOR_TEXT,
+                        f"1px solid {COLOR_ACCENT}", 700)
+        # 'empty' / 'save_idle'
+        return _btn("transparent", COLOR_TEXT_MUTED,
+                    f"1px solid {COLOR_HAIRLINE}", 600,
+                    hover_bg="rgba(255,255,255,8)")
+
+    def _apply_preset_styles(self) -> None:
+        try:
+            armed = getattr(self, "_preset_save_armed", False)
+            blink_on = getattr(self, "_preset_blink_on", False)
+            for slot, btn in getattr(self, "_preset_btns", {}).items():
+                if armed:
+                    state = "blink_on" if blink_on else "blink_off"
+                elif self._selected_preset == slot:
+                    state = "selected"
+                elif self._cam_presets[slot] is not None:
+                    state = "filled"
+                else:
+                    state = "empty"
+                btn.setStyleSheet(self._preset_qss(state))
+            sb = getattr(self, "_btn_preset_save", None)
+            if sb is not None:
+                sb.setStyleSheet(
+                    self._preset_qss("save_armed" if armed else "save_idle")
+                )
+        except Exception:
+            pass
+
+    def _on_preset_blink_tick(self) -> None:
+        self._preset_blink_on = not getattr(self, "_preset_blink_on", False)
+        self._apply_preset_styles()
+
+    def _set_preset_save_armed(self, armed: bool) -> None:
+        """Arm/disarm save mode: while armed all 3 slots blink, inviting
+        the user to pick a slot to write the current camera into."""
+        self._preset_save_armed = bool(armed)
+        sb = getattr(self, "_btn_preset_save", None)
+        if sb is not None and sb.isChecked() != self._preset_save_armed:
+            blocked = sb.blockSignals(True)
+            sb.setChecked(self._preset_save_armed)
+            sb.blockSignals(blocked)
+        timer = getattr(self, "_preset_blink_timer", None)
+        if self._preset_save_armed:
+            self._preset_blink_on = True
+            if timer is not None:
+                timer.start(450)
+        else:
+            if timer is not None:
+                timer.stop()
+            self._preset_blink_on = False
+        self._apply_preset_styles()
+
+    def _capture_camera_state(self) -> dict | None:
+        if self.panda_app is None:
+            return None
+        cam = getattr(self.panda_app, "camera", None)
+        if cam is None:
+            return None
+        try:
+            pos = cam.get_pos()
+            hpr = cam.get_hpr()
+            fov = None
+            camnode = getattr(self.panda_app, "cam", None)
+            if camnode is not None:
+                lens = camnode.node().get_lens()
+                if lens is not None and hasattr(lens, "get_fov"):
+                    fov = float(lens.get_fov().x)
+            return {
+                "pos": [float(pos.x), float(pos.y), float(pos.z)],
+                "hpr": [float(hpr[0]), float(hpr[1]), float(hpr[2])],
+                "fov": fov,
+            }
+        except Exception as exc:
+            print(f"[Preset] capture failed: {exc}")
+            return None
+
+    def _save_preset(self, slot: int) -> None:
+        if not (0 <= slot < 3):
+            return
+        state = self._capture_camera_state()
+        if state is None:
+            print("[Preset] nothing to save (no camera).")
+            return
+        self._cam_presets[slot] = state
+        self._selected_preset = slot          # saving selects the slot
+        self._save_cam_presets()
+        self._apply_preset_styles()
+        print(f"[Preset] saved slot {slot + 1}: {state}")
+
+    def _clear_preset(self, slot: int) -> None:
+        if not (0 <= slot < 3):
+            return
+        self._cam_presets[slot] = None
+        if self._selected_preset == slot:
+            self._selected_preset = None
+        self._save_cam_presets()
+        self._apply_preset_styles()
+        print(f"[Preset] cleared slot {slot + 1}")
+
+    def _recall_preset(self, slot: int) -> None:
+        """Apply a saved preset's position + FOV and drop into free-fly so
+        the user can immediately look around from the saved vantage point."""
+        if self.panda_app is None or not (0 <= slot < 3):
+            return
+        preset = self._cam_presets[slot]
+        if not preset:
+            return
+        cam = getattr(self.panda_app, "camera", None)
+        if cam is None:
+            return
+        # Unfreeze the fly camera (STATIC/BOARD pin it) and reflect FREE in
+        # the mode segment, so the recalled pose is the new free-cam origin.
+        try:
+            if getattr(self, "_camera_mode", None) != "free":
+                self._on_camera_mode("free")
+        except Exception as exc:
+            print(f"[Preset] switch to free failed: {exc}")
+        try:
+            px, py, pz = preset.get("pos", [0.0, 0.0, 0.0])
+            h, p, r = preset.get("hpr", [0.0, 0.0, 0.0])
+            cam.set_pos(float(px), float(py), float(pz))
+            cam.set_hpr(float(h), float(p), float(r))
+            # Restore roll through the fly cam (so mouse-look keeps it) and
+            # reflect it on the dial. Must run AFTER the free-mode switch
+            # above, which resets roll to 0.
+            self._apply_camera_roll(float(r))
+            self._sync_roll_dial(float(r))
+            fov = preset.get("fov")
+            if fov is not None:
+                lens = self.panda_app.cam.node().get_lens()
+                if lens is not None and hasattr(lens, "set_fov"):
+                    lens.set_fov(float(fov))
+                self._sync_fov_slider(float(fov))
+                self._mirror_depth_camera_fov()
+            self._selected_preset = slot      # loading selects the slot
+            self._apply_preset_styles()
+            print(f"[Preset] recalled slot {slot + 1}")
+        except Exception as exc:
+            print(f"[Preset] recall failed: {exc}")
+
+    def _on_preset_save_armed(self, checked: bool) -> None:
+        self._set_preset_save_armed(bool(checked))
+
+    def _on_preset_clicked(self, slot: int) -> None:
+        # Save mode → write the current camera into this slot, select it,
+        # and leave save mode (stops the blinking).
+        if getattr(self, "_preset_save_armed", False):
+            self._save_preset(slot)           # also selects the slot
+            self._set_preset_save_armed(False)
+            return
+        # Normal mode → load the preset if the slot holds one. Empty slots
+        # do nothing (no accidental auto-save).
+        if self._cam_presets[slot] is not None:
+            self._recall_preset(slot)
+
+    def _on_preset_context_menu(self, slot: int) -> None:
+        from PyQt6.QtWidgets import QMenu
+        btn = self._preset_btns.get(slot)
+        if btn is None:
+            return
+        menu = QMenu(btn)
+        act_save = menu.addAction(f"Сохранить текущую в слот {slot + 1}")
+        act_clear = menu.addAction("Очистить слот")
+        act_clear.setEnabled(self._cam_presets[slot] is not None)
+        chosen = menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        if chosen is act_save:
+            self._save_preset(slot)
+        elif chosen is act_clear:
+            self._clear_preset(slot)
+
+    # ==================================================================
+    # FOV slider + camera-alignment reference overlay
+    # ==================================================================
+    def _sync_fov_slider(self, fov: float) -> None:
+        """Reflect a programmatically-applied FOV on the panel slider
+        (without re-triggering _on_fov_changed)."""
+        rp = getattr(self, "right_panel", None)
+        if rp is not None and hasattr(rp, "set_fov_value"):
+            try:
+                rp.set_fov_value(float(fov))
+            except Exception:
+                pass
+
+    def _sync_roll_dial(self, roll: float) -> None:
+        """Reflect a programmatically-applied roll on the panel dial
+        (without re-triggering _on_roll_changed)."""
+        rp = getattr(self, "right_panel", None)
+        if rp is not None and hasattr(rp, "set_roll_value"):
+            try:
+                rp.set_roll_value(float(roll))
+            except Exception:
+                pass
+
+    def _apply_camera_roll(self, roll: float) -> None:
+        """Set the camera roll. Routes through the fly cam (so mouse-look
+        keeps the roll) when present; otherwise sets the node directly."""
+        if self.panda_app is None:
+            return
+        fc = getattr(self.panda_app, "fly_cam", None)
+        if fc is not None and hasattr(fc, "set_roll"):
+            fc.set_roll(float(roll))
+            return
+        cam = getattr(self.panda_app, "camera", None)
+        if cam is not None:
+            try:
+                cam.set_r(float(roll))
+            except Exception as exc:
+                print(f"[Camera] roll set failed: {exc}")
+
+    def _on_roll_changed(self, roll: float) -> None:
+        """Drive the live camera roll from the right-panel dial."""
+        self._apply_camera_roll(roll)
+
+    def _mirror_depth_camera_fov(self, dr=None) -> None:
+        """Mirror the main camera lens FOV onto the depth-preview camera's
+        own lens (only writes when it actually changed)."""
+        if self.panda_app is None:
+            return
+        if dr is None:
+            dr = getattr(self.panda_app, "depth_renderer", None)
+        if dr is None:
+            return
+        cam_np = getattr(dr, "depth_camera_np", None)
+        cam = getattr(self.panda_app, "cam", None)
+        if cam_np is None or cam is None:
+            return
+        try:
+            main_lens = cam.node().get_lens()
+            dlens = cam_np.node().get_lens()
+            if main_lens is None or dlens is None:
+                return
+            mf = main_lens.get_fov()
+            df = dlens.get_fov()
+            if abs(mf.x - df.x) > 1e-3 or abs(mf.y - df.y) > 1e-3:
+                dlens.set_fov(mf)
+        except Exception as exc:
+            print(f"[Depth] FOV mirror failed: {exc}")
+
+    def _on_fov_changed(self, fov: float) -> None:
+        """Drive the live camera lens FOV from the right-panel slider."""
+        if self.panda_app is None:
+            return
+        try:
+            lens = self.panda_app.cam.node().get_lens()
+            if lens is not None and hasattr(lens, "set_fov"):
+                lens.set_fov(float(fov))
+        except Exception as exc:
+            print(f"[Camera] FOV set failed: {exc}")
+        # Reflect the change on the depth-preview camera immediately
+        # (the periodic depth tick also mirrors it as a safety net).
+        self._mirror_depth_camera_fov()
+
+    def _on_stand_reference_selected(self, rec) -> None:
+        """Show / hide the full-viewport reference snapshot used for manual
+        camera alignment. `rec` is a stand Reconstruction, or None."""
+        ov = getattr(self, "reference_overlay", None)
+        if ov is None:
+            return
+        # Switching snapshots invalidates any in-progress point picking.
+        self._active_stand_rec = rec
+        self._stop_point_picking()
+        if rec is None:
+            ov.hide_overlay()
+            return
+        # Prefer the explicit colour-frame path; fall back to .path.
+        path = (getattr(rec, "color_path", "") or "").strip() \
+            or (getattr(rec, "path", "") or "").strip()
+        if not path:
+            ov.hide_overlay()
+            return
+        # Feed the reconstructor the snapshot's depth + colour paths.
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is not None:
+            dr.set_source(
+                (getattr(rec, "depth_path", "") or "").strip(),
+                (getattr(rec, "color_path", "") or "").strip(),
+            )
+        ov.set_image(path)
+        # Manual alignment needs a movable camera — drop into free-fly so
+        # WASD / RMB-look work (STATIC / BOARD freeze the camera).
+        if getattr(self, "_camera_mode", None) != "free":
+            try:
+                self._on_camera_mode("free")
+            except Exception as exc:
+                print(f"[Camera] auto free-mode for alignment failed: {exc}")
+        # Apply the current opacity from the panel slider, if present.
+        rp = getattr(self, "right_panel", None)
+        try:
+            if rp is not None and hasattr(rp, "ref_opacity_slider"):
+                ov.set_opacity(rp.ref_opacity_slider.value() / 100.0)
+            # Reset the show/hide toggle to "shown".
+            if rp is not None and hasattr(rp, "btn_ref_toggle"):
+                blocked = rp.btn_ref_toggle.blockSignals(True)
+                rp.btn_ref_toggle.setChecked(True)
+                rp.btn_ref_toggle.setText("Скрыть снимок")
+                rp.btn_ref_toggle.blockSignals(blocked)
+        except Exception:
+            pass
+        ov.show_overlay()
+        self._raise_huds_above_reference()
+
+        # If reference points were already picked, auto-reconstruct this
+        # snapshot from them (same fixed stand camera, new depth map).
+        try:
+            depth_p = (getattr(rec, "depth_path", "") or "").strip()
+            dr = getattr(self, "depth_reconstructor", None)
+            if (dr is not None and depth_p
+                    and dr.has_saved_points() and not dr.is_picking()
+                    and depth_p != self._last_auto_recon_depth):
+                self._last_auto_recon_depth = depth_p
+                dr.reconstruct_saved(depth_p)
+        except Exception as exc:
+            print(f"[DepthRecon] авто-реконструкция упала: {exc}")
+
+    def _on_reference_opacity_changed(self, value: float) -> None:
+        ov = getattr(self, "reference_overlay", None)
+        if ov is not None:
+            ov.set_opacity(float(value))
+
+    def _on_reference_visible_toggled(self, visible: bool) -> None:
+        ov = getattr(self, "reference_overlay", None)
+        if ov is None:
+            return
+        if visible:
+            ov.show_overlay()
+            self._raise_huds_above_reference()
+        else:
+            ov.hide_overlay()
+
+    def _raise_huds_above_reference(self) -> None:
+        """Keep the interactive panel + read-only HUDs above the
+        click-through reference layer (the telemetry card shows camera
+        pos/rot/FOV the user reads while aligning)."""
+        for name in ("telemetry", "controls", "depth_overlay", "right_panel"):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.raise_()
+                except Exception:
+                    pass
+
+    # ==================================================================
+    # Depth-fill reconstruction (4-point picking)
+    # ==================================================================
+    def _stop_point_picking(self) -> None:
+        """Cancel any in-progress picking and reset the toggle/label."""
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is not None:
+            try:
+                dr.stop_picking()
+                dr.clear_points()
+            except Exception:
+                pass
+        rp = getattr(self, "right_panel", None)
+        if rp is not None:
+            try:
+                rp.set_picking_active(False)
+                rp.set_point_count(0)
+            except Exception:
+                pass
+
+    def _on_point_picking_toggled(self, active: bool) -> None:
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is None:
+            return
+        rec = getattr(self, "_active_stand_rec", None)
+        if active and rec is None:
+            # No stand snapshot selected — nothing to pick against.
+            rp = getattr(self, "right_panel", None)
+            if rp is not None:
+                rp.set_picking_active(False)
+            print("[DepthRecon] выберите снимок стенда перед выбором точек.")
+            return
+        if active:
+            dr.start_picking()
+            # If picking couldn't start (e.g. no depth map), snap the toggle
+            # back so the UI doesn't look armed.
+            if not dr.is_picking():
+                rp = getattr(self, "right_panel", None)
+                if rp is not None:
+                    rp.set_picking_active(False)
+        else:
+            dr.stop_picking()
+
+    def _on_points_reset(self) -> None:
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is not None:
+            try:
+                dr.stop_picking()
+                dr.clear_points()
+                dr.clear_saved_points()   # also stop auto-reconstructing
+                dr.dispose_mesh()
+            except Exception as exc:
+                print(f"[DepthRecon] reset failed: {exc}")
+        self._last_auto_recon_depth = ""
+        rp = getattr(self, "right_panel", None)
+        if rp is not None:
+            rp.set_picking_active(False)
+            rp.set_point_count(0)
+
+    def _on_pick_count(self, n: int) -> None:
+        rp = getattr(self, "right_panel", None)
+        if rp is not None:
+            rp.set_point_count(int(n))
+
+    # Panel / HUD windows hidden while picking for a clean view. The
+    # reference-photo overlay is intentionally NOT in this list — it keeps
+    # rendering during picking so the user can see where the bed corners are.
+    _PICK_HIDE_WIDGETS = (
+        "telemetry", "depth_overlay", "controls", "right_panel",
+    )
+
+    def _on_picking_state(self, active: bool) -> None:
+        """Hide the panels/HUDs while picking bed corners (keeping the
+        reference photo), and restore them afterwards."""
+        if active:
+            self._hide_ui_for_picking()
+        else:
+            self._show_ui_after_picking()
+
+    def _hide_ui_for_picking(self) -> None:
+        self._ui_prev_visible = {}
+        for name in self._PICK_HIDE_WIDGETS:
+            w = getattr(self, name, None)
+            if w is None:
+                continue
+            try:
+                self._ui_prev_visible[name] = bool(w.isVisible())
+                w.hide()
+            except Exception:
+                pass
+        # Keep the reference photo visible + on top of the viewport while the
+        # panels are gone (it's click-through, so picks still reach the scene).
+        ov = getattr(self, "reference_overlay", None)
+        if ov is not None and ov.isVisible():
+            try:
+                ov.raise_()
+            except Exception:
+                pass
+
+    def _show_ui_after_picking(self) -> None:
+        prev = getattr(self, "_ui_prev_visible", None) or {}
+        # Bring back the chrome (HUDs + panel).
+        for name in self._PICK_HIDE_WIDGETS:
+            w = getattr(self, name, None)
+            if w is None:
+                continue
+            was_visible = prev.get(name, True)
+            if not was_visible:
+                continue
+            try:
+                w.show()
+                w.raise_()
+            except Exception:
+                pass
+        # Keep the interactive chrome above the click-through photo layer.
+        self._raise_huds_above_reference()
+
+    def _on_reconstruct_finished(self, success: bool, info: dict) -> None:
+        rp = getattr(self, "right_panel", None)
+        if rp is not None:
+            rp.set_picking_active(False)
+            rp.set_point_count(0)
+        if success:
+            print(f"[DepthRecon] готово: {info}")
+            # Mark this snapshot as already built so re-selecting it doesn't
+            # trigger a redundant auto-reconstruction.
+            rec = getattr(self, "_active_stand_rec", None)
+            if rec is not None:
+                self._last_auto_recon_depth = (
+                    getattr(rec, "depth_path", "") or "").strip()
+        else:
+            print("[DepthRecon] реконструкция не выполнена.")
 
     # ==================================================================
     # Save-render handler
@@ -1793,6 +2494,19 @@ class MainWindow(QMainWindow):
             self.telemetry.update_row("YAW",   f"{yaw:+6.1f}")
             self.telemetry.update_row("ROLL",  f"{roll:+6.1f}")
             self.telemetry.update_row("FOV",   f"{fov:6.1f}")
+            # One-time: align the FOV slider with the live lens so the
+            # control starts in sync with whatever the pipeline booted with.
+            if not getattr(self, "_fov_slider_synced", False) and fov > 0:
+                rp = getattr(self, "right_panel", None)
+                if rp is not None and hasattr(rp, "set_fov_value"):
+                    rp.set_fov_value(fov)
+                    self._fov_slider_synced = True
+            # One-time: align the roll dial with the live camera roll.
+            if not getattr(self, "_roll_dial_synced", False):
+                rp = getattr(self, "right_panel", None)
+                if rp is not None and hasattr(rp, "set_roll_value"):
+                    rp.set_roll_value(roll)
+                    self._roll_dial_synced = True
             try:
                 pos = cam.get_pos()
                 self.telemetry.update_row("X", f"{float(pos.x):+7.1f}")
@@ -1901,6 +2615,16 @@ class MainWindow(QMainWindow):
             self.panda_app.win.requestProperties(props)
         except Exception as e:
             print(f"[Resize] requestProperties failed: {e}")
+        # Keep the lens aspect in sync with the new window so the rendered
+        # view stays undistorted. set_fov() pinned the HORIZONTAL FOV, so the
+        # vertical FOV follows the aspect — the view scales by window WIDTH.
+        # The reference-photo overlay scales to width to match this exactly.
+        try:
+            lens = self.panda_app.cam.node().get_lens()
+            if lens is not None and hasattr(lens, "set_aspect_ratio"):
+                lens.set_aspect_ratio(float(w) / float(h))
+        except Exception as e:
+            print(f"[Resize] lens aspect update failed: {e}")
 
     def resizeEvent(self, e):
         super().resizeEvent(e)

@@ -31,7 +31,7 @@ class FlyCamera:
     """Per-frame fly camera driven from Panda3D's input system."""
 
     # ---- Tunables ----------------------------------------------------
-    MOVE_SPEED   = 10.0   # world units / sec
+    MOVE_SPEED   = 3.0   # world units / sec
     SPRINT_MULT  = 4.0
     LOOK_SENS    = 0.18   # degrees per pixel of mouse delta
     PITCH_LIMIT  = 89.0   # ± degrees
@@ -59,6 +59,10 @@ class FlyCamera:
         self._looking = False
         self._last_mx: int | None = None
         self._last_my: int | None = None
+        # User-controlled roll (rotation about the view axis). The fly cam
+        # holds the camera at this roll instead of forcing level, so the UI
+        # roll dial isn't fought during mouse-look.
+        self._roll = float(start_hpr[2]) if len(start_hpr) > 2 else 0.0
 
         # ---- Bind keys ----------------------------------------------
         for k in self._KEYS:
@@ -86,6 +90,11 @@ class FlyCamera:
 
     # ------------------------------------------------------------------
     def _begin_look(self) -> None:
+        # While frozen (e.g. during depth point-picking, which uses RMB to
+        # finish) the look must stay fully disabled — don't even hide the
+        # cursor.
+        if getattr(self, "_frozen", False):
+            return
         self._looking = True
         self._last_mx = None
         self._last_my = None
@@ -135,6 +144,22 @@ class FlyCamera:
         return bool(getattr(self, "_frozen", False))
 
     # ==================================================================
+    # Roll (rotation about the view axis)
+    # ==================================================================
+    def set_roll(self, roll: float) -> None:
+        """Set the camera roll (degrees) and remember it so mouse-look
+        keeps it instead of levelling. Applies immediately, which also
+        covers the frozen STATIC/BOARD modes."""
+        try:
+            self._roll = float(roll)
+            self.cam.set_r(self._roll)
+        except Exception:
+            pass
+
+    def get_roll(self) -> float:
+        return float(getattr(self, "_roll", 0.0))
+
+    # ==================================================================
     # Frame tick
     # ==================================================================
     def _update(self, task):
@@ -159,8 +184,9 @@ class FlyCamera:
                         if new_p < -self.PITCH_LIMIT: new_p = -self.PITCH_LIMIT
                         self.cam.set_p(new_p)
 
-                        # Fly cams shouldn't tilt.
-                        self.cam.set_r(0.0)
+                        # Hold the user-set roll (0 = level) instead of
+                        # snapping back to 0 every look frame.
+                        self.cam.set_r(self._roll)
 
                     self._last_mx = mx
                     self._last_my = my
