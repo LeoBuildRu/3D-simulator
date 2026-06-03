@@ -224,6 +224,11 @@ class MyApp(ShowBase):
                     base_np.reparent_to(self.render)
                     base_np.set_pos(0, 0, 0)
                     self._apply_auto_shader(base_np)
+                    # PERFORMANCE: this .bam ships RP-style M_modulate stages
+                    # and no tangents — remap stages + build tangents so its
+                    # normal/roughness maps render under simplepbr.
+                    if not self.use_render_pipeline:
+                        self._make_pbr_compatible(base_np)
                     self.base_static_model = base_np
                     print(f"[Scene] base_without_ground.bam loaded from "
                           f"{base_path}")
@@ -440,6 +445,41 @@ class MyApp(ShowBase):
         shadow_res = int(preset.get("shadow_resolution", 2048))
         try:
             import simplepbr
+
+            # Image-based lighting (IBL). This is what actually makes the
+            # scene look "PBR": without an environment map simplepbr has no
+            # ambient specular and metals render black. We build it from the
+            # sky cubemap bundled with RenderPipeline (6 faces). It provides
+            # diffuse (SH) + specular (prefiltered) lighting to ALL surfaces
+            # — trucks, ground, everything.
+            #
+            # `ibl_specular_scale` dims the cubemap before prefiltering, which
+            # controls the brightness of the REFLECTIONS (the bundled sky is
+            # very bright and otherwise blows out metals). The diffuse term is
+            # set separately below via the SH coefficients.
+            self.ibl_specular_scale = 0.35
+            self.ibl_diffuse_scale = 0.25   # absolute, vs the original sky
+            env_map = None
+            try:
+                from panda3d.core import TexturePool
+                cube_pattern = Filename.from_os_specific(
+                    os.path.join(PROJECT_ROOT, "render_pipeline", "data",
+                                 "default_cubemap", "source", "#.png")
+                ).get_fullpath()
+                cube = TexturePool.load_cube_map(cube_pattern)
+                ram = cube.get_ram_image()
+                if ram is not None:
+                    a = np.frombuffer(bytes(ram), dtype=np.uint8).astype(np.float32)
+                    a = np.clip(a * self.ibl_specular_scale, 0, 255).astype(np.uint8)
+                    cube.set_ram_image(a.tobytes())
+                env_map = simplepbr.EnvMap(cube, blocking_prepare=True)
+                print(f"[MyApp] IBL environment map loaded "
+                      f"(reflections x{self.ibl_specular_scale})")
+            except Exception as exc:
+                env_map = None
+                print(f"[MyApp] IBL env map load failed ({exc}); "
+                      f"metals/reflections will look flat")
+
             self.pbr_pipeline = simplepbr.init(
                 use_normal_maps=True,
                 enable_shadows=True,
@@ -447,9 +487,33 @@ class MyApp(ShowBase):
                 max_lights=int(preset.get("max_lights", 4)),
                 msaa_samples=int(preset.get("msaa", 0)),
                 use_emission_maps=False,
-                use_occlusion_maps=True,
+                # Occlusion OFF: our ground roughness map is a plain grayscale
+                # map bound as the metal-roughness (ORM) texture; its R channel
+                # is NOT occlusion, so we must not let simplepbr read it as AO.
+                use_occlusion_maps=False,
+                env_map=env_map,
             )
             print("[MyApp] simplepbr renderer initialised")
+
+            # The bundled cubemap integrates to a very bright ambient
+            # (SH[0] ~5 → irradiance > 1), which the shader adds to EVERY
+            # fragment regardless of shadow — flooding shadows and drowning
+            # the sun so normal maps stop reading. Set the DIFFUSE IBL to an
+            # absolute, modest level via the SH coefficients. (The cube was
+            # already dimmed by ibl_specular_scale, so compensate for that to
+            # keep diffuse independent of the reflection brightness.)
+            if env_map is not None:
+                from panda3d.core import PTA_LVecBase3f, LVecBase3f
+                factor = self.ibl_diffuse_scale / max(self.ibl_specular_scale,
+                                                      1e-3)
+                _scaled = PTA_LVecBase3f()
+                for _v in env_map.sh_coefficients:
+                    _scaled.push_back(LVecBase3f(
+                        _v[0] * factor, _v[1] * factor, _v[2] * factor,
+                    ))
+                self.render.set_shader_input("sh_coeffs", _scaled)
+                print(f"[MyApp] IBL diffuse x{self.ibl_diffuse_scale}, "
+                      f"reflections x{self.ibl_specular_scale}")
         except Exception as exc:
             self.pbr_pipeline = None
             print(f"[MyApp] simplepbr init failed ({exc}); "
@@ -482,18 +546,20 @@ class MyApp(ShowBase):
         self.sun_np = self.render.attach_new_node(sun)
         self.render.set_light(self.sun_np)
 
-        # Low cool ambient fill — keeps shadows dark for contrast while not
-        # being pure black. set_time_of_day adjusts this with the sun.
+        # Low cool ambient fill. The IBL env map already supplies most of the
+        # ambient/sky light, so this stays small to keep shadows contrasty.
+        # set_time_of_day adjusts it with the sun.
         amb = AmbientLight("perf_ambient")
-        amb.set_color(Vec4(0.13, 0.14, 0.18, 1.0))
+        amb.set_color(Vec4(0.06, 0.07, 0.09, 1.0))
         self.ambient_light = amb
         self.ambient_np = self.render.attach_new_node(amb)
         self.render.set_light(self.ambient_np)
 
-        # Position the sun to match the daytime slider's default (13:00 —
-        # a high, bright afternoon sun so lighting and shadows read clearly).
+        # Position the sun to match the daytime slider's default (15:00 — a
+        # ~45° afternoon sun: bright, but raking enough to reveal normal-map
+        # bumps and cast longer, clearly visible shadows).
         try:
-            self.set_time_of_day(13 * 60)
+            self.set_time_of_day(15 * 60)
         except Exception as exc:
             print(f"[MyApp] initial set_time_of_day failed: {exc}")
 
@@ -557,12 +623,13 @@ class MyApp(ShowBase):
             # Strong directional sun + low ambient floor → high light/shadow
             # contrast. In simplepbr a shadowed fragment only keeps the
             # ambient term, so a low ambient is what makes shadows read dark.
-            intensity = 1.15 + 0.75 * warmth
+            intensity = 1.8 + 1.0 * warmth
             self.sun.set_color(Vec4(intensity, g * intensity,
                                     b * intensity, 1.0))
-            self.ambient_light.set_color(Vec4(0.09 + 0.05 * warmth,
-                                              0.10 + 0.05 * warmth,
-                                              0.13 + 0.06 * warmth, 1.0))
+            # Small explicit ambient on top of the IBL env-map ambient.
+            self.ambient_light.set_color(Vec4(0.04 + 0.03 * warmth,
+                                              0.05 + 0.03 * warmth,
+                                              0.07 + 0.035 * warmth, 1.0))
             bg = (0.34 + 0.20 * warmth,
                   0.45 + 0.20 * warmth,
                   0.58 + 0.18 * warmth)
@@ -573,20 +640,28 @@ class MyApp(ShowBase):
         if getattr(self, "_perf_fog", None) is not None:
             self._perf_fog.set_color(bg[0], bg[1], bg[2])
 
-    def _apply_pbr_surface(self, model_np, diffuse_path, roughness=0.85,
-                           srgb_diffuse=True):
+    def _apply_pbr_surface(self, model_np, diffuse_path, normal_path=None,
+                           roughness_path=None, roughness=1.0,
+                           srgb_diffuse=True, has_tangents=False):
         """
-        simplepbr-friendly material for hand-built meshes (PERFORMANCE preset).
+        simplepbr-friendly PBR material for hand-built meshes (PERFORMANCE).
 
-        Binds the diffuse map as the base-colour texture on the default
-        (modulate) stage — which simplepbr reads as `p3d_TextureBaseColor` —
-        plus a scalar-roughness, non-metallic PBR Material. We deliberately
-        avoid RenderPipeline's `emission=(0,1,0,0)` convention (simplepbr
-        would render it as a green glow) and skip normal/metal/rough map
-        stages: these meshes have no tangents, so a normal map would produce
-        artifacts. glTF models keep their full PBR maps via simplepbr.
+        Texture-stage modes follow Panda's metalness convention that simplepbr
+        reads:
+          * base colour  -> default (modulate) stage  -> p3d_TextureBaseColor
+          * roughness    -> M_selector stage (ORM)     -> p3d_TextureMetalRoughness
+                            (G = roughness; B = metallic, forced 0 via the
+                            Material; occlusion is disabled in simplepbr.init so
+                            the R channel of a grayscale roughness map is ignored)
+          * normal       -> M_normal stage             -> p3d_TextureNormal
+                            (only bound when the geometry has tangents — flat
+                            meshes get a constant tangent in their vertex data)
+
+        We deliberately avoid RenderPipeline's `emission=(0,1,0,0)` convention
+        (simplepbr would render it as a green glow). glTF models are untouched
+        here and keep their full PBR maps via simplepbr.
         """
-        from panda3d.core import Texture, Material
+        from panda3d.core import Texture, TextureStage, Material
 
         mat = Material()
         mat.set_base_color((1, 1, 1, 1))
@@ -594,16 +669,170 @@ class MyApp(ShowBase):
         mat.set_metallic(0.0)
         model_np.set_material(mat, 1)
 
+        def _pf(p):
+            return Filename.fromOsSpecific(str(p))
+
+        def _setup(tex, srgb=False):
+            if srgb:
+                tex.set_format(Texture.F_srgb)
+            tex.set_minfilter(Texture.FTLinearMipmapLinear)
+            tex.set_magfilter(Texture.FTLinear)
+            tex.set_wrap_u(Texture.WMRepeat)
+            tex.set_wrap_v(Texture.WMRepeat)
+
+        # Base colour (sRGB) on the default modulate stage.
         if diffuse_path and os.path.exists(diffuse_path):
-            tex = self.loader.loadTexture(Filename.fromOsSpecific(str(diffuse_path)))
+            tex = self.loader.loadTexture(_pf(diffuse_path))
             if tex:
-                if srgb_diffuse:
-                    tex.set_format(Texture.F_srgb)
-                tex.set_minfilter(Texture.FTLinearMipmapLinear)
-                tex.set_magfilter(Texture.FTLinear)
-                tex.set_wrap_u(Texture.WMRepeat)
-                tex.set_wrap_v(Texture.WMRepeat)
+                _setup(tex, srgb=srgb_diffuse)
                 model_np.set_texture(tex, 1)
+
+        # Roughness via the metal-roughness (ORM) selector stage. Linear data.
+        if roughness_path and os.path.exists(roughness_path):
+            rtex = self.loader.loadTexture(_pf(roughness_path))
+            if rtex:
+                _setup(rtex)
+                ts_mr = TextureStage("mr")
+                ts_mr.set_mode(TextureStage.M_selector)
+                model_np.set_texture(ts_mr, rtex, 1)
+
+        # Normal map — only when the mesh carries tangents (flat meshes get a
+        # constant tangent). Linear data.
+        if has_tangents and normal_path and os.path.exists(normal_path):
+            ntex = self.loader.loadTexture(_pf(normal_path))
+            if ntex:
+                _setup(ntex)
+                ts_n = TextureStage("nrm")
+                ts_n.set_mode(TextureStage.M_normal)
+                model_np.set_texture(ts_n, ntex, 1)
+
+    def _make_pbr_compatible(self, model_np):
+        """
+        PERFORMANCE preset: make a loaded .bam model render as PBR under
+        simplepbr.
+
+        The project's .bam models were authored for RenderPipeline, which
+        puts ALL maps (colour / normal / roughness / specular) in M_modulate
+        texture stages distinguished only by name/sort. simplepbr instead
+        selects PBR maps by stage MODE, so without this fix it only ever sees
+        the base colour — no normals, no roughness. We:
+          1. remap stages by name (Normal -> M_normal, Roughness -> M_selector,
+             Specular/IOR/Metal -> M_gloss which simplepbr ignores);
+          2. generate per-vertex tangents (the .bam meshes have none, and
+             normal mapping is impossible without them);
+          3. force metallic = 0 (a grayscale roughness map reused as the ORM
+             selector would otherwise drive metallic via its B channel).
+        """
+        if self.use_render_pipeline:
+            return
+        from panda3d.core import TextureStage
+
+        try:
+            for ts in model_np.find_all_texture_stages():
+                nm = ts.get_name().lower()
+                if "normal" in nm:
+                    ts.set_mode(TextureStage.M_normal)
+                elif "rough" in nm:
+                    ts.set_mode(TextureStage.M_selector)   # ORM: G = roughness
+                elif "specular" in nm or "_ior" in nm or "metal" in nm:
+                    # simplepbr is metal-roughness, not specular/IOR — park this
+                    # map on a stage simplepbr ignores so it can't tint base.
+                    ts.set_mode(TextureStage.M_gloss)
+        except Exception as exc:
+            print(f"[MyApp] stage remap failed: {exc}")
+
+        try:
+            for mat in model_np.find_all_materials():
+                mat.set_metallic(0.0)
+                if not mat.has_roughness():
+                    mat.set_roughness(0.6)
+        except Exception as exc:
+            print(f"[MyApp] material fix failed: {exc}")
+
+        # Generate tangents so the normal map can shade (visible up close;
+        # at distance it mip-flattens — simplepbr has no parallax/displacement).
+        try:
+            geomnodes = model_np.find_all_matches("**/+GeomNode")
+            for i in range(geomnodes.get_num_paths()):
+                gnode = geomnodes.get_path(i).node()
+                for g in range(gnode.get_num_geoms()):
+                    self._generate_tangents_for_geom(gnode.modify_geom(g))
+        except Exception as exc:
+            print(f"[MyApp] tangent generation failed: {exc}")
+
+    def _generate_tangents_for_geom(self, geom):
+        """
+        Add a per-vertex tangent column to `geom` (in place), computed from
+        positions/normals/UVs. Adapted from panda3d-gltf's calculate_tangents
+        (https://www.marti.works/calculating-tangents-for-your-mesh/). No-op
+        if the geom has no texcoords.
+        """
+        from panda3d.core import (GeomVertexReader, GeomVertexWriter,
+                                  InternalName, GeomEnums, LVector2, LVector3)
+
+        gvd = geom.get_vertex_data()
+        if not gvd.has_column(InternalName.get_texcoord()):
+            return
+        if geom.get_num_primitives() == 0:
+            return
+
+        prim = geom.get_primitive(0).decompose()
+        gvd = gvd.replace_column(
+            InternalName.get_tangent(), 4, GeomEnums.NT_float32,
+            GeomEnums.C_other)
+
+        def _read3(name):
+            r = GeomVertexReader(gvd, name)
+            out = []
+            while not r.is_at_end():
+                d = r.get_data3f()
+                out.append(LVector3(d[0], d[1], d[2]))
+            return out
+
+        posdata = _read3(InternalName.get_vertex())
+        normaldata = _read3(InternalName.get_normal())
+        uvr = GeomVertexReader(gvd, InternalName.get_texcoord())
+        uvdata = []
+        while not uvr.is_at_end():
+            d = uvr.get_data2f()
+            uvdata.append(LVector2(d[0], d[1]))
+
+        n = len(posdata)
+        if n == 0 or len(uvdata) < n or len(normaldata) < n:
+            return
+        tana = [LVector3(0, 0, 0) for _ in range(n)]
+        tanb = [LVector3(0, 0, 0) for _ in range(n)]
+
+        verts = prim.get_vertex_list()
+        for t in range(0, len(verts) - 2, 3):
+            i0, i1, i2 = verts[t], verts[t + 1], verts[t + 2]
+            e1 = posdata[i1] - posdata[i0]
+            e2 = posdata[i2] - posdata[i0]
+            d1 = uvdata[i1] - uvdata[i0]
+            d2 = uvdata[i2] - uvdata[i0]
+            denom = d1.x * d2.y - d2.x * d1.y
+            if denom != 0.0:
+                f = 1.0 / denom
+                tan = (e1 * d2.y - e2 * d1.y) * f
+                bit = (e2 * d1.x - e1 * d2.x) * f
+            else:
+                tan = LVector3(0, 0, 0)
+                bit = LVector3(0, 0, 0)
+            for idx in (i0, i1, i2):
+                tana[idx] += tan
+                tanb[idx] += bit
+
+        tw = GeomVertexWriter(gvd, InternalName.get_tangent())
+        for normal, t0, t1 in zip(normaldata, tana, tanb):
+            tangent = t0 - normal * normal.dot(t0)
+            if tangent.length_squared() > 1e-12:
+                tangent.normalize()
+            else:
+                tangent = LVector3(1, 0, 0)
+            w = -1.0 if normal.cross(t0).dot(t1) < 0 else 1.0
+            tw.set_data4f(tangent.x, tangent.y, tangent.z, w)
+
+        geom.set_vertex_data(gvd)
 
     def create_mesh_from_data(self, vertices: np.ndarray, triangles: np.ndarray,
                             normals: np.ndarray, uvs: np.ndarray):
@@ -670,10 +899,12 @@ class MyApp(ShowBase):
         if not os.path.exists(normal_path):
             normal_path = "assets/textures/concrete_8k/concrete_debris_nor_dx_8k.jpg"
 
-        # PERFORMANCE preset (simplepbr): use the PBR-friendly path instead
-        # of RenderPipeline's green-emission / 4-stage convention.
+        # PERFORMANCE preset (simplepbr): PBR-friendly path instead of
+        # RenderPipeline's green-emission / 4-stage convention. Roughness map
+        # is bound (no tangents on these meshes, so the normal map is skipped).
         if not self.use_render_pipeline:
-            self._apply_pbr_surface(model_np, diffuse_path)
+            self._apply_pbr_surface(model_np, diffuse_path,
+                                    roughness_path=roughness_path)
             model_np.set_two_sided(True)
             return
 
@@ -1492,12 +1723,35 @@ class MyApp(ShowBase):
         texture_repeat_u = self.current_texture_set.get('textureRepeatU', 160.0)
         texture_repeat_v = self.current_texture_set.get('textureRepeatV', 160.0)
 
-        format = GeomVertexFormat.getV3n3t2()
-        format = GeomVertexFormat.registerFormat(format)
+        # PERFORMANCE preset adds a tangent column so simplepbr can use the
+        # ground normal map. The grid is flat (normal +Z) and the UV layout
+        # has U tracking world +Y, so a constant tangent (0,1,0,1) is correct.
+        # RenderPipeline keeps the original V3n3t2 format unchanged.
+        add_tangent = not self.use_render_pipeline
+        if add_tangent:
+            from panda3d.core import (GeomVertexArrayFormat, InternalName,
+                                      GeomEnums)
+            _arr = GeomVertexArrayFormat()
+            _arr.add_column(InternalName.get_vertex(), 3,
+                            GeomEnums.NT_float32, GeomEnums.C_point)
+            _arr.add_column(InternalName.get_normal(), 3,
+                            GeomEnums.NT_float32, GeomEnums.C_normal)
+            _arr.add_column(InternalName.get_texcoord(), 2,
+                            GeomEnums.NT_float32, GeomEnums.C_texcoord)
+            _arr.add_column(InternalName.get_tangent(), 4,
+                            GeomEnums.NT_float32, GeomEnums.C_vector)
+            format = GeomVertexFormat()
+            format.add_array(_arr)
+            format = GeomVertexFormat.registerFormat(format)
+        else:
+            format = GeomVertexFormat.getV3n3t2()
+            format = GeomVertexFormat.registerFormat(format)
         vdata = GeomVertexData("simplified_perlin_data", format, Geom.UHStatic)
         vertex = GeomVertexWriter(vdata, "vertex")
         normal = GeomVertexWriter(vdata, "normal")
         texcoord = GeomVertexWriter(vdata, "texcoord")
+        tangent = (GeomVertexWriter(vdata, InternalName.get_tangent())
+                   if add_tangent else None)
 
         grid_size = 64
         step_x = size_x / (grid_size - 1) if grid_size > 1 else 0
@@ -1518,6 +1772,12 @@ class MyApp(ShowBase):
                 u = normalized_v * texture_repeat_u
                 v = -normalized_u * texture_repeat_v
                 texcoord.addData2f(u, v)
+                if add_tangent:
+                    # w = -1 flips the bitangent, converting the DirectX-style
+                    # normal maps (_nor_dx, green = -Y) the project ships to the
+                    # OpenGL convention simplepbr expects. (If bumps ever look
+                    # inverted, flip this back to +1.)
+                    tangent.addData4f(0, 1, 0, -1)
 
         prim = GeomTriangles(Geom.UHStatic)
         for y in range(grid_size - 1):
@@ -1555,11 +1815,15 @@ class MyApp(ShowBase):
         roughness_path = "assets/textures/groundPerlin_8k/aerial_beach_03_rough_8k.jpg"
         metallic_path = None  # металличность не используется, будет заглушка
 
-        # PERFORMANCE preset (simplepbr): PBR-friendly base-colour material;
-        # skip RP's green-emission, 4-stage setup and the "fixed" depth bin
-        # so the ground depth-tests normally under the forward renderer.
+        # PERFORMANCE preset (simplepbr): full PBR-friendly material (base
+        # colour + roughness + normal map — the mesh carries a constant
+        # tangent). Skip RP's green-emission, 4-stage setup and the "fixed"
+        # depth bin so the ground depth-tests normally under forward render.
         if not self.use_render_pipeline:
-            self._apply_pbr_surface(self.perlin_model, diffuse_path)
+            self._apply_pbr_surface(self.perlin_model, diffuse_path,
+                                    normal_path=normal_path,
+                                    roughness_path=roughness_path,
+                                    roughness=1.0, has_tangents=True)
             self.perlin_model.set_two_sided(True)
             return
 
@@ -1643,7 +1907,7 @@ class MyApp(ShowBase):
     def _set_initial_time(self, task):
         """Установка начального времени суток"""
         if hasattr(self, 'render_pipeline') and hasattr(self.render_pipeline, 'daytime_mgr'):
-            self.render_pipeline.daytime_mgr.time = "13:00"
+            self.render_pipeline.daytime_mgr.time = "15:00"
         return task.done
 
     def setup_scene(self):
@@ -1970,6 +2234,9 @@ class MyApp(ShowBase):
             self.render_pipeline.prepare_scene(model_np)
         else:
             self._apply_auto_shader(model_np)
+            # Remap RP-style texture stages + build tangents so the model's
+            # normal/roughness maps render as PBR under simplepbr.
+            self._make_pbr_compatible(model_np)
         model_np.set_pos(0, 0, 0)
         model_np.set_hpr(0, 0, 0)
         model_np.set_scale(1)

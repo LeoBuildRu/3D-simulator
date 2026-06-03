@@ -257,7 +257,7 @@ class MainWindow(QMainWindow):
             )
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(0, 1439)              # minutes in a day
-            slider.setValue(13 * 60)              # 13:00 default (bright sun)
+            slider.setValue(15 * 60)              # 15:00 default (raking sun)
             slider.setFixedHeight(18)
             slider.setStyleSheet(
                 "QSlider::groove:horizontal {"
@@ -277,7 +277,7 @@ class MainWindow(QMainWindow):
                 "}"
             )
 
-            value_lbl = _QLabel("13:00")
+            value_lbl = _QLabel("15:00")
             value_lbl.setStyleSheet(
                 f"color: {_CT}; font-family: {_FM};"
                 f"font-size: 11px; background: transparent;"
