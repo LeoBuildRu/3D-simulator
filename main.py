@@ -492,6 +492,12 @@ class MyApp(ShowBase):
                 # is NOT occlusion, so we must not let simplepbr read it as AO.
                 use_occlusion_maps=False,
                 env_map=env_map,
+                # Bias is subtracted in normalized [0,1] shadow-map depth, so
+                # its world-space size = bias * (far - near) of the sun lens.
+                # With our tight sun frustum (~120u range) this is ~0.16u —
+                # enough to avoid acne without the huge Peter-panning offset
+                # the default 0.005 caused with a wide frustum.
+                shadow_bias=0.0013,
             )
             print("[MyApp] simplepbr renderer initialised")
 
@@ -536,12 +542,18 @@ class MyApp(ShowBase):
         # Sun: directional, shadow-casting. DirectionalLight's default lens
         # is orthographic, so set_film_size is in world units — sized to
         # frame the area where models sit (around the origin).
+        # Tight orthographic shadow frustum centred on the scene origin (where
+        # models/cargo load). Film covers ±40u; the depth range is kept small
+        # (sun at a fixed distance, range ~120u) so the normalized-depth bias
+        # stays tiny in world units — otherwise shadows Peter-pan badly.
+        self._sun_distance = 120.0
         sun = DirectionalLight("perf_sun")
         sun.set_color(Vec4(1.0, 0.96, 0.88, 1.0))
         sun.set_shadow_caster(True, shadow_res, shadow_res)
         sun_lens = sun.get_lens()
-        sun_lens.set_film_size(90, 90)
-        sun_lens.set_near_far(1.0, 400.0)
+        sun_lens.set_film_size(80, 80)
+        sun_lens.set_near_far(self._sun_distance - 60.0,
+                              self._sun_distance + 60.0)
         self.sun = sun
         self.sun_np = self.render.attach_new_node(sun)
         self.render.set_light(self.sun_np)
@@ -605,10 +617,16 @@ class MyApp(ShowBase):
         # Azimuth sweeps east->west across the day.
         azimuth = -120.0 + 240.0 * day_frac
 
-        # Distance is irrelevant for direction but frames the shadow lens.
-        sun_np.set_pos(80.0 * math.sin(math.radians(azimuth)),
-                       -80.0 * math.cos(math.radians(azimuth)),
-                       max(8.0, 120.0 * max(0.05, elevation)))
+        # Place the sun at a FIXED distance along its direction so it stays
+        # centred in the tight orthographic shadow frustum (set in
+        # _init_lightweight_renderer). Only the direction changes with time.
+        from panda3d.core import Vec3
+        d = getattr(self, "_sun_distance", 120.0)
+        direction = Vec3(80.0 * math.sin(math.radians(azimuth)),
+                         -80.0 * math.cos(math.radians(azimuth)),
+                         max(20.0, 120.0 * max(0.1, elevation)))
+        direction.normalize()
+        sun_np.set_pos(direction * d)
         sun_np.look_at(0, 0, 0)
 
         # Colour: warm and dim near the horizon, bright white at noon.

@@ -804,7 +804,13 @@ class DepthReconstructor:
         try:
             mat = Material()
             mat.set_base_color((0.62, 0.55, 0.47, 1.0))
-            mat.set_emission((0, 1, 0, 0))   # RP: G = normal strength
+            if self.panda_app.use_render_pipeline:
+                mat.set_emission((0, 1, 0, 0))   # RP: G = normal strength
+            else:
+                # simplepbr: no green emission; non-metallic, mid roughness so
+                # the depth-fill mesh is lit by the sun (not flat/one-colour).
+                mat.set_roughness(0.85)
+                mat.set_metallic(0.0)
             node.set_material(mat, 1)
             node.set_two_sided(True)
         except Exception as exc:

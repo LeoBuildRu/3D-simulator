@@ -439,6 +439,16 @@ class PerlinMeshGenerator:
         if not os.path.exists(normal_path):
             normal_path = "assets/textures/stones_8k/rocks_ground_01_nor_dx_8k.jpg"
 
+        # PERFORMANCE preset (simplepbr): RP's green-emission + 4-modulate-stage
+        # convention renders flat/unlit under simplepbr. Use the PBR-friendly
+        # material (base colour + roughness + non-metallic) so the fill mesh
+        # is lit by the sun with proper light/shadow contrast.
+        if not self.panda_app.use_render_pipeline:
+            self.panda_app._apply_pbr_surface(
+                model_np, diffuse_path, roughness_path=roughness_path)
+            model_np.set_two_sided(True)
+            return
+
         mat = Material()
         mat.set_base_color((1, 1, 1, 1))
         mat.set_emission((0, 1, 0, 0))

@@ -255,6 +255,15 @@ class MeshReconstruction:
 
         loader = self.panda_app.loader
 
+        # PERFORMANCE preset (simplepbr): RP's green-emission + 4-modulate-stage
+        # convention renders flat/unlit. Use the PBR-friendly material so the
+        # reconstructed mesh is lit by the sun with proper shading contrast.
+        if not self.panda_app.use_render_pipeline:
+            self.panda_app._apply_pbr_surface(
+                node_path, diffuse_path, roughness_path=rough_path)
+            node_path.set_two_sided(True)
+            return
+
         def _filename(path):
             return Filename.fromOsSpecific(str(path))
 
