@@ -859,12 +859,18 @@ class MyApp(ShowBase):
         PERFORMANCE preset: make a runtime-generated fill mesh (depth-map,
         CSG, procedural, .ply reconstruction) render as lit PBR under simplepbr.
 
-        These meshes carry inconsistent / inverted per-vertex normals (RP
-        tolerates that; simplepbr clamps N·L to 0 so they go black or, with a
-        glossy default material, flat one-colour). We recompute smooth,
-        area-weighted vertex normals oriented upward (the cargo fill is a top
-        surface) so the sun actually shades them, then apply a diffuse PBR
-        material. No-op under RenderPipeline.
+        Two things are needed:
+          1. Consistent normals — these meshes have inverted/inconsistent ones
+             (RP tolerates it; simplepbr would shade them black). We recompute
+             smooth, centroid-outward vertex normals.
+          2. TANGENTS — simplepbr's shader always does
+             `normalize(NormalMatrix * p3d_Tangent.xyz)`. With no tangent
+             attribute that's `normalize(0)`, which is NaN on Intel GPUs
+             (NVIDIA tolerates it) → NaN normal → BLACK. This is exactly why
+             the fill meshes render fine on RTX but black on the Intel iGPU,
+             while the ground/trucks (which carry tangents) are fine. We
+             generate tangents so the TBN is valid everywhere.
+        Then a diffuse PBR material is applied. No-op under RenderPipeline.
         """
         if self.use_render_pipeline:
             return
@@ -878,9 +884,12 @@ class MyApp(ShowBase):
                 geom_nodes.append(matches.get_path(i).node())
             for gnode in geom_nodes:
                 for g in range(gnode.get_num_geoms()):
-                    self._recompute_normals_up(gnode.modify_geom(g))
+                    geom = gnode.modify_geom(g)
+                    self._recompute_normals_up(geom)
+                    # Tangents AFTER normals (the w-sign uses the new normals).
+                    self._generate_tangents_for_geom(geom)
         except Exception as exc:
-            print(f"[MyApp] fill-mesh normal recompute failed: {exc}")
+            print(f"[MyApp] fill-mesh normal/tangent fix failed: {exc}")
 
         self._apply_pbr_surface(model_np, diffuse_path or "",
                                 roughness_path=roughness_path,
