@@ -916,29 +916,39 @@ class MyApp(ShowBase):
         verts = prim.get_vertex_list()
         for t in range(0, len(verts) - 2, 3):
             i0, i1, i2 = verts[t], verts[t + 1], verts[t + 2]
+            if i0 >= n or i1 >= n or i2 >= n:
+                continue
             # Area-weighted face normal (un-normalized cross product).
             face_n = (pos[i1] - pos[i0]).cross(pos[i2] - pos[i0])
             acc[i0] += face_n
             acc[i1] += face_n
             acc[i2] += face_n
 
-        # Orient every normal into the UPPER hemisphere. The cargo fill is a
-        # top surface viewed from above, so up-facing normals are correct and,
-        # crucially, robust: it works whether the mesh winding produced
-        # up/down/inward normals (a mesh-wide "flip by mean" fails on closed
-        # or mixed meshes and leaves them dark). Bumps still tilt the normals
-        # in X/Y, preserving light/shadow contrast; up-facing also makes the
-        # IBL diffuse sample the bright sky (not the dark ground hemisphere).
+        # Orient every normal OUTWARD from the mesh centroid. This is robust to
+        # the node's later transform (some fill meshes are rotated P=90 after
+        # materialing, so a local "+Z up" orientation would end up sideways and
+        # dark). "Outward" is a geometric property preserved under rotation,
+        # and the meshes are placed roof-up, so outward = world-up on the
+        # visible top surface → lit by the sun + sky instead of black. Bumps
+        # still tilt the normals, preserving light/shadow contrast.
+        centroid = LVector3(0, 0, 0)
+        for p in pos:
+            centroid += p
+        centroid *= (1.0 / n)
+
         gvd_mod = geom.modify_vertex_data()
         nwriter = GeomVertexWriter(gvd_mod, InternalName.get_normal())
-        for v in acc:
+        for idx, v in enumerate(acc):
             nrm = LVector3(v)
-            if nrm.z < 0.0:
+            outward = pos[idx] - centroid
+            if nrm.dot(outward) < 0.0:
                 nrm = LVector3(-nrm.x, -nrm.y, -nrm.z)
             if nrm.length_squared() > 1e-12:
                 nrm.normalize()
             else:
-                nrm = LVector3(0, 0, 1)
+                nrm = LVector3(outward) if outward.length_squared() > 1e-9 \
+                    else LVector3(0, 0, 1)
+                nrm.normalize()
             nwriter.set_data3f(nrm.x, nrm.y, nrm.z)
 
     def create_mesh_from_data(self, vertices: np.ndarray, triangles: np.ndarray,
