@@ -922,15 +922,19 @@ class MyApp(ShowBase):
             acc[i1] += face_n
             acc[i2] += face_n
 
-        mean = LVector3(0, 0, 0)
-        for v in acc:
-            mean += v
-        flip = mean.z < 0.0
-
+        # Orient every normal into the UPPER hemisphere. The cargo fill is a
+        # top surface viewed from above, so up-facing normals are correct and,
+        # crucially, robust: it works whether the mesh winding produced
+        # up/down/inward normals (a mesh-wide "flip by mean" fails on closed
+        # or mixed meshes and leaves them dark). Bumps still tilt the normals
+        # in X/Y, preserving light/shadow contrast; up-facing also makes the
+        # IBL diffuse sample the bright sky (not the dark ground hemisphere).
         gvd_mod = geom.modify_vertex_data()
         nwriter = GeomVertexWriter(gvd_mod, InternalName.get_normal())
         for v in acc:
-            nrm = LVector3(-v.x, -v.y, -v.z) if flip else LVector3(v)
+            nrm = LVector3(v)
+            if nrm.z < 0.0:
+                nrm = LVector3(-nrm.x, -nrm.y, -nrm.z)
             if nrm.length_squared() > 1e-12:
                 nrm.normalize()
             else:
