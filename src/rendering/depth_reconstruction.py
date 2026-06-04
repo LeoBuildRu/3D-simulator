@@ -56,8 +56,8 @@ class DepthReconstructor:
 
     # Any number of points is allowed; this many are required to form a
     # region + calibrate. Picking is finished by the user (RMB / Esc).
-    MIN_POINTS = 3
-    GRID = 160          # mesh resolution across the region (GRID x GRID quads)
+    MIN_POINTS = 2
+    GRID = 200          # mesh resolution across the region (GRID x GRID quads)
     # Texture tiling for the reconstructed surface: UV units per world metre.
     # UVs are a top-down planar projection of global XY, so the texture keeps
     # a real-world scale regardless of mesh size. Bump >1 to tile tighter.
@@ -69,6 +69,35 @@ class DepthReconstructor:
     # higher = each point's influence stays tighter to its own area.
     IDW_POWER = 2.0
     IDW_EPS = 1e-6
+    # Maximum allowed 3D length (world units / metres) of a mesh triangle's
+    # edge. Cells whose neighbouring vertices are farther apart than this are
+    # dropped — this culls the long, stretched polygons that bridge depth
+    # discontinuities (e.g. fill surface -> background). Tune to taste.
+    MAX_EDGE_LEN = 0.7
+    # Maximum allowed VERTICAL (global +Z) extent of a triangle edge, metres.
+    # Near-vertical polygons (the bed walls / стенки кузова) have a big Δz per
+    # edge and get culled, while flat/gently-sloped fill is kept.
+    MAX_VERTICAL_DROP = 2.0
+    # Clear stray polygons around sharp depth discontinuities: a depth pixel
+    # whose value spans more than JUMP_THRESH_M (metres) within a
+    # JUMP_RADIUS_PX-pixel window is treated as "near a jump", and any mesh
+    # sample landing there is dropped. This removes the floating fragments
+    # that appear in the blurred/compressed transition band of a big jump.
+    JUMP_RADIUS_PX = 2
+    JUMP_THRESH_M = 1.0
+    # Light surface smoothing: number of 3x3 mask-aware averaging passes over
+    # the grid depths before unprojection. Evens out the terracing caused by
+    # 8-bit depth quantization. 0 = off; 1-3 = gentle. Only averages valid
+    # (kept) neighbours, so it doesn't bleed across mask/jump boundaries.
+    SMOOTH_ITERS = 2
+    # Per-snapshot fill mask (<depth>-mask.png, RGBA). When USE_MASKS is on and
+    # a mask exists for the snapshot, the mesh is clipped ONLY by the mask
+    # (alpha > MASK_ALPHA_MIN) and the geometric cullings above are skipped.
+    # If USE_MASKS is on but the mask is missing — or USE_MASKS is off — the
+    # geometric cullings (edge length / verticality / jump radius) are used.
+    USE_MASKS = True
+    MASK_SUFFIX = "-mask.png"
+    MASK_ALPHA_MIN = 0.5
     # A dedicated, definitely-non-zero collide mask. We stamp it onto the
     # truck's visible geometry and use the same bit for the picking ray, so
     # the hit test works regardless of whatever into-mask the .bam /
@@ -495,6 +524,41 @@ class DepthReconstructor:
         resid = self._idw_residual(FX, FY, cfx, cfy, r_ctrl)
         Z_grid = A * d_grid + B + resid
 
+        # Decide the clipping strategy:
+        #   USE_MASKS + mask present  -> use ONLY the snapshot's alpha mask.
+        #   USE_MASKS + mask missing  -> fall back to the geometric cullings.
+        #   USE_MASKS off             -> geometric cullings.
+        mask_alpha = self._load_mask_alpha(W, H) if self.USE_MASKS else None
+        use_mask = mask_alpha is not None
+
+        if use_mask:
+            keep = mask_alpha[rows, cols] > self.MASK_ALPHA_MIN
+            n_before = int(inside.sum())
+            inside = inside & keep
+            self._log(f"Маска: оставлено {int(inside.sum())} из {n_before} "
+                      f"узлов (alpha > {self.MASK_ALPHA_MIN:.0%}); "
+                      f"отсечения по длине/вертикали отключены.")
+        else:
+            # Drop samples in the blurred transition band around a sharp jump.
+            forbidden = self._jump_forbidden_mask(depth, A)
+            if forbidden is not None:
+                near = forbidden[rows, cols]
+                n_before = int(inside.sum())
+                inside = inside & (~near)
+                n_cut = n_before - int(inside.sum())
+                if n_cut > 0:
+                    self._log(f"У разрывов глубины убрано {n_cut} узлов "
+                              f"(радиус {self.JUMP_RADIUS_PX}px, "
+                              f"порог {self.JUMP_THRESH_M} м).")
+
+        # Gentle smoothing of the (kept) grid depths to kill the 8-bit
+        # quantization terracing before the surface is built.
+        if self.SMOOTH_ITERS > 0:
+            Z_grid = self._smooth_grid_z(
+                Z_grid.reshape(stride, stride),
+                inside.reshape(stride, stride),
+                self.SMOOTH_ITERS).ravel()
+
         # Unproject the in-hull samples through the live lens.
         verts = np.zeros((FX.shape[0], 3), dtype=np.float64)
         for k in range(FX.shape[0]):
@@ -506,11 +570,22 @@ class DepthReconstructor:
             verts[k, 1] = wp.y
             verts[k, 2] = wp.z
 
-        faces = self._grid_faces_masked(G, inside)
+        # Build triangles. With a mask, no geometric culling (inf limits);
+        # otherwise cull by edge length and verticality.
+        if use_mask:
+            me, mv = float("inf"), float("inf")
+        else:
+            me, mv = self.MAX_EDGE_LEN, self.MAX_VERTICAL_DROP
+        faces, dropped = self._build_grid_faces(G, inside, verts, me, mv)
         if len(faces) == 0:
-            self._log("Внутри области нет ячеек — добавьте больше/шире точек.")
+            self._log("Нет ячеек для меша (узкая область / маска пуста / всё "
+                      "отсечено).")
             self._finish(False, {})
             return False
+        if dropped and not use_mask:
+            self._log(f"Отсечено {dropped} полигонов (длина > "
+                      f"{self.MAX_EDGE_LEN} м или вертикаль > "
+                      f"{self.MAX_VERTICAL_DROP} м).")
         z_min = float(Z_grid[inside].min())
         z_max = float(Z_grid[inside].max())
 
@@ -670,6 +745,29 @@ class DepthReconstructor:
             self._log(f"Не удалось прочитать карту глубины: {exc}")
             return None
 
+    def _mask_path(self) -> str:
+        if not self._depth_path:
+            return ""
+        return os.path.splitext(self._depth_path)[0] + self.MASK_SUFFIX
+
+    def _load_mask_alpha(self, W, H):
+        """Load the fill mask's alpha channel as an HxW float array in [0, 1]
+        (resized to the depth size if needed). Returns None when there is no
+        mask file for this snapshot."""
+        mp = self._mask_path()
+        if not mp or not os.path.exists(mp):
+            self._log("Маска не найдена — применяю геометрические отсечения.")
+            return None
+        try:
+            from PIL import Image
+            im = Image.open(mp).convert("RGBA")
+            if im.size != (W, H):
+                im = im.resize((W, H), Image.NEAREST)
+            return np.asarray(im, dtype=np.float32)[..., 3] / 255.0
+        except Exception as exc:
+            self._log(f"Не удалось прочитать маску: {exc}")
+            return None
+
     def _vertical_film_span(self, W_img, H_img) -> float:
         """Half-extent (in film fy units) that the photo occupies vertically:
         fyh = window_aspect / photo_aspect. The photo fills the film width,
@@ -767,23 +865,120 @@ class DepthReconstructor:
         return (w * r[None, :]).sum(axis=1) / wsum
 
     @staticmethod
-    def _grid_faces_masked(G, inside):
-        """Grid triangles, emitting only cells whose 4 corners are in-hull."""
+    def _smooth_grid_z(Z, valid, iters):
+        """Mask-aware 3x3 box smoothing of a (stride,stride) depth grid,
+        repeated `iters` times. Each valid cell is replaced by the average of
+        its valid 3x3 neighbours; invalid cells are left untouched and never
+        contribute (no bleeding across removed regions)."""
+        Zc = Z.astype(np.float64).copy()
+        w0 = valid.astype(np.float64)
+        Hh, Ww = Zc.shape
+        for _ in range(int(iters)):
+            acc = np.zeros_like(Zc)
+            wsum = np.zeros_like(Zc)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    # dest[y,x] gathers neighbour src[y+dy, x+dx].
+                    ys_d, ye_d = max(0, -dy), Hh - max(0, dy)
+                    xs_d, xe_d = max(0, -dx), Ww - max(0, dx)
+                    ys_s, ye_s = max(0, dy), Hh - max(0, -dy)
+                    xs_s, xe_s = max(0, dx), Ww - max(0, -dx)
+                    vw = w0[ys_s:ye_s, xs_s:xe_s]
+                    acc[ys_d:ye_d, xs_d:xe_d] += (
+                        Zc[ys_s:ye_s, xs_s:xe_s] * vw)
+                    wsum[ys_d:ye_d, xs_d:xe_d] += vw
+            new = np.where(wsum > 0, acc / np.maximum(wsum, 1e-12), Zc)
+            Zc = np.where(valid, new, Zc)
+        return Zc
+
+    @staticmethod
+    def _build_grid_faces(G, inside, verts, max_edge, max_vdrop):
+        """Vectorised grid triangulation. A cell becomes 2 triangles only if
+        all 4 corners are in-hull AND, for every triangle edge, the 3D length
+        is <= max_edge AND the vertical (world +Z) drop is <= max_vdrop.
+
+        Returns (faces (T,3) int64, dropped_count)."""
         stride = G + 1
-        faces = []
-        for ti in range(G):
-            base = ti * stride
-            for si in range(G):
-                a = base + si
-                b = a + 1
-                c = a + stride
-                d = c + 1
-                if inside[a] and inside[b] and inside[c] and inside[d]:
-                    faces.append((a, b, d))
-                    faces.append((a, d, c))
-        if not faces:
-            return np.zeros((0, 3), dtype=np.int64)
-        return np.asarray(faces, dtype=np.int64)
+        V = verts.reshape(stride, stride, 3)
+        ins = inside.reshape(stride, stride)
+
+        # Edge vectors between neighbouring grid vertices.
+        eH = V[:, 1:, :] - V[:, :-1, :]    # (stride, G, 3) horizontal
+        eV = V[1:, :, :] - V[:-1, :, :]    # (G, stride, 3) vertical
+        eD = V[1:, 1:, :] - V[:-1, :-1, :]  # (G, G, 3) diagonal
+        me = float(max_edge)
+        mv = float(max_vdrop)
+
+        # Per-edge acceptance: short enough AND not too vertical.
+        okH = (np.linalg.norm(eH, axis=2) <= me) & (np.abs(eH[..., 2]) <= mv)
+        okV = (np.linalg.norm(eV, axis=2) <= me) & (np.abs(eV[..., 2]) <= mv)
+        okD = (np.linalg.norm(eD, axis=2) <= me) & (np.abs(eD[..., 2]) <= mv)
+
+        ti = np.arange(G)[:, None]
+        si = np.arange(G)[None, :]
+        a = ti * stride + si          # top-left corner index of each cell
+        b = a + 1                     # top-right
+        c = a + stride                # bottom-left
+        d = c + 1                     # bottom-right
+
+        cell_in = (ins[:-1, :-1] & ins[:-1, 1:] &
+                   ins[1:, :-1] & ins[1:, 1:])    # (G, G)
+
+        # Triangle 1 (a,b,d): edges a-b, b-d, a-d.
+        t1 = cell_in & okH[:-1, :] & okV[:, 1:] & okD
+        # Triangle 2 (a,d,c): edges a-d, d-c, a-c.
+        t2 = cell_in & okD & okH[1:, :] & okV[:, :-1]
+
+        f1 = np.stack([a[t1], b[t1], d[t1]], axis=1) if t1.any() \
+            else np.zeros((0, 3), np.int64)
+        f2 = np.stack([a[t2], d[t2], c[t2]], axis=1) if t2.any() \
+            else np.zeros((0, 3), np.int64)
+        faces = np.concatenate([f1, f2], axis=0).astype(np.int64)
+
+        # In-hull triangles rejected (by edge length or verticality).
+        dropped = int(2 * int(cell_in.sum()) - faces.shape[0])
+        return faces, dropped
+
+    def _jump_forbidden_mask(self, depth, A):
+        """Boolean HxW mask: True where the depth varies by more than
+        JUMP_THRESH_M (metric) within a JUMP_RADIUS_PX window — i.e. near a
+        sharp discontinuity (plus its blurred transition band)."""
+        R = int(self.JUMP_RADIUS_PX)
+        if R <= 0 or abs(float(A)) < 1e-9:
+            return None
+        rng = self._window_range(np.asarray(depth, dtype=np.float32), R)
+        return (abs(float(A)) * rng) > float(self.JUMP_THRESH_M)
+
+    @staticmethod
+    def _window_range(a, R):
+        """Per-pixel (max - min) over a (2R+1)x(2R+1) box, border-replicated.
+        Separable: max/min along rows then columns."""
+        def shift(arr, s, ax):
+            out = np.empty_like(arr)
+            if ax == 0:
+                if s > 0:
+                    out[s:, :] = arr[:-s, :]; out[:s, :] = arr[:1, :]
+                else:
+                    out[:s, :] = arr[-s:, :]; out[s:, :] = arr[-1:, :]
+            else:
+                if s > 0:
+                    out[:, s:] = arr[:, :-s]; out[:, :s] = arr[:, :1]
+                else:
+                    out[:, :s] = arr[:, -s:]; out[:, s:] = arr[:, -1:]
+            return out
+
+        mx = a.copy()
+        mn = a.copy()
+        for ax in (0, 1):
+            amx = mx.copy()
+            amn = mn.copy()
+            for s in range(1, R + 1):
+                amx = np.maximum(amx, shift(mx, s, ax))
+                amx = np.maximum(amx, shift(mx, -s, ax))
+                amn = np.minimum(amn, shift(mn, s, ax))
+                amn = np.minimum(amn, shift(mn, -s, ax))
+            mx, mn = amx, amn
+        return mx - mn
 
     @staticmethod
     def _unproject(lens, cam_np, render, fx, fy, Z):

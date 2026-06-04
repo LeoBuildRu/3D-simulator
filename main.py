@@ -658,6 +658,22 @@ class MyApp(ShowBase):
         if getattr(self, "_perf_fog", None) is not None:
             self._perf_fog.set_color(bg[0], bg[1], bg[2])
 
+    def _flat_normal_texture(self):
+        """A cached 1x1 flat (0,0,1) tangent-space normal map. Bound on meshes
+        that have tangents but no real normal map, so simplepbr always samples
+        a well-defined normal texture (Panda's default differs on Intel)."""
+        from panda3d.core import Texture
+        tex = getattr(self, "_flat_normal_tex", None)
+        if tex is None:
+            tex = Texture("flat_normal")
+            tex.setup_2d_texture(1, 1, Texture.T_unsigned_byte, Texture.F_rgb)
+            # Panda RAM image is BGR: (B=255, G=128, R=128) -> RGB(128,128,255).
+            tex.set_ram_image(bytes([255, 128, 128]))
+            tex.set_minfilter(Texture.FTNearest)
+            tex.set_magfilter(Texture.FTNearest)
+            self._flat_normal_tex = tex
+        return tex
+
     def _apply_pbr_surface(self, model_np, diffuse_path, normal_path=None,
                            roughness_path=None, roughness=1.0,
                            srgb_diffuse=True, has_tangents=False,
@@ -715,15 +731,24 @@ class MyApp(ShowBase):
                 ts_mr.set_mode(TextureStage.M_selector)
                 model_np.set_texture(ts_mr, rtex, 1)
 
-        # Normal map — only when the mesh carries tangents (flat meshes get a
-        # constant tangent). Linear data.
-        if has_tangents and normal_path and os.path.exists(normal_path):
-            ntex = self.loader.loadTexture(_pf(normal_path))
-            if ntex:
-                _setup(ntex)
-                ts_n = TextureStage("nrm")
-                ts_n.set_mode(TextureStage.M_normal)
-                model_np.set_texture(ts_n, ntex, 1)
+        # Normal map. simplepbr's shader ALWAYS samples p3d_TextureNormal
+        # (use_normal_maps is global). A mesh with tangents but no bound normal
+        # map falls back to Panda's DEFAULT normal texture, which Intel drivers
+        # mishandle → a bad normal → N·L<=0 → the surface gets ambient only
+        # (no sun / no shadows), while NVIDIA renders it fine. So whenever the
+        # mesh has tangents we bind an EXPLICIT normal map — the real one if
+        # available, otherwise a flat (0,0,1) so the geometric normal is used.
+        if has_tangents:
+            ts_n = TextureStage("nrm")
+            ts_n.set_mode(TextureStage.M_normal)
+            ntex = None
+            if normal_path and os.path.exists(normal_path):
+                ntex = self.loader.loadTexture(_pf(normal_path))
+                if ntex:
+                    _setup(ntex)
+            if ntex is None:
+                ntex = self._flat_normal_texture()
+            model_np.set_texture(ts_n, ntex, 1)
 
     def _make_pbr_compatible(self, model_np):
         """
@@ -891,9 +916,11 @@ class MyApp(ShowBase):
         except Exception as exc:
             print(f"[MyApp] fill-mesh normal/tangent fix failed: {exc}")
 
+        # has_tangents=True: we generated tangents above, so bind a normal map
+        # (flat if none) — required for correct directional lighting on Intel.
         self._apply_pbr_surface(model_np, diffuse_path or "",
                                 roughness_path=roughness_path,
-                                base_color=base_color)
+                                base_color=base_color, has_tangents=True)
         model_np.set_two_sided(True)
 
     def _recompute_normals_up(self, geom):

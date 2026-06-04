@@ -589,6 +589,10 @@ def _scan_local_height_examples() -> List[Reconstruction]:
 # Suffix marking the depth map inside a stand snapshot pair, e.g.
 # "example-1.png" (colour) <-> "example-1_depth_da3.png" (depth).
 _STAND_DEPTH_SUFFIX = "_depth_da3"
+# Per-snapshot fill mask, e.g. "example-1_depth_da3-mask.png". These are an
+# implementation detail of reconstruction and must NOT appear as their own
+# entries in the snapshot list.
+_STAND_MASK_SUFFIX = "-mask.png"
 
 
 def _scan_local_stand_examples() -> List[Reconstruction]:
@@ -616,11 +620,15 @@ def _scan_local_stand_examples() -> List[Reconstruction]:
         print(f"[panel_data] failed to list stand/: {exc}")
         return out
 
+    # Fill masks (<depth>-mask.png) are not standalone snapshots — skip them.
+    mask_files = {f for f in pngs if f.lower().endswith(_STAND_MASK_SUFFIX)}
     depth_files = {
         f for f in pngs
-        if os.path.splitext(f)[0].endswith(_STAND_DEPTH_SUFFIX)
+        if f not in mask_files
+        and os.path.splitext(f)[0].endswith(_STAND_DEPTH_SUFFIX)
     }
-    color_files = [f for f in pngs if f not in depth_files]
+    color_files = [f for f in pngs
+                   if f not in mask_files and f not in depth_files]
 
     for color_name in sorted(color_files):
         stem = os.path.splitext(color_name)[0]
