@@ -660,7 +660,8 @@ class MyApp(ShowBase):
 
     def _apply_pbr_surface(self, model_np, diffuse_path, normal_path=None,
                            roughness_path=None, roughness=1.0,
-                           srgb_diffuse=True, has_tangents=False):
+                           srgb_diffuse=True, has_tangents=False,
+                           base_color=(1, 1, 1, 1)):
         """
         simplepbr-friendly PBR material for hand-built meshes (PERFORMANCE).
 
@@ -682,7 +683,7 @@ class MyApp(ShowBase):
         from panda3d.core import Texture, TextureStage, Material
 
         mat = Material()
-        mat.set_base_color((1, 1, 1, 1))
+        mat.set_base_color(base_color)
         mat.set_roughness(float(roughness))
         mat.set_metallic(0.0)
         model_np.set_material(mat, 1)
@@ -851,6 +852,90 @@ class MyApp(ShowBase):
             tw.set_data4f(tangent.x, tangent.y, tangent.z, w)
 
         geom.set_vertex_data(gvd)
+
+    def relight_generated_mesh(self, model_np, diffuse_path=None,
+                               roughness_path=None, base_color=(1, 1, 1, 1)):
+        """
+        PERFORMANCE preset: make a runtime-generated fill mesh (depth-map,
+        CSG, procedural, .ply reconstruction) render as lit PBR under simplepbr.
+
+        These meshes carry inconsistent / inverted per-vertex normals (RP
+        tolerates that; simplepbr clamps N·L to 0 so they go black or, with a
+        glossy default material, flat one-colour). We recompute smooth,
+        area-weighted vertex normals oriented upward (the cargo fill is a top
+        surface) so the sun actually shades them, then apply a diffuse PBR
+        material. No-op under RenderPipeline.
+        """
+        if self.use_render_pipeline:
+            return
+        from panda3d.core import GeomNode
+        try:
+            geom_nodes = []
+            if isinstance(model_np.node(), GeomNode):
+                geom_nodes.append(model_np.node())
+            matches = model_np.find_all_matches("**/+GeomNode")
+            for i in range(matches.get_num_paths()):
+                geom_nodes.append(matches.get_path(i).node())
+            for gnode in geom_nodes:
+                for g in range(gnode.get_num_geoms()):
+                    self._recompute_normals_up(gnode.modify_geom(g))
+        except Exception as exc:
+            print(f"[MyApp] fill-mesh normal recompute failed: {exc}")
+
+        self._apply_pbr_surface(model_np, diffuse_path or "",
+                                roughness_path=roughness_path,
+                                base_color=base_color)
+        model_np.set_two_sided(True)
+
+    def _recompute_normals_up(self, geom):
+        """
+        Recompute area-weighted smooth vertex normals for `geom` in place and
+        orient them upward (negate if the mesh's mean normal points down), so
+        simplepbr's directional lighting produces real light/shadow contrast
+        instead of a black/flat surface. No-op if the geom has no normals.
+        """
+        from panda3d.core import (GeomVertexReader, GeomVertexWriter,
+                                  InternalName, LVector3)
+        gvd = geom.get_vertex_data()
+        if not gvd.has_column(InternalName.get_normal()):
+            return
+        if geom.get_num_primitives() == 0:
+            return
+        prim = geom.get_primitive(0).decompose()
+
+        preader = GeomVertexReader(gvd, InternalName.get_vertex())
+        pos = []
+        while not preader.is_at_end():
+            d = preader.get_data3f()
+            pos.append(LVector3(d[0], d[1], d[2]))
+        n = len(pos)
+        if n == 0:
+            return
+
+        acc = [LVector3(0, 0, 0) for _ in range(n)]
+        verts = prim.get_vertex_list()
+        for t in range(0, len(verts) - 2, 3):
+            i0, i1, i2 = verts[t], verts[t + 1], verts[t + 2]
+            # Area-weighted face normal (un-normalized cross product).
+            face_n = (pos[i1] - pos[i0]).cross(pos[i2] - pos[i0])
+            acc[i0] += face_n
+            acc[i1] += face_n
+            acc[i2] += face_n
+
+        mean = LVector3(0, 0, 0)
+        for v in acc:
+            mean += v
+        flip = mean.z < 0.0
+
+        gvd_mod = geom.modify_vertex_data()
+        nwriter = GeomVertexWriter(gvd_mod, InternalName.get_normal())
+        for v in acc:
+            nrm = LVector3(-v.x, -v.y, -v.z) if flip else LVector3(v)
+            if nrm.length_squared() > 1e-12:
+                nrm.normalize()
+            else:
+                nrm = LVector3(0, 0, 1)
+            nwriter.set_data3f(nrm.x, nrm.y, nrm.z)
 
     def create_mesh_from_data(self, vertices: np.ndarray, triangles: np.ndarray,
                             normals: np.ndarray, uvs: np.ndarray):
