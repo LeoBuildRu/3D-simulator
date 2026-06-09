@@ -663,6 +663,8 @@ class MainWindow(QMainWindow):
         # ---- Depth-fill reconstruction (N-point picking) -----------
         self._active_stand_rec = None
         self._last_auto_recon_depth = ""   # de-dupe auto-reconstruct calls
+        self._build_scheduled = False      # coalesce snapshot auto-builds
+        self._pending_build_depth = ""
         try:
             from src.rendering.depth_reconstruction import DepthReconstructor
             self.depth_reconstructor = DepthReconstructor(panda_app)
@@ -678,6 +680,7 @@ class MainWindow(QMainWindow):
         self.right_panel.pointsResetRequested.connect(
             self._on_points_reset
         )
+        self.right_panel.pointVizToggled.connect(self._on_point_viz_toggled)
 
         # Fire an initial load so the default model is on the scene before
         # the user even picks anything.
@@ -2065,18 +2068,11 @@ class MainWindow(QMainWindow):
         ov.show_overlay()
         self._raise_huds_above_reference()
 
-        # If reference points were already picked, auto-reconstruct this
-        # snapshot from them (same fixed stand camera, new depth map).
-        try:
-            depth_p = (getattr(rec, "depth_path", "") or "").strip()
-            dr = getattr(self, "depth_reconstructor", None)
-            if (dr is not None and depth_p
-                    and dr.has_saved_points() and not dr.is_picking()
-                    and depth_p != self._last_auto_recon_depth):
-                self._last_auto_recon_depth = depth_p
-                dr.reconstruct_saved(depth_p)
-        except Exception as exc:
-            print(f"[DepthRecon] авто-реконструкция упала: {exc}")
+        # Selecting a stand snapshot automatically places anchor points and
+        # rebuilds the fill (auto search by default; a manual pick is reused).
+        depth_p = (getattr(rec, "depth_path", "") or "").strip()
+        if depth_p:
+            self._schedule_snapshot_build(depth_p)
 
     def _on_reference_opacity_changed(self, value: float) -> None:
         ov = getattr(self, "reference_overlay", None)
@@ -2168,6 +2164,36 @@ class MainWindow(QMainWindow):
         rp = getattr(self, "right_panel", None)
         if rp is not None:
             rp.set_point_count(int(n))
+
+    def _schedule_snapshot_build(self, depth_p: str) -> None:
+        """Coalesce the auto-build for a stand snapshot. Selecting a row fires
+        the signal twice (currentItemChanged + itemClicked); a 0-delay timer
+        collapses that into one build, while a real re-click still rebuilds."""
+        self._pending_build_depth = depth_p
+        if getattr(self, "_build_scheduled", False):
+            return
+        self._build_scheduled = True
+        QTimer.singleShot(0, self._run_pending_snapshot_build)
+
+    def _run_pending_snapshot_build(self) -> None:
+        self._build_scheduled = False
+        depth_p = getattr(self, "_pending_build_depth", "")
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is None or not depth_p or dr.is_picking():
+            return
+        self._last_auto_recon_depth = depth_p
+        try:
+            dr.reconstruct_for_snapshot(depth_p)
+        except Exception as exc:
+            print(f"[DepthRecon] авто-реконструкция упала: {exc}")
+
+    def _on_point_viz_toggled(self, on: bool) -> None:
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is not None and hasattr(dr, "set_visualize"):
+            try:
+                dr.set_visualize(bool(on))
+            except Exception as exc:
+                print(f"[DepthRecon] viz toggle failed: {exc}")
 
     # Panel / HUD windows hidden while picking for a clean view. The
     # reference-photo overlay is intentionally NOT in this list — it keeps

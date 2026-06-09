@@ -98,6 +98,37 @@ class DepthReconstructor:
     USE_MASKS = True
     MASK_SUFFIX = "-mask.png"
     MASK_ALPHA_MIN = 0.5
+    # --- Automatic reference-point search ----------------------------
+    # Instead of manual picking, cast an AUTO_GRID x AUTO_GRID grid of rays
+    # across the screen; every ray that hits the truck is a candidate anchor.
+    # Candidates are then rejected robustly (see _reject_outliers):
+    #   • global  — a point whose depth->metric pair breaks the overall
+    #     Z = A*d + B law by more than AUTO_GLOBAL_K·MAD (floored at
+    #     AUTO_GLOBAL_ABS metres) is dropped (catches fill / 2D-3D mismatch);
+    #   • local   — a point whose residual deviates from its neighbours'
+    #     median by more than AUTO_LOCAL_THRESH metres is dropped (the
+    #     "5 wall points agree, the 6th is off" case).
+    # Thresholds are deliberately tight — culling many points is fine.
+    AUTO_GRID = 70
+    # Truck depth is found by projecting its vertices into a supersampled
+    # z-buffer (nearest forward depth wins) instead of ray-casting each grid
+    # point — O(vertices) once vs O(rays × polygons). BUF = AUTO_GRID * this.
+    AUTO_BUF_SUPERSAMPLE = 8
+    AUTO_REJECT_ITERS = 4
+    AUTO_GLOBAL_K = 3.0
+    AUTO_GLOBAL_ABS = 0.10      # metres — residual floor for global reject
+    AUTO_LOCAL_WINDOW = 3       # grid-cell radius of the local neighbourhood
+    AUTO_LOCAL_THRESH = 0.06    # metres — local residual deviation cutoff
+    AUTO_LOCAL_MIN_NB = 5       # need this many neighbours to judge a point
+    # The bed FLOOR must never be an anchor: fill can sit anywhere on it, so a
+    # floor point's depth (fill surface) won't match the truck (floor). Only
+    # near-vertical surfaces (the walls) are reliable. We compute the truck
+    # surface normal at each candidate and drop those whose normal is more
+    # vertical (|n·Zup|) than this — i.e. near-horizontal floor / shelves.
+    AUTO_REJECT_FLOOR = True
+    AUTO_FLOOR_MAX_NZ = 0.55
+    # Build the debug point-grid (green = used as anchor, red = rejected).
+    VISUALIZE_POINTS = False
     # A dedicated, definitely-non-zero collide mask. We stamp it onto the
     # truck's visible geometry and use the same bit for the picking ray, so
     # the hit test works regardless of whatever into-mask the .bam /
@@ -132,6 +163,14 @@ class DepthReconstructor:
         self._truck_np = None                         # cached pick target
         self._truck_collider = None                   # CollisionPolygon node
         self._collider_truck_id = None                # whose collider we built
+
+        # Automatic point search / visualization state.
+        self._truck_verts = None                      # cached world vertices
+        self._truck_verts_id = None
+        self._auto_mode = False                       # last build was auto?
+        self._viz_on = bool(self.VISUALIZE_POINTS)
+        self._viz_node = None
+        self._auto_viz_data = None                    # [(Point3, accepted)]
 
         # UI callbacks (wired by MainWindow; safe to touch Qt — Panda is
         # stepped on the Qt thread).
@@ -209,6 +248,7 @@ class DepthReconstructor:
         n = len(self._films)
         self.stop_picking()
         if n >= self.MIN_POINTS:
+            self._auto_mode = False     # manual pick overrides auto mode
             self.reconstruct()
         else:
             self._log(f"Недостаточно точек ({n}), нужно ≥ {self.MIN_POINTS}.")
@@ -614,6 +654,11 @@ class DepthReconstructor:
         # automatically (same camera, different depth map).
         self._saved_films = [(float(f[0]), float(f[1]))
                              for f in self._films[:n_pts]]
+        # Keep the on-screen point visualization in sync with the anchors
+        # actually used (works for both auto and manual modes).
+        self._auto_viz_data = list(self._saved_films)
+        if self._viz_on:
+            self._build_point_viz(self._auto_viz_data)
 
         info = {"A": A, "B": B, "z_min": z_min, "z_max": z_max,
                 "points": int(n_pts),
@@ -629,6 +674,9 @@ class DepthReconstructor:
 
     def clear_saved_points(self) -> None:
         self._saved_films = []
+        self._auto_mode = False
+        self._auto_viz_data = None
+        self._dispose_viz()
 
     def reconstruct_saved(self, depth_path: str = "") -> bool:
         """Rebuild from the saved film points against a (new) depth map by
@@ -663,6 +711,318 @@ class DepthReconstructor:
         self._emit_count()
         self._log(f"Авто-реконструкция по {len(films)} сохранённым точкам…")
         return self.reconstruct()
+
+    # ==================================================================
+    # Automatic reference-point search
+    # ==================================================================
+    def has_pending_auto(self) -> bool:
+        """True if a snapshot switch should auto-rebuild (auto mode used, or
+        manual points saved)."""
+        return self._auto_mode or self.has_saved_points()
+
+    def reconstruct_for_snapshot(self, depth_path: str = "") -> bool:
+        """Rebuild for a snapshot. Automatic point search is the default; a
+        manual pick (saved points, not auto mode) takes precedence and is
+        reused instead."""
+        if self.has_saved_points() and not self._auto_mode:
+            return self.reconstruct_saved(depth_path)
+        return self.reconstruct_auto(depth_path)
+
+    def set_visualize(self, on: bool) -> None:
+        """Toggle the point-grid debug visualisation."""
+        self._viz_on = bool(on)
+        if self._viz_on:
+            if self._auto_viz_data:
+                self._build_point_viz(self._auto_viz_data)
+        else:
+            self._dispose_viz()
+
+    def reconstruct_auto(self, depth_path: str = "") -> bool:
+        """Find reference points automatically (grid of rays + robust
+        rejection) and reconstruct. The camera must already be aligned."""
+        if self._picking:
+            return False
+        if depth_path:
+            self._depth_path = depth_path
+        if not self._depth_path or not os.path.exists(self._depth_path):
+            self._log("Авто-точки: нет карты глубины.")
+            self._finish(False, {})
+            return False
+        depth = self._load_depth_norm()
+        if depth is None:
+            self._finish(False, {})
+            return False
+        H, W = depth.shape
+
+        fyh = self._vertical_film_span(W, H)
+
+        truck = self._find_truck_np()
+        self._truck_np = truck
+        if truck is None or truck.is_empty():
+            self._log("Авто-точки: модель кузова не найдена.")
+            self._finish(False, {})
+            return False
+
+        self._log(f"Авто-поиск опорных точек: сетка "
+                  f"{self.AUTO_GRID}×{self.AUTO_GRID} (z-буфер кузова)…")
+        films, hits, viz, n_hit = self._auto_find_points(depth, fyh, W, H, truck)
+        self._log(f"Авто-точки: в кузов попало {n_hit}, принято "
+                  f"{len(films)} (отброшено {n_hit - len(films)}).")
+
+        self._auto_viz_data = viz
+        if self._viz_on:
+            self._build_point_viz(viz)
+
+        if len(films) < self.MIN_POINTS:
+            self._log("Авто-точки: принято слишком мало точек.")
+            self._finish(False, {})
+            return False
+
+        self._films = films
+        self._hits = hits
+        self._auto_mode = True
+        self._emit_count()
+        return self.reconstruct()
+
+    def _get_truck_vertices_world(self, truck):
+        """All truck vertices in world (render) coords, cached per truck."""
+        if self._truck_verts is not None and self._truck_verts_id == id(truck):
+            return self._truck_verts
+        render = self.panda_app.render
+        verts = []
+        for gnp in truck.find_all_matches("**/+GeomNode"):
+            gn = gnp.node()
+            mat = gnp.get_mat(render)        # geom space -> world
+            for gi in range(gn.get_num_geoms()):
+                vdata = gn.get_geom(gi).get_vertex_data()
+                vr = GeomVertexReader(vdata, "vertex")
+                while not vr.is_at_end():
+                    p = vr.get_data3()
+                    w = mat.xform_point(LPoint3(p[0], p[1], p[2]))
+                    verts.append((w[0], w[1], w[2]))
+        arr = (np.asarray(verts, dtype=np.float64)
+               if verts else np.zeros((0, 3), dtype=np.float64))
+        self._truck_verts = arr
+        self._truck_verts_id = id(truck)
+        return arr
+
+    @staticmethod
+    def _mat_to_np(m):
+        return np.array([[m.get_cell(i, j) for j in range(4)]
+                         for i in range(4)], dtype=np.float64)
+
+    def _auto_depth_grid(self, truck):
+        """Forward-depth of the truck per grid cell, via a supersampled
+        projected z-buffer (nearest vertex wins). Returns an (N,N) array with
+        +inf where no truck surface projects. O(vertices), no ray-casting."""
+        V = self._get_truck_vertices_world(truck)
+        if V.shape[0] == 0:
+            return None
+        app = self.panda_app
+        cam_np = app.cam
+        render = app.render
+        lens = cam_np.node().get_lens()
+
+        M = self._mat_to_np(render.get_mat(cam_np))      # world -> cam (rows)
+        Pj = self._mat_to_np(lens.get_projection_mat())  # cam  -> clip
+        Vh = np.hstack([V, np.ones((V.shape[0], 1))])
+        cam = Vh @ M                       # (V,4)
+        Zf = cam[:, 1]                     # forward distance (cam +Y)
+        clip = cam @ Pj                    # (V,4)
+        w = clip[:, 3]
+        good = (Zf > 1e-4) & (np.abs(w) > 1e-12)
+        fx = np.where(good, clip[:, 0] / np.where(good, w, 1.0), 9.0)
+        fy = np.where(good, clip[:, 1] / np.where(good, w, 1.0), 9.0)
+        inb = good & (np.abs(fx) <= 1.0) & (np.abs(fy) <= 1.0)
+
+        N = int(self.AUTO_GRID)
+        K = max(1, int(self.AUTO_BUF_SUPERSAMPLE))
+        BUF = N * K
+        px = np.clip(((fx + 1.0) * 0.5 * BUF).astype(np.int64), 0, BUF - 1)
+        py = np.clip(((1.0 - fy) * 0.5 * BUF).astype(np.int64), 0, BUF - 1)
+        buf = np.full(BUF * BUF, np.inf, dtype=np.float64)
+        sel = inb
+        np.minimum.at(buf, py[sel] * BUF + px[sel], Zf[sel])
+        buf = buf.reshape(BUF, BUF)
+        # Min-pool each KxK block down to the grid (nearest surface per cell).
+        Zg = buf.reshape(N, K, N, K).min(axis=(1, 3))
+        return Zg
+
+    def _auto_find_points(self, depth, fyh, W, H, truck):
+        """Find anchor candidates via the truck z-buffer, reject outliers, and
+        return (films_accepted, hits_accepted, viz_films_accepted, n_hits)."""
+        Zg = self._auto_depth_grid(truck)
+        if Zg is None:
+            return [], [], [], 0
+        N = int(self.AUTO_GRID)
+
+        # Cell-centre film coords for the grid.
+        jj, ii = np.meshgrid(np.arange(N), np.arange(N))
+        fxg = ((jj + 0.5) / N) * 2.0 - 1.0
+        fyg = 1.0 - ((ii + 0.5) / N) * 2.0
+        hit_mask = np.isfinite(Zg)
+
+        # Depth-map value per cell.
+        cols, rows = self._film_to_pixel_vec(fxg.ravel(), fyg.ravel(),
+                                             W, H, fyh)
+        dg = depth[rows, cols].reshape(N, N)
+        Zsafe = np.where(hit_mask, Zg, 0.0)
+
+        # Unproject every truck-hit cell to a 3D world grid (reused below for
+        # the surface-normal floor test and for the accepted anchors).
+        app = self.panda_app
+        cam_np = app.cam
+        render = app.render
+        lens = cam_np.node().get_lens()
+        Pw = np.full((N, N, 3), np.nan, dtype=np.float64)
+        for i in range(N):
+            for j in range(N):
+                if not hit_mask[i, j]:
+                    continue
+                wp = self._unproject(lens, cam_np, render,
+                                     float(fxg[i, j]), float(fyg[i, j]),
+                                     float(Zg[i, j]))
+                Pw[i, j, 0] = wp.x; Pw[i, j, 1] = wp.y; Pw[i, j, 2] = wp.z
+
+        # Candidate mask: drop near-horizontal (floor) truck surfaces.
+        cand = hit_mask
+        n_floor = 0
+        if self.AUTO_REJECT_FLOOR:
+            nz = self._surface_verticality(Pw)
+            floor = hit_mask & (nz > float(self.AUTO_FLOOR_MAX_NZ))
+            cand = hit_mask & (~floor)
+            n_floor = int(floor.sum())
+            if n_floor:
+                self._log(f"Авто-точки: отброшено {n_floor} точек дна "
+                          f"(нормаль вертикальнее {self.AUTO_FLOOR_MAX_NZ}).")
+
+        accepted = self._reject_outliers(fxg, fyg, dg, Zsafe, cand)
+
+        films_acc, hits_acc, viz = [], [], []
+        for i in range(N):
+            for j in range(N):
+                if not accepted[i, j]:
+                    continue
+                fx = float(fxg[i, j]); fy = float(fyg[i, j])
+                films_acc.append((fx, fy))
+                hits_acc.append(Point3(float(Pw[i, j, 0]),
+                                       float(Pw[i, j, 1]),
+                                       float(Pw[i, j, 2])))
+                viz.append((fx, fy))     # screen-space viz: accepted only
+        return films_acc, hits_acc, viz, int(hit_mask.sum())
+
+    @staticmethod
+    def _surface_verticality(Pw):
+        """|normal·Zup| per grid cell from the unprojected truck surface.
+        ~1 = horizontal (floor), ~0 = vertical (wall). NaN-safe; cells without
+        full neighbours get 0 (kept)."""
+        N = Pw.shape[0]
+        du = np.full((N, N, 3), np.nan)
+        dv = np.full((N, N, 3), np.nan)
+        du[:, 1:-1, :] = Pw[:, 2:, :] - Pw[:, :-2, :]    # screen +x direction
+        dv[1:-1, :, :] = Pw[:-2, :, :] - Pw[2:, :, :]    # screen +y (up) dir
+        nrm = np.cross(du, dv)
+        ln = np.linalg.norm(nrm, axis=2)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            nz = np.abs(nrm[:, :, 2]) / ln
+        return np.where(np.isfinite(nz), nz, 0.0)
+
+    def _reject_outliers(self, fxg, fyg, dg, Zg, hit_mask):
+        """Robust rejection of bad anchor candidates. Returns a bool grid of
+        accepted points. See the AUTO_* constants for the thresholds."""
+        N = fxg.shape[0]
+        inl = hit_mask.copy()
+        A = B = None
+
+        # Stage A: global robust linear d -> Z fit (drops fill / mismatch).
+        for _ in range(int(self.AUTO_REJECT_ITERS)):
+            if int(inl.sum()) < self.MIN_POINTS:
+                break
+            Af, Bf = self._fit_linear(dg[inl], Zg[inl])
+            if Af is None:
+                Af, Bf = 0.0, float(Zg[inl].mean())
+            A, B = Af, Bf
+            r = Zg - (A * dg + B)
+            rin = r[inl]
+            center = float(np.median(rin))
+            mad = 1.4826 * float(np.median(np.abs(rin - center)))
+            thr = max(self.AUTO_GLOBAL_K * mad, self.AUTO_GLOBAL_ABS)
+            new = inl & (np.abs(r - center) <= thr)
+            if int(new.sum()) == int(inl.sum()):
+                inl = new
+                break
+            inl = new
+
+        if A is None:
+            return inl
+
+        # Stage B: local residual smoothness (the "5 agree, 6th is off" case).
+        r = Zg - (A * dg + B)
+        # Scale the neighbourhood with the grid so it covers a constant screen
+        # area regardless of AUTO_GRID — keeps the statistics robust as the
+        # point count grows.
+        Wr = max(int(self.AUTO_LOCAL_WINDOW),
+                 int(round(self.AUTO_LOCAL_WINDOW * N / 50.0)))
+        rej = np.zeros((N, N), dtype=bool)
+        for (gi, gj) in np.argwhere(inl):
+            i0, i1 = max(0, gi - Wr), min(N, gi + Wr + 1)
+            j0, j1 = max(0, gj - Wr), min(N, gj + Wr + 1)
+            win_in = inl[i0:i1, j0:j1].copy()
+            win_in[gi - i0, gj - j0] = False     # exclude self
+            if int(win_in.sum()) < self.AUTO_LOCAL_MIN_NB:
+                continue
+            pred = float(np.median(r[i0:i1, j0:j1][win_in]))
+            if abs(float(r[gi, gj]) - pred) > self.AUTO_LOCAL_THRESH:
+                rej[gi, gj] = True
+        return inl & (~rej)
+
+    def _build_point_viz(self, viz) -> None:
+        """Draw the accepted anchor points in SCREEN space (render2d) as green
+        dots. `viz` is a list of (fx, fy) film coords of the used anchors —
+        film coords are exactly render2d NDC, so they land where the points
+        project on screen, independent of the 3D scene."""
+        self._dispose_viz()
+        if not viz:
+            return
+        try:
+            from panda3d.core import GeomPoints
+            parent = getattr(self.panda_app, "render2d", None)
+            if parent is None:
+                parent = self.panda_app.render
+            fmt = GeomVertexFormat.get_v3c4()
+            vdata = GeomVertexData("auto_pts", fmt, Geom.UHStatic)
+            vdata.set_num_rows(len(viz))
+            vw = GeomVertexWriter(vdata, "vertex")
+            cw = GeomVertexWriter(vdata, "color")
+            prim = GeomPoints(Geom.UHStatic)
+            for idx, (fx, fy) in enumerate(viz):
+                # render2d: x = fx (right), z = fy (up), y = 0 (depth).
+                vw.add_data3f(float(fx), 0.0, float(fy))
+                cw.add_data4f(0.1, 1.0, 0.2, 1.0)     # green = used anchor
+                prim.add_vertex(idx)
+            prim.close_primitive()
+            geom = Geom(vdata)
+            geom.add_primitive(prim)
+            gnode = GeomNode("auto_point_viz")
+            gnode.add_geom(geom)
+            np_ = parent.attach_new_node(gnode)
+            np_.set_render_mode_thickness(7)
+            np_.set_light_off(1)
+            np_.set_depth_test(False)
+            np_.set_depth_write(False)
+            np_.set_bin("fixed", 100)
+            self._viz_node = np_
+        except Exception as exc:
+            self._log(f"point viz failed: {exc}")
+
+    def _dispose_viz(self) -> None:
+        n = getattr(self, "_viz_node", None)
+        if n is not None:
+            try:
+                n.remove_node()
+            except Exception:
+                pass
+        self._viz_node = None
 
     # ------------------------------------------------------------------
     def _compute_normals(self, verts, faces):

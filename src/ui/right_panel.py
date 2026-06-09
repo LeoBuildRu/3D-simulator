@@ -877,6 +877,8 @@ class RightPanel(QWidget):
     pointPickingToggled        = pyqtSignal(bool)
     # Emitted when the user asks to clear the picked points / reconstruction.
     pointsResetRequested       = pyqtSignal()
+    # Emitted when the anchor-point visualization toggle flips.
+    pointVizToggled            = pyqtSignal(bool)
     # Emitted when the user presses "Run Simulation". Payload is a dict:
     #   {
     #     "model_key":     str | None,   # current model set key
@@ -1522,6 +1524,20 @@ class RightPanel(QWidget):
         pick_row.addWidget(self.btn_pick_points, 1)
         pick_row.addWidget(self.btn_pick_reset, 0)
         rc.addLayout(pick_row)
+
+        # ----- Anchor-point visualization toggle ----------------------
+        # (Points are placed automatically when a stand snapshot is selected.)
+        self.btn_point_viz = QPushButton("Точки")
+        self.btn_point_viz.setCheckable(True)
+        self.btn_point_viz.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_point_viz.setToolTip(
+            "Показать использованные опорные точки на экране (зелёные)."
+        )
+        self.btn_point_viz.setStyleSheet(self._soft_accent_button_qss())
+        self.btn_point_viz.toggled.connect(
+            lambda checked: self.pointVizToggled.emit(bool(checked))
+        )
+        rc.addWidget(self.btn_point_viz)
 
         v.addWidget(self._ref_controls_holder)
         return holder
