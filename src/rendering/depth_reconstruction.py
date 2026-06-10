@@ -5,30 +5,34 @@
 # Flow (driven from the UI):
 #   1. The user picks a stand snapshot and lines the live camera up with the
 #      reference overlay so the 3D world matches the photo.
-#   2. They toggle "point picking" and click the 4 corners of the truck bed
-#      (кузов) in the viewport.
-#   3. Each clicked screen point is ray-cast against the loaded truck model to
-#      recover its true 3D position (4 metric anchor points).
+#   2. Anchor points are obtained — either by clicking on the truck in the
+#      viewport, or by the automatic grid-of-rays search. These points are
+#      used ONLY to calibrate depth; they do NOT bound the mesh.
+#   3. Each anchor point is ray-cast against the loaded truck model to recover
+#      its true 3D position (metric anchor points).
 #   4. The depth map (linear, 8-bit grayscale) is calibrated to metric using
-#      the 4 anchors — a least-squares fit  Z = A*d + B  maps the normalised
+#      the anchors — a least-squares fit  Z = A*d + B  maps the normalised
 #      depth value d∈[0,1] to a forward (perpendicular) distance from the
 #      camera. The fit recovers min/max depth and is sign-agnostic, so it
 #      doesn't matter whether "near" is bright or dark.
-#   5. A grid is sampled inside the bed quad; every sample is unprojected
-#      through the current camera lens at its calibrated depth, giving a 3D
-#      surface. That surface is turned into a Panda mesh and added to the
-#      scene, anchored to the current camera state.
+#   5. A grid is sampled over the REGION (the mask, or the whole frame when
+#      there is no mask); every sample is unprojected through the current
+#      camera lens at its calibrated depth, giving a 3D surface. That surface
+#      is turned into a Panda mesh and added to the scene, anchored to the
+#      current camera state.
 #
 # Assumptions (documented so they're easy to revisit):
-#   A1  The 4 points are the bed corners; the mesh covers the region INSIDE
-#       that quad (the fill surface), not the whole frame.
+#   A1  The mesh region is defined by the per-snapshot mask (alpha) if one
+#       exists, otherwise the whole frame is reconstructed. The anchor points
+#       only calibrate depth — they never bound the region.
 #   A2  The depth PNG is linear and normalised by /255.
 #   A3  "depth" = forward/perpendicular distance from the camera plane
 #       (Panda camera looks down +Y), consistent with linear depth.
-#   A4  The photo fills the film rectangle 1:1, i.e. depth-pixel (u,v) maps
-#       to film coords fx=2u-1, fy=1-2v. Matching the camera to the overlay
-#       (shown KeepAspectRatio) makes this hold when the viewport aspect ≈
-#       the photo aspect (1670x942 ≈ 16:9).
+#   A4  The color overlay and depth map cover the same FOV (same scene).
+#       The overlay is shown KeepAspectRatio (fills film width, letterboxed
+#       vertically). fyh = window_aspect / color_aspect is the vertical
+#       half-extent in film space. Normalized UV coords (u,v)∈[0,1]² are
+#       shared between color and depth, so the depth resolution can differ.
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -54,8 +58,10 @@ from panda3d.core import (
 class DepthReconstructor:
     """Owns the N-point picking interaction and the depth->mesh pipeline."""
 
-    # Any number of points is allowed; this many are required to form a
-    # region + calibrate. Picking is finished by the user (RMB / Esc).
+    # Any number of points is allowed; this many are required to calibrate
+    # the depth law Z = A*d + B. The points ONLY calibrate depth — the mesh
+    # region is defined by the mask (or the whole frame). Picking is finished
+    # by the user (RMB / Esc).
     MIN_POINTS = 2
     GRID = 200          # mesh resolution across the region (GRID x GRID quads)
     # Texture tiling for the reconstructed surface: UV units per world metre.
@@ -69,35 +75,25 @@ class DepthReconstructor:
     # higher = each point's influence stays tighter to its own area.
     IDW_POWER = 2.0
     IDW_EPS = 1e-6
-    # Maximum allowed 3D length (world units / metres) of a mesh triangle's
-    # edge. Cells whose neighbouring vertices are farther apart than this are
-    # dropped — this culls the long, stretched polygons that bridge depth
-    # discontinuities (e.g. fill surface -> background). Tune to taste.
-    MAX_EDGE_LEN = 0.7
-    # Maximum allowed VERTICAL (global +Z) extent of a triangle edge, metres.
-    # Near-vertical polygons (the bed walls / стенки кузова) have a big Δz per
-    # edge and get culled, while flat/gently-sloped fill is kept.
-    MAX_VERTICAL_DROP = 2.0
-    # Clear stray polygons around sharp depth discontinuities: a depth pixel
-    # whose value spans more than JUMP_THRESH_M (metres) within a
-    # JUMP_RADIUS_PX-pixel window is treated as "near a jump", and any mesh
-    # sample landing there is dropped. This removes the floating fragments
-    # that appear in the blurred/compressed transition band of a big jump.
-    JUMP_RADIUS_PX = 2
-    JUMP_THRESH_M = 1.0
     # Light surface smoothing: number of 3x3 mask-aware averaging passes over
     # the grid depths before unprojection. Evens out the terracing caused by
     # 8-bit depth quantization. 0 = off; 1-3 = gentle. Only averages valid
-    # (kept) neighbours, so it doesn't bleed across mask/jump boundaries.
+    # (kept) neighbours, so it doesn't bleed across the mask boundary.
     SMOOTH_ITERS = 2
-    # Per-snapshot fill mask (<depth>-mask.png, RGBA). When USE_MASKS is on and
-    # a mask exists for the snapshot, the mesh is clipped ONLY by the mask
-    # (alpha > MASK_ALPHA_MIN) and the geometric cullings above are skipped.
-    # If USE_MASKS is on but the mask is missing — or USE_MASKS is off — the
-    # geometric cullings (edge length / verticality / jump radius) are used.
+    # Per-snapshot fill mask (<depth>-mask.png, RGBA). The mask is the ONLY
+    # thing that bounds the mesh: when USE_MASKS is on and a mask exists, the
+    # mesh covers exactly the masked pixels (alpha > MASK_ALPHA_MIN). When the
+    # mask is missing — or USE_MASKS is off — the WHOLE frame is reconstructed
+    # and nothing is culled.
     USE_MASKS = True
     MASK_SUFFIX = "-mask.png"
     MASK_ALPHA_MIN = 0.5
+    # The mesh-cell rule keeps a cell only when all 4 of its corners are in the
+    # mask, which erodes the kept region inward by ~1 grid cell along the whole
+    # boundary (plus the grid-node quantization of the edge). Dilate the
+    # sampled mask by this many cells first so the surface reaches the true
+    # mask edge instead of being trimmed short. 0 = off.
+    MASK_DILATE_CELLS = 1
     # --- Automatic reference-point search ----------------------------
     # Instead of manual picking, cast an AUTO_GRID x AUTO_GRID grid of rays
     # across the screen; every ray that hits the truck is a candidate anchor.
@@ -545,22 +541,30 @@ class DepthReconstructor:
                   f"остатки {r_ctrl.min():+.2f}..{r_ctrl.max():+.2f} м "
                   f"(IDW-коррекция по районам).")
 
-        # --- Region = convex hull of the picked points (film space) -------
-        hull = self._convex_hull(list(zip(cfx.tolist(), cfy.tolist())))
-        if len(hull) < 3:
-            self._log("Точки вырождены (нет площади) — нечего реконструировать.")
-            self._finish(False, {})
-            return False
+        # --- Region: defined by the mask, NOT by the picked points --------
+        # The picked points are used ONLY for the depth calibration above.
+        #   mask present -> the mesh covers exactly the masked pixels
+        #                   (alpha > MASK_ALPHA_MIN), at full grid resolution
+        #                   over the mask's bounding box;
+        #   no mask      -> the whole frame is reconstructed and nothing is
+        #                   culled.
+        mask_alpha = self._load_mask_alpha(W, H) if self.USE_MASKS else None
+        use_mask = mask_alpha is not None
 
-        # Grid over the hull's bounding box; mask to the hull.
         G = self.GRID
         stride = G + 1
-        xs = cfx.min() + (cfx.max() - cfx.min()) * (np.arange(stride) / G)
-        ys = cfy.min() + (cfy.max() - cfy.min()) * (np.arange(stride) / G)
+        # Grid bounds in film space: the mask's film bounding box if we have a
+        # mask (keeps full resolution where it matters), otherwise the whole
+        # depth image ([-1, 1] x [-fyh, fyh]).
+        if use_mask:
+            fx0, fx1, fy0, fy1 = self._mask_film_bounds(mask_alpha, W, H, fyh)
+        else:
+            fx0, fx1, fy0, fy1 = -1.0, 1.0, -fyh, fyh
+        xs = fx0 + (fx1 - fx0) * (np.arange(stride) / G)
+        ys = fy0 + (fy1 - fy0) * (np.arange(stride) / G)
         FX, FY = np.meshgrid(xs, ys)          # (stride, stride)
         FX = FX.ravel()
         FY = FY.ravel()
-        inside = self._inside_hull_mask(hull, FX, FY)
 
         # Depth value + locally-corrected metric depth at every grid sample.
         cols, rows = self._film_to_pixel_vec(FX, FY, W, H, fyh)
@@ -568,32 +572,23 @@ class DepthReconstructor:
         resid = self._idw_residual(FX, FY, cfx, cfy, r_ctrl)
         Z_grid = A * d_grid + B + resid
 
-        # Decide the clipping strategy:
-        #   USE_MASKS + mask present  -> use ONLY the snapshot's alpha mask.
-        #   USE_MASKS + mask missing  -> fall back to the geometric cullings.
-        #   USE_MASKS off             -> geometric cullings.
-        mask_alpha = self._load_mask_alpha(W, H) if self.USE_MASKS else None
-        use_mask = mask_alpha is not None
-
+        # Region selection: keep masked nodes, or everything when no mask.
         if use_mask:
-            keep = mask_alpha[rows, cols] > self.MASK_ALPHA_MIN
-            n_before = int(inside.sum())
-            inside = inside & keep
-            self._log(f"Маска: оставлено {int(inside.sum())} из {n_before} "
-                      f"узлов (alpha > {self.MASK_ALPHA_MIN:.0%}); "
-                      f"отсечения по длине/вертикали отключены.")
+            inside = mask_alpha[rows, cols] > self.MASK_ALPHA_MIN
+            n_mask = int(inside.sum())
+            # Grow the kept region by a cell so the all-4-corners face rule
+            # reaches the true mask edge instead of eroding it inward.
+            if self.MASK_DILATE_CELLS > 0:
+                inside = self._dilate_grid_mask(
+                    inside.reshape(stride, stride),
+                    self.MASK_DILATE_CELLS).ravel()
+            self._log(f"Маска: регион = {n_mask} узлов "
+                      f"(alpha > {self.MASK_ALPHA_MIN:.0%}, +"
+                      f"{self.MASK_DILATE_CELLS} ячейка к краю); "
+                      f"геометрические отсечения отключены.")
         else:
-            # Drop samples in the blurred transition band around a sharp jump.
-            forbidden = self._jump_forbidden_mask(depth, A)
-            if forbidden is not None:
-                near = forbidden[rows, cols]
-                n_before = int(inside.sum())
-                inside = inside & (~near)
-                n_cut = n_before - int(inside.sum())
-                if n_cut > 0:
-                    self._log(f"У разрывов глубины убрано {n_cut} узлов "
-                              f"(радиус {self.JUMP_RADIUS_PX}px, "
-                              f"порог {self.JUMP_THRESH_M} м).")
+            inside = np.ones(FX.shape[0], dtype=bool)
+            self._log("Маски нет: реконструирую весь кадр без отсечений.")
 
         # Gentle smoothing of the (kept) grid depths to kill the 8-bit
         # quantization terracing before the surface is built.
@@ -603,7 +598,7 @@ class DepthReconstructor:
                 inside.reshape(stride, stride),
                 self.SMOOTH_ITERS).ravel()
 
-        # Unproject the in-hull samples through the live lens.
+        # Unproject the in-region samples through the live lens.
         verts = np.zeros((FX.shape[0], 3), dtype=np.float64)
         for k in range(FX.shape[0]):
             if not inside[k]:
@@ -614,22 +609,15 @@ class DepthReconstructor:
             verts[k, 1] = wp.y
             verts[k, 2] = wp.z
 
-        # Build triangles. With a mask, no geometric culling (inf limits);
-        # otherwise cull by edge length and verticality.
-        if use_mask:
-            me, mv = float("inf"), float("inf")
-        else:
-            me, mv = self.MAX_EDGE_LEN, self.MAX_VERTICAL_DROP
-        faces, dropped = self._build_grid_faces(G, inside, verts, me, mv)
+        # Build triangles. No geometric culling: the region is fully defined
+        # by the mask (or the whole frame), so every cell whose 4 corners are
+        # in-region becomes 2 triangles (inf edge/vertical limits).
+        faces, _dropped = self._build_grid_faces(
+            G, inside, verts, float("inf"), float("inf"))
         if len(faces) == 0:
-            self._log("Нет ячеек для меша (узкая область / маска пуста / всё "
-                      "отсечено).")
+            self._log("Нет ячеек для меша (маска пуста / регион вырожден).")
             self._finish(False, {})
             return False
-        if dropped and not use_mask:
-            self._log(f"Отсечено {dropped} полигонов (длина > "
-                      f"{self.MAX_EDGE_LEN} м или вертикаль > "
-                      f"{self.MAX_VERTICAL_DROP} м).")
         z_min = float(Z_grid[inside].min())
         z_max = float(Z_grid[inside].max())
 
@@ -680,6 +668,11 @@ class DepthReconstructor:
     def has_saved_points(self) -> bool:
         return len(self._saved_films) >= self.MIN_POINTS
 
+    def has_manual_saved_points(self) -> bool:
+        """True only for points saved from a MANUAL pick. These are reused
+        automatically on snapshot switch; auto-found points are not."""
+        return self.has_saved_points() and not self._auto_mode
+
     def clear_saved_points(self) -> None:
         self._saved_films = []
         self._auto_mode = False
@@ -723,19 +716,6 @@ class DepthReconstructor:
     # ==================================================================
     # Automatic reference-point search
     # ==================================================================
-    def has_pending_auto(self) -> bool:
-        """True if a snapshot switch should auto-rebuild (auto mode used, or
-        manual points saved)."""
-        return self._auto_mode or self.has_saved_points()
-
-    def reconstruct_for_snapshot(self, depth_path: str = "") -> bool:
-        """Rebuild for a snapshot. Automatic point search is the default; a
-        manual pick (saved points, not auto mode) takes precedence and is
-        reused instead."""
-        if self.has_saved_points() and not self._auto_mode:
-            return self.reconstruct_saved(depth_path)
-        return self.reconstruct_auto(depth_path)
-
     def set_visualize(self, on: bool) -> None:
         """Toggle the point-grid debug visualisation."""
         self._viz_on = bool(on)
@@ -1168,19 +1148,59 @@ class DepthReconstructor:
             self._log(f"Не удалось прочитать маску: {exc}")
             return None
 
-    def _vertical_film_span(self, W_img, H_img) -> float:
+    def _mask_film_bounds(self, mask_alpha, W, H, fyh):
+        """Film-space bounding box (fx0, fx1, fy0, fy1) of the masked pixels
+        (alpha > MASK_ALPHA_MIN), with a 1-pixel margin so the edge is fully
+        covered. Falls back to the whole frame if the mask is empty."""
+        sel = mask_alpha > self.MASK_ALPHA_MIN
+        ys_idx, xs_idx = np.where(sel)
+        if xs_idx.size == 0:
+            return -1.0, 1.0, -fyh, fyh
+        c0 = max(0, int(xs_idx.min()) - 1)
+        c1 = min(W - 1, int(xs_idx.max()) + 1)
+        r0 = max(0, int(ys_idx.min()) - 1)
+        r1 = min(H - 1, int(ys_idx.max()) + 1)
+        # Pixel -> film, inverse of _film_to_pixel:
+        #   u = col/(W-1), fx = 2u - 1;  v = row/(H-1), fy = fyh*(1 - 2v).
+        wd = float(max(1, W - 1))
+        hd = float(max(1, H - 1))
+        fx0 = 2.0 * (c0 / wd) - 1.0
+        fx1 = 2.0 * (c1 / wd) - 1.0
+        # Rows grow downward, so the top row (r0) is the HIGH fy.
+        fy_hi = fyh * (1.0 - 2.0 * (r0 / hd))
+        fy_lo = fyh * (1.0 - 2.0 * (r1 / hd))
+        return fx0, fx1, fy_lo, fy_hi
+
+    def _vertical_film_span(self, W_depth, H_depth) -> float:
         """Half-extent (in film fy units) that the photo occupies vertically:
         fyh = window_aspect / photo_aspect. The photo fills the film width,
-        so vertically it spans fy in [-fyh, +fyh]."""
+        so vertically it spans fy in [-fyh, +fyh].
+
+        The aspect ratio is taken from the COLOR overlay (what the user sees),
+        falling back to the depth image if no color image is available. This
+        matters when color and depth have different aspect ratios."""
         try:
             win = self.panda_app.win
             aw = float(win.get_x_size()) / float(max(1, win.get_y_size()))
         except Exception:
-            aw = float(W_img) / float(max(1, H_img))
-        ap = float(W_img) / float(max(1, H_img))
+            aw = float(W_depth) / float(max(1, H_depth))
+        # Use the color image's aspect to match the overlay the user sees.
+        W_overlay, H_overlay = self._color_image_size(W_depth, H_depth)
+        ap = float(W_overlay) / float(max(1, H_overlay))
         if ap <= 1e-9:
             return 1.0
         return aw / ap
+
+    def _color_image_size(self, W_fallback, H_fallback):
+        """Return (W, H) of the color overlay image, or the fallback size."""
+        if self._color_path and os.path.exists(self._color_path):
+            try:
+                from PIL import Image
+                with Image.open(self._color_path) as im:
+                    return im.width, im.height
+            except Exception:
+                pass
+        return W_fallback, H_fallback
 
     @staticmethod
     def _film_to_pixel(fx, fy, W, H, fyh=1.0):
@@ -1208,41 +1228,6 @@ class DepthReconstructor:
             return None, None
 
     @staticmethod
-    def _convex_hull(points):
-        """Andrew's monotone-chain convex hull. Returns hull vertices CCW."""
-        pts = sorted(set((round(float(p[0]), 9), round(float(p[1]), 9))
-                         for p in points))
-        if len(pts) <= 2:
-            return pts
-
-        def cross(o, a, b):
-            return (a[0]-o[0]) * (b[1]-o[1]) - (a[1]-o[1]) * (b[0]-o[0])
-
-        lower = []
-        for p in pts:
-            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-                lower.pop()
-            lower.append(p)
-        upper = []
-        for p in reversed(pts):
-            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-                upper.pop()
-            upper.append(p)
-        return lower[:-1] + upper[:-1]
-
-    @staticmethod
-    def _inside_hull_mask(hull, X, Y):
-        """Vectorised point-in-convex-polygon test (CCW hull)."""
-        inside = np.ones(X.shape, dtype=bool)
-        n = len(hull)
-        for k in range(n):
-            ax, ay = hull[k]
-            bx, by = hull[(k + 1) % n]
-            cr = (bx - ax) * (Y - ay) - (by - ay) * (X - ax)
-            inside &= (cr >= -1e-9)
-        return inside
-
-    @staticmethod
     def _film_to_pixel_vec(FX, FY, W, H, fyh):
         if abs(fyh) < 1e-9:
             fyh = 1.0
@@ -1263,6 +1248,27 @@ class DepthReconstructor:
         wsum = w.sum(axis=1)
         wsum[wsum < 1e-12] = 1e-12
         return (w * r[None, :]).sum(axis=1) / wsum
+
+    @staticmethod
+    def _dilate_grid_mask(mask2d, iters):
+        """8-connected (3x3) binary dilation of a (stride,stride) bool grid,
+        repeated `iters` times. Grows the kept region outward by one grid cell
+        per pass — the inverse of the all-4-corners erosion in
+        _build_grid_faces. Dilated nodes still have valid depth (Z_grid is
+        computed for every node), so they're safe to include."""
+        m = mask2d.copy()
+        for _ in range(int(iters)):
+            out = m.copy()
+            out[:-1, :] |= m[1:, :]
+            out[1:, :] |= m[:-1, :]
+            out[:, :-1] |= m[:, 1:]
+            out[:, 1:] |= m[:, :-1]
+            out[:-1, :-1] |= m[1:, 1:]
+            out[1:, 1:] |= m[:-1, :-1]
+            out[:-1, 1:] |= m[1:, :-1]
+            out[1:, :-1] |= m[:-1, 1:]
+            m = out
+        return m
 
     @staticmethod
     def _smooth_grid_z(Z, valid, iters):
@@ -1294,8 +1300,9 @@ class DepthReconstructor:
     @staticmethod
     def _build_grid_faces(G, inside, verts, max_edge, max_vdrop):
         """Vectorised grid triangulation. A cell becomes 2 triangles only if
-        all 4 corners are in-hull AND, for every triangle edge, the 3D length
-        is <= max_edge AND the vertical (world +Z) drop is <= max_vdrop.
+        all 4 corners are in-region AND, for every triangle edge, the 3D length
+        is <= max_edge AND the vertical (world +Z) drop is <= max_vdrop. Pass
+        max_edge=max_vdrop=inf to disable the geometric culling.
 
         Returns (faces (T,3) int64, dropped_count)."""
         stride = G + 1
@@ -1335,50 +1342,9 @@ class DepthReconstructor:
             else np.zeros((0, 3), np.int64)
         faces = np.concatenate([f1, f2], axis=0).astype(np.int64)
 
-        # In-hull triangles rejected (by edge length or verticality).
+        # In-region triangles rejected (by edge length or verticality).
         dropped = int(2 * int(cell_in.sum()) - faces.shape[0])
         return faces, dropped
-
-    def _jump_forbidden_mask(self, depth, A):
-        """Boolean HxW mask: True where the depth varies by more than
-        JUMP_THRESH_M (metric) within a JUMP_RADIUS_PX window — i.e. near a
-        sharp discontinuity (plus its blurred transition band)."""
-        R = int(self.JUMP_RADIUS_PX)
-        if R <= 0 or abs(float(A)) < 1e-9:
-            return None
-        rng = self._window_range(np.asarray(depth, dtype=np.float32), R)
-        return (abs(float(A)) * rng) > float(self.JUMP_THRESH_M)
-
-    @staticmethod
-    def _window_range(a, R):
-        """Per-pixel (max - min) over a (2R+1)x(2R+1) box, border-replicated.
-        Separable: max/min along rows then columns."""
-        def shift(arr, s, ax):
-            out = np.empty_like(arr)
-            if ax == 0:
-                if s > 0:
-                    out[s:, :] = arr[:-s, :]; out[:s, :] = arr[:1, :]
-                else:
-                    out[:s, :] = arr[-s:, :]; out[s:, :] = arr[-1:, :]
-            else:
-                if s > 0:
-                    out[:, s:] = arr[:, :-s]; out[:, :s] = arr[:, :1]
-                else:
-                    out[:, :s] = arr[:, -s:]; out[:, s:] = arr[:, -1:]
-            return out
-
-        mx = a.copy()
-        mn = a.copy()
-        for ax in (0, 1):
-            amx = mx.copy()
-            amn = mn.copy()
-            for s in range(1, R + 1):
-                amx = np.maximum(amx, shift(mx, s, ax))
-                amx = np.maximum(amx, shift(mx, -s, ax))
-                amn = np.minimum(amn, shift(mn, s, ax))
-                amn = np.minimum(amn, shift(mn, -s, ax))
-            mx, mn = amx, amn
-        return mx - mn
 
     @staticmethod
     def _unproject(lens, cam_np, render, fx, fy, Z):

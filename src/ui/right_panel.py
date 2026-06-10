@@ -879,6 +879,8 @@ class RightPanel(QWidget):
     pointsResetRequested       = pyqtSignal()
     # Emitted when the anchor-point visualization toggle flips.
     pointVizToggled            = pyqtSignal(bool)
+    # Emitted when the user requests the automatic anchor-point search + build.
+    autoPointsRequested        = pyqtSignal()
     # Emitted when the user presses "Run Simulation". Payload is a dict:
     #   {
     #     "model_key":     str | None,   # current model set key
@@ -1525,8 +1527,22 @@ class RightPanel(QWidget):
         pick_row.addWidget(self.btn_pick_reset, 0)
         rc.addLayout(pick_row)
 
-        # ----- Anchor-point visualization toggle ----------------------
-        # (Points are placed automatically when a stand snapshot is selected.)
+        # ----- Auto anchor-points + visualization toggle --------------
+        pts_row = QHBoxLayout()
+        pts_row.setContentsMargins(0, 0, 0, 0)
+        pts_row.setSpacing(6)
+
+        self.btn_auto_points = QPushButton("Авто-точки")
+        self.btn_auto_points.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_auto_points.setToolTip(
+            "Автоматически найти опорные точки на кузове и построить "
+            "наполнение."
+        )
+        self.btn_auto_points.setStyleSheet(self._soft_accent_button_qss())
+        self.btn_auto_points.clicked.connect(
+            lambda _=False: self.autoPointsRequested.emit()
+        )
+
         self.btn_point_viz = QPushButton("Точки")
         self.btn_point_viz.setCheckable(True)
         self.btn_point_viz.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1537,7 +1553,10 @@ class RightPanel(QWidget):
         self.btn_point_viz.toggled.connect(
             lambda checked: self.pointVizToggled.emit(bool(checked))
         )
-        rc.addWidget(self.btn_point_viz)
+
+        pts_row.addWidget(self.btn_auto_points, 1)
+        pts_row.addWidget(self.btn_point_viz, 0)
+        rc.addLayout(pts_row)
 
         v.addWidget(self._ref_controls_holder)
         return holder

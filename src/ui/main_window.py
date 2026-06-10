@@ -681,6 +681,9 @@ class MainWindow(QMainWindow):
             self._on_points_reset
         )
         self.right_panel.pointVizToggled.connect(self._on_point_viz_toggled)
+        self.right_panel.autoPointsRequested.connect(
+            self._on_auto_points_requested
+        )
 
         # Fire an initial load so the default model is on the scene before
         # the user even picks anything.
@@ -2068,8 +2071,9 @@ class MainWindow(QMainWindow):
         ov.show_overlay()
         self._raise_huds_above_reference()
 
-        # Selecting a stand snapshot automatically places anchor points and
-        # rebuilds the fill (auto search by default; a manual pick is reused).
+        # Selecting a stand snapshot only rebuilds when a MANUAL pick was
+        # saved (same camera, new depth map). Automatic point search is no
+        # longer triggered here — it's an explicit action ("Авто-точки").
         depth_p = (getattr(rec, "depth_path", "") or "").strip()
         if depth_p:
             self._schedule_snapshot_build(depth_p)
@@ -2181,11 +2185,37 @@ class MainWindow(QMainWindow):
         dr = getattr(self, "depth_reconstructor", None)
         if dr is None or not depth_p or dr.is_picking():
             return
+        # Only reuse a saved MANUAL pick; never run the automatic point search
+        # on snapshot selection (that's the "Авто-точки" button now).
+        if not dr.has_manual_saved_points():
+            return
         self._last_auto_recon_depth = depth_p
         try:
-            dr.reconstruct_for_snapshot(depth_p)
+            dr.reconstruct_saved(depth_p)
         except Exception as exc:
-            print(f"[DepthRecon] авто-реконструкция упала: {exc}")
+            print(f"[DepthRecon] реконструкция по сохранённым точкам упала: {exc}")
+
+    def _on_auto_points_requested(self) -> None:
+        """Explicit automatic anchor-point search + rebuild for the active
+        snapshot (triggered by the "Авто-точки" button)."""
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is None:
+            return
+        rec = getattr(self, "_active_stand_rec", None)
+        if rec is None:
+            print("[DepthRecon] выберите снимок стенда перед авто-поиском точек.")
+            return
+        if dr.is_picking():
+            return
+        depth_p = (getattr(rec, "depth_path", "") or "").strip()
+        if not depth_p:
+            print("[DepthRecon] у снимка нет карты глубины.")
+            return
+        self._last_auto_recon_depth = depth_p
+        try:
+            dr.reconstruct_auto(depth_p)
+        except Exception as exc:
+            print(f"[DepthRecon] авто-поиск точек упал: {exc}")
 
     def _on_point_viz_toggled(self, on: bool) -> None:
         dr = getattr(self, "depth_reconstructor", None)
@@ -2657,12 +2687,7 @@ class MainWindow(QMainWindow):
     def _reposition_panda(self) -> None:
         if self.panda_app is None:
             return
-        # Qt6 reports widget geometry in LOGICAL pixels, but the native HWND
-        # (and therefore Win32 SetWindowPos / Panda's WindowProperties) work in
-        # PHYSICAL pixels. At display scaling != 100% these differ by the
-        # device-pixel ratio, so we must convert logical -> physical here or the
-        # Panda window ends up smaller than its container (black borders).
-        dpr = self.panda_container.devicePixelRatioF()
+        dpr = self.devicePixelRatio()
         w = max(1, round(self.panda_container.width() * dpr))
         h = max(1, round(self.panda_container.height() * dpr))
         hwnd = self._panda_hwnd
