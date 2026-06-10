@@ -88,6 +88,12 @@ class DepthReconstructor:
     USE_MASKS = True
     MASK_SUFFIX = "-mask.png"
     MASK_ALPHA_MIN = 0.5
+    # The mesh-cell rule keeps a cell only when all 4 of its corners are in the
+    # mask, which erodes the kept region inward by ~1 grid cell along the whole
+    # boundary (plus the grid-node quantization of the edge). Dilate the
+    # sampled mask by this many cells first so the surface reaches the true
+    # mask edge instead of being trimmed short. 0 = off.
+    MASK_DILATE_CELLS = 1
     # --- Automatic reference-point search ----------------------------
     # Instead of manual picking, cast an AUTO_GRID x AUTO_GRID grid of rays
     # across the screen; every ray that hits the truck is a candidate anchor.
@@ -565,8 +571,16 @@ class DepthReconstructor:
         # Region selection: keep masked nodes, or everything when no mask.
         if use_mask:
             inside = mask_alpha[rows, cols] > self.MASK_ALPHA_MIN
-            self._log(f"Маска: регион = {int(inside.sum())} узлов "
-                      f"(alpha > {self.MASK_ALPHA_MIN:.0%}); "
+            n_mask = int(inside.sum())
+            # Grow the kept region by a cell so the all-4-corners face rule
+            # reaches the true mask edge instead of eroding it inward.
+            if self.MASK_DILATE_CELLS > 0:
+                inside = self._dilate_grid_mask(
+                    inside.reshape(stride, stride),
+                    self.MASK_DILATE_CELLS).ravel()
+            self._log(f"Маска: регион = {n_mask} узлов "
+                      f"(alpha > {self.MASK_ALPHA_MIN:.0%}, +"
+                      f"{self.MASK_DILATE_CELLS} ячейка к краю); "
                       f"геометрические отсечения отключены.")
         else:
             inside = np.ones(FX.shape[0], dtype=bool)
@@ -1194,6 +1208,27 @@ class DepthReconstructor:
         wsum = w.sum(axis=1)
         wsum[wsum < 1e-12] = 1e-12
         return (w * r[None, :]).sum(axis=1) / wsum
+
+    @staticmethod
+    def _dilate_grid_mask(mask2d, iters):
+        """8-connected (3x3) binary dilation of a (stride,stride) bool grid,
+        repeated `iters` times. Grows the kept region outward by one grid cell
+        per pass — the inverse of the all-4-corners erosion in
+        _build_grid_faces. Dilated nodes still have valid depth (Z_grid is
+        computed for every node), so they're safe to include."""
+        m = mask2d.copy()
+        for _ in range(int(iters)):
+            out = m.copy()
+            out[:-1, :] |= m[1:, :]
+            out[1:, :] |= m[:-1, :]
+            out[:, :-1] |= m[:, 1:]
+            out[:, 1:] |= m[:, :-1]
+            out[:-1, :-1] |= m[1:, 1:]
+            out[1:, 1:] |= m[:-1, :-1]
+            out[:-1, 1:] |= m[1:, :-1]
+            out[1:, :-1] |= m[:-1, 1:]
+            m = out
+        return m
 
     @staticmethod
     def _smooth_grid_z(Z, valid, iters):
