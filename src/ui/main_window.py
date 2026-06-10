@@ -2657,8 +2657,14 @@ class MainWindow(QMainWindow):
     def _reposition_panda(self) -> None:
         if self.panda_app is None:
             return
-        w = max(1, self.panda_container.width())
-        h = max(1, self.panda_container.height())
+        # Qt6 reports widget geometry in LOGICAL pixels, but the native HWND
+        # (and therefore Win32 SetWindowPos / Panda's WindowProperties) work in
+        # PHYSICAL pixels. At display scaling != 100% these differ by the
+        # device-pixel ratio, so we must convert logical -> physical here or the
+        # Panda window ends up smaller than its container (black borders).
+        dpr = self.panda_container.devicePixelRatioF()
+        w = max(1, round(self.panda_container.width() * dpr))
+        h = max(1, round(self.panda_container.height() * dpr))
         hwnd = self._panda_hwnd
         if hwnd:
             try:

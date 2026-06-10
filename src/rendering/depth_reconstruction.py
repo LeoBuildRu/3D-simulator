@@ -129,6 +129,10 @@ class DepthReconstructor:
     AUTO_FLOOR_MAX_NZ = 0.55
     # Build the debug point-grid (green = used as anchor, red = rejected).
     VISUALIZE_POINTS = False
+    # Diagnostic visualization: colour EVERY truck-hit point by its fate so we
+    # can see which stage drops it — green = anchor, blue = floor-filtered,
+    # red = robust-rejected. Off = show only accepted (green).
+    AUTO_VIZ_DIAGNOSTIC = True
     # A dedicated, definitely-non-zero collide mask. We stamp it onto the
     # truck's visible geometry and use the same bit for the picking ray, so
     # the hit test works regardless of whatever into-mask the .bam /
@@ -654,11 +658,15 @@ class DepthReconstructor:
         # automatically (same camera, different depth map).
         self._saved_films = [(float(f[0]), float(f[1]))
                              for f in self._films[:n_pts]]
-        # Keep the on-screen point visualization in sync with the anchors
-        # actually used (works for both auto and manual modes).
-        self._auto_viz_data = list(self._saved_films)
-        if self._viz_on:
-            self._build_point_viz(self._auto_viz_data)
+        # Visualization: in AUTO mode the green/blue/red diagnostic grid was
+        # already built (before this call) — don't clobber it. In MANUAL mode
+        # show the used anchors (green) at their 3D positions (4-tuple format
+        # the viz builder expects; the old 2-tuple form crashed it).
+        if self._viz_on and not self._auto_mode:
+            manual_viz = [(float(p.x), float(p.y), float(p.z), 0)
+                          for p in self._hits[:n_pts]]
+            self._auto_viz_data = manual_viz
+            self._build_point_viz(manual_viz)
 
         info = {"A": A, "B": B, "z_min": z_min, "z_max": z_max,
                 "points": int(n_pts),
@@ -884,31 +892,46 @@ class DepthReconstructor:
                                      float(Zg[i, j]))
                 Pw[i, j, 0] = wp.x; Pw[i, j, 1] = wp.y; Pw[i, j, 2] = wp.z
 
-        # Candidate mask: drop near-horizontal (floor) truck surfaces.
+        # Candidate mask: build an AABB from all truck-hit points and drop
+        # the lower half (world +Z), keeping only the upper part of the bed.
         cand = hit_mask
-        n_floor = 0
-        if self.AUTO_REJECT_FLOOR:
-            nz = self._surface_verticality(Pw)
-            floor = hit_mask & (nz > float(self.AUTO_FLOOR_MAX_NZ))
-            cand = hit_mask & (~floor)
-            n_floor = int(floor.sum())
-            if n_floor:
-                self._log(f"Авто-точки: отброшено {n_floor} точек дна "
-                          f"(нормаль вертикальнее {self.AUTO_FLOOR_MAX_NZ}).")
+        if hit_mask.any():
+            zw = Pw[:, :, 2]
+            zs = zw[hit_mask]
+            z_min = float(zs.min())
+            z_max = float(zs.max())
+            z_mid = 0.5 * (z_min + z_max)
+            cand = hit_mask & (zw >= z_mid)
+            n_drop = int(hit_mask.sum() - cand.sum())
+            self._log(f"Авто-точки: AABB по Z=[{z_min:.2f}, {z_max:.2f}], "
+                      f"отброшена нижняя половина — {n_drop} точек.")
 
         accepted = self._reject_outliers(fxg, fyg, dg, Zsafe, cand)
 
+        diag = bool(self.AUTO_VIZ_DIAGNOSTIC)
         films_acc, hits_acc, viz = [], [], []
+        n_floor_f = n_robust = 0
         for i in range(N):
             for j in range(N):
-                if not accepted[i, j]:
+                if not hit_mask[i, j]:
                     continue
                 fx = float(fxg[i, j]); fy = float(fyg[i, j])
-                films_acc.append((fx, fy))
-                hits_acc.append(Point3(float(Pw[i, j, 0]),
-                                       float(Pw[i, j, 1]),
-                                       float(Pw[i, j, 2])))
-                viz.append((fx, fy))     # screen-space viz: accepted only
+                px = float(Pw[i, j, 0])
+                py = float(Pw[i, j, 1])
+                pz = float(Pw[i, j, 2])
+                if accepted[i, j]:
+                    films_acc.append((fx, fy))
+                    hits_acc.append(Point3(px, py, pz))
+                    viz.append((px, py, pz, 0))        # green = anchor
+                elif diag and not cand[i, j]:
+                    viz.append((px, py, pz, 1))        # blue = floor-filtered
+                    n_floor_f += 1
+                elif diag:
+                    viz.append((px, py, pz, 2))        # red = robust-rejected
+                    n_robust += 1
+        if diag:
+            self._log(f"Авто-точки (диагностика): принято {len(films_acc)}, "
+                      f"фильтр дна {n_floor_f}, робастно отброшено {n_robust}.")
         return films_acc, hits_acc, viz, int(hit_mask.sum())
 
     @staticmethod
@@ -976,42 +999,59 @@ class DepthReconstructor:
                 rej[gi, gj] = True
         return inl & (~rej)
 
+    # fate code -> RGBA: 0 anchor (green), 1 floor-filtered (blue),
+    # 2 robust-rejected (red).
+    _VIZ_COLORS = {
+        0: (0.1, 1.0, 0.1, 1.0),
+        1: (0.15, 0.6, 1.0, 1.0),
+        2: (1.0, 0.1, 0.1, 1.0),
+    }
+
     def _build_point_viz(self, viz) -> None:
-        """Draw the accepted anchor points in SCREEN space (render2d) as green
-        dots. `viz` is a list of (fx, fy) film coords of the used anchors —
-        film coords are exactly render2d NDC, so they land where the points
-        project on screen, independent of the 3D scene."""
+        """Draw the auto-search points in the 3D WORLD at their hit positions,
+        one node per fate with a FLAT colour (`set_color`). Drawing in `render`
+        is guaranteed to display under RenderPipeline (unlike render2d). `viz`
+        items are (px, py, pz, fate)."""
         self._dispose_viz()
         if not viz:
             return
         try:
             from panda3d.core import GeomPoints
-            parent = getattr(self.panda_app, "render2d", None)
-            if parent is None:
-                parent = self.panda_app.render
-            fmt = GeomVertexFormat.get_v3c4()
-            vdata = GeomVertexData("auto_pts", fmt, Geom.UHStatic)
-            vdata.set_num_rows(len(viz))
-            vw = GeomVertexWriter(vdata, "vertex")
-            cw = GeomVertexWriter(vdata, "color")
-            prim = GeomPoints(Geom.UHStatic)
-            for idx, (fx, fy) in enumerate(viz):
-                # render2d: x = fx (right), z = fy (up), y = 0 (depth).
-                vw.add_data3f(float(fx), 0.0, float(fy))
-                cw.add_data4f(0.1, 1.0, 0.2, 1.0)     # green = used anchor
-                prim.add_vertex(idx)
-            prim.close_primitive()
-            geom = Geom(vdata)
-            geom.add_primitive(prim)
-            gnode = GeomNode("auto_point_viz")
-            gnode.add_geom(geom)
-            np_ = parent.attach_new_node(gnode)
-            np_.set_render_mode_thickness(7)
-            np_.set_light_off(1)
-            np_.set_depth_test(False)
-            np_.set_depth_write(False)
-            np_.set_bin("fixed", 100)
-            self._viz_node = np_
+            groups = {}
+            for item in viz:
+                if len(item) < 3:
+                    continue           # expects (px, py, pz[, fate])
+                fate = item[3] if len(item) > 3 else 0
+                groups.setdefault(fate, []).append(
+                    (item[0], item[1], item[2]))
+            if not groups:
+                return
+
+            root = self.panda_app.render.attach_new_node("auto_point_viz")
+            for fate, pts in groups.items():
+                fmt = GeomVertexFormat.get_v3()
+                vdata = GeomVertexData("auto_pts", fmt, Geom.UHStatic)
+                vdata.set_num_rows(len(pts))
+                vw = GeomVertexWriter(vdata, "vertex")
+                prim = GeomPoints(Geom.UHStatic)
+                for idx, (px, py, pz) in enumerate(pts):
+                    vw.add_data3f(float(px), float(py), float(pz))
+                    prim.add_vertex(idx)
+                prim.close_primitive()
+                geom = Geom(vdata)
+                geom.add_primitive(prim)
+                gnode = GeomNode(f"auto_pts_{fate}")
+                gnode.add_geom(geom)
+                node = root.attach_new_node(gnode)
+                r, g, b, a = self._VIZ_COLORS.get(fate, self._VIZ_COLORS[0])
+                node.set_color(r, g, b, a, 1)
+                node.set_render_mode_thickness(12)
+
+            root.set_light_off(1)
+            root.set_depth_test(False)     # draw on top of the truck
+            root.set_depth_write(False)
+            root.set_bin("fixed", 100)
+            self._viz_node = root
         except Exception as exc:
             self._log(f"point viz failed: {exc}")
 

@@ -2632,8 +2632,12 @@ def main():
     # falling back to the legacy default.
     tls_host, tls_port = load_tls_config(base_path)
 
-    init_w = max(1, win.panda_container.width())
-    init_h = max(1, win.panda_container.height())
+    # Convert Qt's LOGICAL widget size to PHYSICAL pixels so Panda's initial
+    # win-size matches the native HWND at display scaling != 100% (otherwise
+    # the embedded render window starts out smaller than its container).
+    _dpr = win.panda_container.devicePixelRatioF()
+    init_w = max(1, round(win.panda_container.width() * _dpr))
+    init_h = max(1, round(win.panda_container.height() * _dpr))
 
     # Resolve the graphics preset (saved choice, or auto-detected on first
     # run — "performance" on integrated Intel graphics, "ultra" otherwise).
