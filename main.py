@@ -2632,8 +2632,9 @@ def main():
     # falling back to the legacy default.
     tls_host, tls_port = load_tls_config(base_path)
 
-    init_w = max(1, win.panda_container.width())
-    init_h = max(1, win.panda_container.height())
+    dpr = win.devicePixelRatio()
+    init_w = max(1, round(win.panda_container.width() * dpr))
+    init_h = max(1, round(win.panda_container.height() * dpr))
 
     # Resolve the graphics preset (saved choice, or auto-detected on first
     # run — "performance" on integrated Intel graphics, "ultra" otherwise).

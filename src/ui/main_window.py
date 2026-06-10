@@ -2657,8 +2657,9 @@ class MainWindow(QMainWindow):
     def _reposition_panda(self) -> None:
         if self.panda_app is None:
             return
-        w = max(1, self.panda_container.width())
-        h = max(1, self.panda_container.height())
+        dpr = self.devicePixelRatio()
+        w = max(1, round(self.panda_container.width() * dpr))
+        h = max(1, round(self.panda_container.height() * dpr))
         hwnd = self._panda_hwnd
         if hwnd:
             try:
