@@ -80,12 +80,117 @@ class DepthReconstructor:
     # 8-bit depth quantization. 0 = off; 1-3 = gentle. Only averages valid
     # (kept) neighbours, so it doesn't bleed across the mask boundary.
     SMOOTH_ITERS = 2
-    # Per-snapshot fill mask (<depth>-mask.png, RGBA). The mask is the ONLY
-    # thing that bounds the mesh: when USE_MASKS is on and a mask exists, the
-    # mesh covers exactly the masked pixels (alpha > MASK_ALPHA_MIN). When the
-    # mask is missing — or USE_MASKS is off — the WHOLE frame is reconstructed
-    # and nothing is culled.
-    USE_MASKS = True
+    # ==================================================================
+    # PIPELINE (mask-free). The reconstruction now runs as:
+    #   Stage 1  build the relief over the WHOLE frame, cutting off
+    #            over-long polygons (steep stretched triangles) and the
+    #            cells around them (LONGPOLY_*).
+    #   Stage 2  Boolean with the napolnitel (truck-body filler) mesh —
+    #            keep only the relief that sits INSIDE the truck body,
+    #            discarding all pile geometry spilling outside
+    #            (CLIP_TO_NAPOLNITEL).
+    #   Stage 3  (disabled by default) the legacy extrapolation + sealed-
+    #            solid Boolean DIFFERENCE + volume measurement. Flip
+    #            ENABLE_EXTRAPOLATION / ENABLE_VOLUME to restore it.
+    # ------------------------------------------------------------------
+    # Stage 1 — long-polygon cutoff. The relief is sampled on a grid that is
+    # uniform in SCREEN space, so each cell spans a world distance that grows
+    # with its distance from the camera. A grid edge is cut when it is too long
+    # by EITHER of two tests (whichever triggers):
+    #
+    #   • RELATIVE — edge_len / Z (forward distance) > LONGPOLY_MAX_EDGE_RATIO.
+    #     Scale-invariant: a smoothly sampled surface has edge_len/Z ≈ the
+    #     angular pixel pitch (constant at every depth), while a depth
+    #     discontinuity (silhouette / pile edge / wall) spikes well above it.
+    #     This catches stretched bridging triangles at ANY distance — including
+    #     near silhouettes whose edges are absolutely short. Lower = more
+    #     aggressive. None disables this test.
+    #
+    #   • ABSOLUTE — edge_len > LONGPOLY_MAX_EDGE_M metres. The relative test
+    #     alone permits edges up to ratio·Z, so on far geometry (large Z) it
+    #     tolerates absolutely huge polygons (e.g. 1.2 m at Z=10 m). This hard
+    #     cap bounds the world size of any kept polygon, so far objects don't
+    #     keep over-long triangles. Make it generous enough not to chew up
+    #     honest far surface but small enough to kill stretched ones. None
+    #     disables this test.
+    #
+    # The offending cell is dropped, and so is every cell within
+    # LONGPOLY_PROPAGATE_CELLS grid cells of it (Chebyshev radius) so the torn
+    # region is cleanly removed instead of leaving a jagged fringe (0 = drop
+    # only the offending cells). LONGPOLY_CUTOFF=False disables Stage 1.
+    LONGPOLY_CUTOFF = True
+    LONGPOLY_MAX_EDGE_RATIO = 0.15
+    LONGPOLY_MAX_EDGE_M = 0.30
+    LONGPOLY_PROPAGATE_CELLS = 1
+    # Final mesh cleanup (runs on the finished triangle mesh — after the
+    # truck-body Boolean and, if enabled, after extrapolation + volume, so it
+    # catches near-vertical walls no matter which stage created them; the
+    # volume number is computed before cleanup and is kept).
+    #
+    # STEEP cutoff: a triangle whose surface tilts more than STEEP_MAX_ANGLE_DEG
+    # from horizontal (|normal·Zup| < cos(angle)) is near-vertical — a candidate
+    # occlusion wall / silhouette artifact. Every such triangle, plus every
+    # triangle whose centroid lies within STEEP_REMOVE_RADIUS_M metres of one,
+    # is removed. The radius carves a clean margin around each strong drop.
+    # STEEP_CUTOFF=False or STEEP_MAX_ANGLE_DEG=None disables it.
+    #
+    # NEAR-WALL ONLY (STEEP_EDGE_ONLY): the angle-of-repose cut is applied ONLY
+    # within STEEP_NEAR_WALL_M metres of the nearest truck-body wall (the
+    # napolnitel side walls, measured as XY distance to the truck footprint
+    # perimeter). Steep faces there are occlusion artifacts where the load meets
+    # the bed side; a steep face farther INTO the load is a real feature (a
+    # ridge / crater wall) and is kept, so the cut never tears a chunk out of
+    # the middle of the pile. To avoid punching holes, only the steep faces that
+    # are connected (through other steep, near-wall faces) to an open mesh
+    # boundary are removed — the removed region always reaches the rim. A fully
+    # closed mesh (the volume solid, no open boundary) instead drops every
+    # near-wall steep face directly. Set STEEP_EDGE_ONLY=False to remove every
+    # steep face regardless of distance to the walls.
+    STEEP_CUTOFF = True
+    STEEP_MAX_ANGLE_DEG = 70.0
+    STEEP_REMOVE_RADIUS_M = 0.01
+    STEEP_EDGE_ONLY = True
+    STEEP_NEAR_WALL_M = 0.5
+    # Small-cluster removal: after the steep cut, drop every connected group of
+    # triangles whose world bounding box is smaller than MIN_CLUSTER_SIZE_M in
+    # its largest dimension — isolated specks left behind by the cutoffs. Set
+    # to 0/None to keep all clusters.
+    MIN_CLUSTER_SIZE_M = 1.00
+    # Stage 0 — background removal by flood fill. A depth map often has a big
+    # gray-ish area (sky / far wall above the truck) that isn't part of the
+    # load. A paint-bucket flood fill is seeded from the image border and
+    # grows across pixels whose 8-bit depth value stays within
+    # BG_FLOOD_THRESHOLD of the SEED (border) value — a FIXED-RANGE fill, so
+    # the flood stays in the gray/dark background and stops at the much
+    # brighter (nearer) truck instead of bleeding through its soft silhouette.
+    # Each disjoint border segment seeds its own fill, so backgrounds with
+    # several gray shades are all caught. Only flooded blobs covering at least
+    # BG_MIN_AREA_FRAC of the frame are treated as background — small fills
+    # (e.g. a seed landing on real geometry) are ignored. BG_SEED_BORDERS
+    # picks which edges to seed from ("top", "bottom", "left", "right").
+    # Set BG_FLOODFILL=False to disable.
+    BG_FLOODFILL = True
+    BG_FLOOD_THRESHOLD = 10         # 0..255 depth units, tolerance from seed
+    BG_MIN_AREA_FRAC = 0.02         # ignore flooded blobs smaller than this
+    BG_SEED_BORDERS = ("top",)      # edges to seed the flood from
+    # Stage 2 — clip the relief to the truck body. Every relief vertex is
+    # tested for containment in the closed napolnitel mesh (TONAR_OBJ_*,
+    # transform applied); a triangle survives only if all 3 of its corners
+    # are inside. This is the mask-free replacement for the old 2D fill
+    # mask: the truck-body solid bounds the mesh in 3D instead.
+    CLIP_TO_NAPOLNITEL = True
+    # Stage 3 — legacy extrapolation + sealed-solid Boolean DIFFERENCE +
+    # volume. Disabled for now; set both True to bring the old behaviour
+    # back (it rebuilds the geometry from the grid, see reconstruct()).
+    ENABLE_EXTRAPOLATION = False
+    ENABLE_VOLUME = ENABLE_EXTRAPOLATION
+    # ==================================================================
+    # Per-snapshot fill mask (<depth>-mask.png, RGBA). DISABLED by default
+    # now (USE_MASKS=False) — the truck-body Boolean (Stage 2) bounds the
+    # mesh instead. When turned back on and a mask exists, the mesh covers
+    # exactly the masked pixels (alpha > MASK_ALPHA_MIN); otherwise the
+    # WHOLE frame is reconstructed.
+    USE_MASKS = False
     MASK_SUFFIX = "-mask.png"
     MASK_ALPHA_MIN = 0.5
     # The mesh-cell rule keeps a cell only when all 4 of its corners are in the
@@ -181,9 +286,16 @@ class DepthReconstructor:
         [ 0.0,  1.0,  0.0, 0.0],
         [ 0.0,  0.0,  0.0, 1.0],
     ]
-    # Path to a local Blender 2.70 install used for the boolean step.
-    # Empty/None or a missing file disables clipping (the un-clipped
-    # extrapolated relief is kept). Timeout is in seconds.
+    # Boolean engine for the volume step (tonar − sealed_solid). "auto" uses
+    # the in-process manifold3d library when it's importable (fast, no external
+    # dependency) and only falls back to Blender if manifold3d is missing or
+    # rejects the input. "manifold" / "blender" force one engine. If the chosen
+    # engine(s) fail, Stage 3 still clips the extrapolated relief to the truck
+    # body with a point-in-mesh test so the geometry never overhangs the bed
+    # (only the volume number is then unavailable).
+    BOOLEAN_ENGINE = "auto"         # "auto" | "manifold" | "blender"
+    # Path to a local Blender 2.70 install used as the boolean fallback.
+    # Empty/None or a missing file disables the Blender path. Timeout in s.
     BLENDER_EXE = r"C:\Program Files\Blender Foundation\Blender\blender.exe"
     BLENDER_TIMEOUT_S = 120
     # --- Automatic reference-point search ----------------------------
@@ -687,7 +799,21 @@ class DepthReconstructor:
                       f"геометрические отсечения отключены.")
         else:
             inside = np.ones(FX.shape[0], dtype=bool)
-            self._log("Маски нет: реконструирую весь кадр без отсечений.")
+            # Flood-fill background removal: a large gray-ish region flooded
+            # from the image border (typically the sky/wall above the truck)
+            # is dropped before reconstruction. Grid nodes that sample a
+            # background pixel are marked out-of-region.
+            bg = self._detect_background(depth)
+            if bg is not None:
+                bg_node = bg[rows, cols]
+                n_bg = int(bg_node.sum())
+                inside = inside & (~bg_node)
+                self._log(
+                    f"Фон (заливка): отброшено {int(bg.sum())} пикс. "
+                    f"({bg.sum() / (H * W):.0%} кадра) → {n_bg} узлов сетки; "
+                    f"реконструирую остаток кадра.")
+            else:
+                self._log("Маски нет: реконструирую весь кадр без отсечений.")
 
         # Gentle smoothing of the (kept) grid depths to kill the 8-bit
         # quantization terracing before the surface is built.
@@ -708,55 +834,102 @@ class DepthReconstructor:
             verts[k, 1] = wp.y
             verts[k, 2] = wp.z
 
-        # Branch 1: extrapolate the masked relief to TARGET_SIZE_M via
-        #           mirror-tiling, producing a single rectangular mesh.
-        # Branch 2: keep the mask/whole-frame mesh (no geometric culling).
-        target_built = False
-        target_dims = None
-        if self.TARGET_SIZE_M is not None and bool(inside.any()):
-            ext = self._build_target_extrapolated(verts, inside, stride)
+        clip_volume = None
+
+        # ---- Stage 1: relief over the whole frame, cutting off over-long
+        #      polygons (relative to camera distance) and the cells around them.
+        if self.LONGPOLY_CUTOFF:
+            mr = (float("inf") if self.LONGPOLY_MAX_EDGE_RATIO is None
+                  else float(self.LONGPOLY_MAX_EDGE_RATIO))
+            me = (float("inf") if self.LONGPOLY_MAX_EDGE_M is None
+                  else float(self.LONGPOLY_MAX_EDGE_M))
+            long_prop = int(self.LONGPOLY_PROPAGATE_CELLS)
+        else:
+            mr, me, long_prop = float("inf"), float("inf"), 0
+        faces, dropped = self._build_grid_faces(
+            G, inside, verts, Z_grid, mr, long_prop, me)
+        self._log(
+            f"Срез длинных полигонов: edge/Z≤{mr:.3g} И edge≤{me:.3g} м "
+            f"(рад. {long_prop}) — отброшено {dropped} треугольников.")
+
+        if len(faces) == 0:
+            self._log("Нет ячеек для меша после среза длинных полигонов.")
+            self._finish(False, {})
+            return False
+
+        # ---- Stage 2: Boolean with the napolnitel mesh — keep only the relief
+        #      INSIDE the truck body, cut off everything outside. Runs BEFORE
+        #      extrapolation so the measured cloud (and the target rectangle
+        #      centred on it) is bounded to the truck, not the whole frame.
+        if self.CLIP_TO_NAPOLNITEL and len(faces) > 0:
+            res = self._clip_relief_to_body(verts, faces)
+            if res is not None:
+                verts, faces = res
+
+        if len(faces) == 0:
+            self._log("Нет ячеек для меша (всё отсечено наполнителем).")
+            self._finish(False, {})
+            return False
+
+        # ---- Stage 3 (optional): extrapolate the truck-bounded relief to
+        #      TARGET_SIZE_M, then (optional) seal + Boolean DIFFERENCE with the
+        #      napolnitel for a closed, measurable filler volume.
+        if self.ENABLE_EXTRAPOLATION and self.TARGET_SIZE_M is not None:
+            # Measured cloud = the vertices that survived Stages 1 & 2.
+            used = np.unique(np.asarray(faces).reshape(-1))
+            ext = self._build_target_extrapolated(verts[used])
             if ext is not None:
                 verts, faces, ext_info = ext
-                target_built = True
                 TX_m, TY_m = self.TARGET_SIZE_M
                 sw_m, sh_m = ext_info["src_size_m"]
                 tnx, tny = ext_info["target_grid"]
                 target_dims = (tnx, tny)
                 self._log(
-                    f"Экстраполяция: маска {sw_m:.2f}×{sh_m:.2f} м → цель "
-                    f"{TX_m:.1f}×{TY_m:.1f} м (mirror-tiling, сетка {tnx}×{tny}, "
-                    f"{ext_info['src_valid_cells']} валидных ячеек источника).")
+                    f"Экстраполяция: измеренная зона {sw_m:.2f}×{sh_m:.2f} м → "
+                    f"цель {TX_m:.1f}×{TY_m:.1f} м (mirror-tiling, сетка "
+                    f"{tnx}×{tny}, {ext_info['src_valid_cells']} валидных "
+                    f"ячеек источника).")
+                volume_done = False
+                if (self.ENABLE_VOLUME and self.TONAR_OBJ_REL_PATH):
+                    # Seal the relief into the empty space above it, then run
+                    # the Boolean DIFFERENCE tonar − sealed → the closed,
+                    # measurable filler volume below the relief.
+                    clip_res = self._clip_relief_to_target(
+                        verts, faces, target_dims)
+                    if clip_res is not None:
+                        verts, faces, clip_volume = clip_res
+                        volume_done = True
+                if not volume_done:
+                    # No volume mesh (volume off, or every boolean engine
+                    # failed): the extrapolated TARGET_SIZE_M rectangle still
+                    # overhangs the bed, so clip it to the truck body with the
+                    # point-in-mesh test. Guarantees the geometry is bounded by
+                    # the napolnitel even without a working boolean engine.
+                    res = self._clip_relief_to_body(verts, faces)
+                    if res is not None:
+                        verts, faces = res
+                        self._log("Объёмный boolean не выполнен — "
+                                  "экстраполированный рельеф обрезан по кузову "
+                                  "(point-in-mesh).")
+            else:
+                self._log("Экстраполяция: недостаточно данных — пропуск.")
 
-        if not target_built:
-            # Build triangles. No geometric culling: the region is fully defined
-            # by the mask (or the whole frame), so every cell whose 4 corners are
-            # in-region becomes 2 triangles (inf edge/vertical limits).
-            faces, _dropped = self._build_grid_faces(
-                G, inside, verts, float("inf"), float("inf"))
+        # ---- Final cleanup: strip near-vertical walls (with a metric removal
+        #      radius) and tiny disconnected clusters from the displayed mesh.
+        #      Runs last so it catches vertical faces from any stage; the volume
+        #      number was already computed above and is kept.
+        if (self.STEEP_CUTOFF or self.MIN_CLUSTER_SIZE_M) and len(faces) > 0:
+            verts, faces = self._cleanup_relief(verts, faces)
+
         if len(faces) == 0:
-            self._log("Нет ячеек для меша (маска пуста / регион вырожден).")
+            self._log("Нет ячеек для меша (регион вырожден / всё отсечено).")
             self._finish(False, {})
             return False
-        if target_built:
-            z_min = float(verts[:, 2].min())
-            z_max = float(verts[:, 2].max())
-        else:
-            z_min = float(Z_grid[inside].min())
-            z_max = float(Z_grid[inside].max())
 
-        # Seal the relief into a closed solid representing the empty space
-        # ABOVE the relief, then run Blender 2.70 boolean DIFFERENCE:
-        #   tonar_napolnitel − sealed_solid = part of the truck container
-        # BELOW the relief (the filler volume, closed and measurable). On
-        # any failure (no path / Blender missing / empty result) the
-        # un-clipped relief is kept silently.
-        clip_volume = None
-        if target_built and self.TONAR_OBJ_REL_PATH:
-            clip_res = self._clip_relief_to_target(verts, faces, target_dims)
-            if clip_res is not None:
-                verts, faces, clip_volume = clip_res
-                z_min = float(verts[:, 2].min())
-                z_max = float(verts[:, 2].max())
+        # Z extent of the vertices actually used by the surviving faces.
+        used = np.unique(np.asarray(faces).reshape(-1))
+        z_min = float(verts[used, 2].min())
+        z_max = float(verts[used, 2].max())
 
         # Vertex normals for proper lighting (computed from the grid mesh).
         normals = self._compute_normals(verts, faces)
@@ -1306,6 +1479,70 @@ class DepthReconstructor:
             self._log(f"Не удалось прочитать карту глубины: {exc}")
             return None
 
+    def _detect_background(self, depth):
+        """Detect a large gray-ish background region in the depth map via a
+        paint-bucket flood fill seeded from the image border(s). Returns an
+        HxW bool array (True = background, to exclude from reconstruction), or
+        None when the flood finds nothing big enough / the feature is off.
+
+        The flood grows across pixels whose 8-bit depth value stays within
+        BG_FLOOD_THRESHOLD of the SEED (border) value (cv2 FIXED range), so it
+        spreads over the gray/dark background but stops at the much brighter
+        (nearer) truck instead of bleeding through its soft silhouette. Only
+        flooded blobs covering >= BG_MIN_AREA_FRAC of the frame are kept, so a
+        seed that lands on real geometry (small fill) is ignored."""
+        if not self.BG_FLOODFILL:
+            return None
+        try:
+            import cv2
+        except Exception as exc:
+            self._log(f"Фон: OpenCV недоступен ({exc}) — фон не удаляю.")
+            return None
+
+        H, W = depth.shape
+        img = np.clip(depth * 255.0, 0.0, 255.0).astype(np.uint8)
+        thr = int(self.BG_FLOOD_THRESHOLD)
+        min_area = int(self.BG_MIN_AREA_FRAC * H * W)
+        # 8-connected, fixed range (compare to seed, not neighbour),
+        # mask-only (image left untouched), fill mask with 1.
+        flags = (8 | cv2.FLOODFILL_FIXED_RANGE
+                 | cv2.FLOODFILL_MASK_ONLY | (1 << 8))
+
+        # Seed pixels along each requested border edge.
+        seeds = []
+        borders = self.BG_SEED_BORDERS or ()
+        if "top" in borders:
+            seeds += [(c, 0) for c in range(W)]
+        if "bottom" in borders:
+            seeds += [(c, H - 1) for c in range(W)]
+        if "left" in borders:
+            seeds += [(0, r) for r in range(H)]
+        if "right" in borders:
+            seeds += [(W - 1, r) for r in range(H)]
+
+        bg = np.zeros((H, W), dtype=bool)
+        # Track every pixel any flood has already covered, so each disjoint
+        # border segment is flooded once (and we don't reflood the same blob).
+        seen = np.zeros((H, W), dtype=bool)
+        for (sx, sy) in seeds:
+            if seen[sy, sx]:
+                continue
+            m = np.zeros((H + 2, W + 2), dtype=np.uint8)
+            try:
+                cv2.floodFill(img, m, (int(sx), int(sy)), 0,
+                              (thr,) * 3, (thr,) * 3, flags)
+            except Exception as exc:
+                self._log(f"Фон: floodFill упал: {exc}")
+                return None
+            region = m[1:-1, 1:-1] > 0
+            seen |= region
+            if int(region.sum()) >= min_area:
+                bg |= region
+
+        if not bg.any():
+            return None
+        return bg
+
     def _mask_path(self) -> str:
         if not self._depth_path:
             return ""
@@ -1479,28 +1716,60 @@ class DepthReconstructor:
         return Zc
 
     @staticmethod
-    def _build_grid_faces(G, inside, verts, max_edge, max_vdrop):
-        """Vectorised grid triangulation. A cell becomes 2 triangles only if
-        all 4 corners are in-region AND, for every triangle edge, the 3D length
-        is <= max_edge AND the vertical (world +Z) drop is <= max_vdrop. Pass
-        max_edge=max_vdrop=inf to disable the geometric culling.
+    def _build_grid_faces(G, inside, verts, Zf, max_edge_ratio,
+                          propagate_cells=0, max_edge_m=float("inf")):
+        """Vectorised grid triangulation. A cell becomes 2 triangles only when
+        all 4 corners are in-region AND none of its edges is "too long". An edge
+        is too long when it fails EITHER test:
+
+          • RELATIVE — edge_len / Z (forward distance at the edge midpoint)
+            exceeds max_edge_ratio. Scale-invariant: a smoothly sampled surface
+            has edge_len/Z ≈ const (the angular pixel pitch) at every depth, so
+            this catches depth discontinuities (silhouettes / pile edges) at any
+            distance. Pass max_edge_ratio=inf to disable.
+          • ABSOLUTE — edge_len exceeds max_edge_m metres. Bounds the world size
+            of any kept polygon so far geometry (large Z, where the relative
+            test alone tolerates edges up to ratio·Z) doesn't keep over-long
+            triangles. Pass max_edge_m=inf to disable.
+
+        (Near-vertical / steep faces and tiny disconnected clusters are removed
+        afterwards by _cleanup_relief, which works on the final triangle mesh
+        with a metric radius — see that method.)
+
+        Zf is the per-node forward distance from the camera (the calibrated
+        depth Z that the verts were unprojected from), same length as verts.
+
+        propagate_cells > 0 grows the set of cut cells outward by that many
+        grid cells (Chebyshev radius) before triangulating, so the torn region
+        around a long polygon is removed cleanly instead of leaving a jagged
+        fringe.
 
         Returns (faces (T,3) int64, dropped_count)."""
         stride = G + 1
         V = verts.reshape(stride, stride, 3)
         ins = inside.reshape(stride, stride)
+        Z = np.asarray(Zf, dtype=np.float64).reshape(stride, stride)
+        # Forward distance at each edge midpoint (clamped away from 0 so the
+        # ratio stays finite for samples that landed near the camera plane).
+        eps = 1e-3
+        ZmH = np.maximum(0.5 * (Z[:, 1:] + Z[:, :-1]), eps)    # (stride, G)
+        ZmV = np.maximum(0.5 * (Z[1:, :] + Z[:-1, :]), eps)    # (G, stride)
+        ZmD = np.maximum(0.5 * (Z[1:, 1:] + Z[:-1, :-1]), eps)  # (G, G)
 
-        # Edge vectors between neighbouring grid vertices.
+        # Edge vectors between neighbouring grid vertices, and their 3D lengths.
         eH = V[:, 1:, :] - V[:, :-1, :]    # (stride, G, 3) horizontal
         eV = V[1:, :, :] - V[:-1, :, :]    # (G, stride, 3) vertical
         eD = V[1:, 1:, :] - V[:-1, :-1, :]  # (G, G, 3) diagonal
-        me = float(max_edge)
-        mv = float(max_vdrop)
+        lH = np.linalg.norm(eH, axis=2)
+        lV = np.linalg.norm(eV, axis=2)
+        lD = np.linalg.norm(eD, axis=2)
+        mr = float(max_edge_ratio)
+        me = float(max_edge_m)
 
-        # Per-edge acceptance: short enough AND not too vertical.
-        okH = (np.linalg.norm(eH, axis=2) <= me) & (np.abs(eH[..., 2]) <= mv)
-        okV = (np.linalg.norm(eV, axis=2) <= me) & (np.abs(eV[..., 2]) <= mv)
-        okD = (np.linalg.norm(eD, axis=2) <= me) & (np.abs(eD[..., 2]) <= mv)
+        # Per-edge: short enough RELATIVE to distance AND under the ABSOLUTE cap.
+        okH = ((lH / ZmH) <= mr) & (lH <= me)
+        okV = ((lV / ZmV) <= mr) & (lV <= me)
+        okD = ((lD / ZmD) <= mr) & (lD <= me)
 
         ti = np.arange(G)[:, None]
         si = np.arange(G)[None, :]
@@ -1512,27 +1781,307 @@ class DepthReconstructor:
         cell_in = (ins[:-1, :-1] & ins[:-1, 1:] &
                    ins[1:, :-1] & ins[1:, 1:])    # (G, G)
 
-        # Triangle 1 (a,b,d): edges a-b, b-d, a-d.
-        t1 = cell_in & okH[:-1, :] & okV[:, 1:] & okD
-        # Triangle 2 (a,d,c): edges a-d, d-c, a-c.
-        t2 = cell_in & okD & okH[1:, :] & okV[:, :-1]
+        # A cell is "good" only when all five of its edges (4 sides + the
+        # shared diagonal) pass the length test.
+        cell_ok = (okH[:-1, :] & okH[1:, :] &
+                   okV[:, :-1] & okV[:, 1:] & okD)
+        bad = cell_in & (~cell_ok)
+        if propagate_cells and int(propagate_cells) > 0 and bad.any():
+            bad = DepthReconstructor._dilate_grid_mask(bad, int(propagate_cells))
+        keep = cell_in & (~bad)       # (G, G)
 
-        f1 = np.stack([a[t1], b[t1], d[t1]], axis=1) if t1.any() \
-            else np.zeros((0, 3), np.int64)
-        f2 = np.stack([a[t2], d[t2], c[t2]], axis=1) if t2.any() \
-            else np.zeros((0, 3), np.int64)
-        faces = np.concatenate([f1, f2], axis=0).astype(np.int64)
+        if keep.any():
+            f1 = np.stack([a[keep], b[keep], d[keep]], axis=1)
+            f2 = np.stack([a[keep], d[keep], c[keep]], axis=1)
+            faces = np.concatenate([f1, f2], axis=0).astype(np.int64)
+        else:
+            faces = np.zeros((0, 3), np.int64)
 
-        # In-region triangles rejected (by edge length or verticality).
+        # In-region triangles dropped (by cutoff + propagation).
         dropped = int(2 * int(cell_in.sum()) - faces.shape[0])
         return faces, dropped
 
     # ------------------------------------------------------------------
+    # Final mesh cleanup: steep-face removal + small-cluster removal
+    # ------------------------------------------------------------------
+    def _cleanup_relief(self, verts, faces):
+        """Remove near-vertical faces and tiny disconnected clusters from a
+        finished triangle mesh.
+
+          1. STEEP cut: a triangle whose surface tilts more than
+             STEEP_MAX_ANGLE_DEG from horizontal (|n·Zup| < cos(angle)) is
+             removed, together with every triangle whose centroid is within
+             STEEP_REMOVE_RADIUS_M metres of a steep one (a metric removal
+             radius around each strong drop).
+          2. CLUSTER cut: of what remains, every connected group of triangles
+             whose world bounding box is smaller than MIN_CLUSTER_SIZE_M in its
+             largest dimension is dropped.
+
+        Operates on the final mesh (after the truck-body Boolean and, when
+        enabled, after extrapolation/volume), so it catches vertical walls
+        regardless of which stage produced them. Returns (verts, faces)
+        re-indexed onto the surviving triangles."""
+        verts = np.asarray(verts, dtype=np.float64)
+        faces = np.asarray(faces, dtype=np.int64)
+        if faces.shape[0] == 0:
+            return verts, faces
+        n0 = faces.shape[0]
+
+        # --- 1. steep faces (per-triangle normal) ---
+        if self.STEEP_CUTOFF and self.STEEP_MAX_ANGLE_DEG is not None:
+            v0 = verts[faces[:, 0]]
+            v1 = verts[faces[:, 1]]
+            v2 = verts[faces[:, 2]]
+            nrm = np.cross(v1 - v0, v2 - v0)
+            ln = np.linalg.norm(nrm, axis=1)
+            nz = np.where(ln > 1e-12, np.abs(nrm[:, 2]) / np.maximum(ln, 1e-12),
+                          1.0)
+            cos_t = math.cos(math.radians(float(self.STEEP_MAX_ANGLE_DEG)))
+            steep = nz < cos_t
+            cent = (v0 + v1 + v2) / 3.0
+
+            # Optional metric margin: grow the steep set to faces within
+            # STEEP_REMOVE_RADIUS_M of a steep one, so the cut keeps a clean
+            # border around each strong drop.
+            def _grow(mask):
+                radius = float(self.STEEP_REMOVE_RADIUS_M or 0.0)
+                if radius > 0.0 and mask.any() and (~mask).any():
+                    try:
+                        from scipy.spatial import cKDTree
+                        near = cKDTree(cent[mask]).query_ball_point(
+                            cent, r=radius)
+                        return np.fromiter((len(x) > 0 for x in near),
+                                           dtype=bool, count=len(near))
+                    except Exception as exc:
+                        self._log(f"Очистка: радиус среза недоступен ({exc}).")
+                return mask
+
+            edge_only = bool(getattr(self, "STEEP_EDGE_ONLY", True))
+            if not edge_only:
+                # Remove every steep face (+ margin), regardless of position.
+                steep = _grow(steep)
+                faces = faces[~steep]
+                self._log(
+                    f"Очистка: удалено {int(steep.sum())} крутых граней "
+                    f"(>{float(self.STEEP_MAX_ANGLE_DEG):g}°, без ограничения "
+                    f"по борту).")
+            elif steep.any():
+                # Near-wall only: "removable" = steep (grown by the margin) AND
+                # within STEEP_NEAR_WALL_M of the nearest truck-body wall (XY
+                # distance to the napolnitel footprint perimeter). A steep face
+                # farther into the load is a real feature and is kept.
+                removable = _grow(steep)
+                near = float(getattr(self, "STEEP_NEAR_WALL_M", 0.5) or 0.0)
+                poly = self._truck_wall_footprint()
+                if poly is None:
+                    self._log("Очистка: борт кузова (napolnitel) не найден — "
+                              "ограничение по борту пропущено.")
+                elif near > 0.0 and removable.any():
+                    try:
+                        dw = self._dist_point_to_polygon_edges(
+                            cent[:, :2], poly)
+                        removable = removable & (dw <= near)
+                    except Exception as exc:
+                        self._log(f"Очистка: расстояние до борта "
+                                  f"недоступно ({exc}).")
+                # Avoid punching internal holes: on an OPEN mesh keep only the
+                # removable faces connected (through other removable faces) to
+                # an open boundary, so the removed region always reaches the
+                # rim. A CLOSED mesh (volume solid) has no open boundary — there
+                # the near-wall steep faces are the perimeter walls, drop them
+                # directly.
+                bface = self._boundary_faces(faces)
+                if bface.any():
+                    remove = self._flood_faces_to_boundary(
+                        faces, removable, bface)
+                else:
+                    remove = removable
+                faces = faces[~remove]
+                self._log(
+                    f"Очистка: срез откоса в {near:g} м от борта — удалено "
+                    f"{int(remove.sum())} граней (без внутренних дыр).")
+            if faces.shape[0] == 0:
+                self._log("Очистка: после среза вертикалей не осталось граней.")
+                return verts, faces
+
+        # --- 2. thin / small disconnected clusters ---
+        # A cluster is judged by its WIDTH — the narrowest extent of its XY
+        # footprint (minor principal axis). Using the width, not the longest
+        # span, removes both compact specks AND long-thin slivers (which are
+        # long but narrow, so the old max-span test let them through), while
+        # keeping the genuinely large main area (wide in both axes).
+        min_c = float(self.MIN_CLUSTER_SIZE_M or 0.0)
+        if min_c > 0.0 and faces.shape[0] > 0 and trimesh is not None:
+            try:
+                import trimesh as tm
+                mesh = tm.Trimesh(vertices=verts, faces=faces, process=False)
+                adj = mesh.face_adjacency
+                labels = tm.graph.connected_component_labels(
+                    adj, node_count=faces.shape[0])
+                keep = np.ones(faces.shape[0], dtype=bool)
+                for lab in np.unique(labels):
+                    sel = labels == lab
+                    pts = verts[np.unique(faces[sel].reshape(-1))]
+                    if self._cluster_width_xy(pts) < min_c:
+                        keep[sel] = False
+                faces = faces[keep]
+            except Exception as exc:
+                self._log(f"Очистка: удаление кластеров пропущено ({exc}).")
+
+        if faces.shape[0] == 0:
+            return verts, faces
+        # Re-index onto the surviving vertices.
+        used = np.unique(faces.reshape(-1))
+        remap = np.full(verts.shape[0], -1, dtype=np.int64)
+        remap[used] = np.arange(used.shape[0])
+        new_verts = verts[used]
+        new_faces = remap[faces]
+        if new_faces.shape[0] != n0:
+            ang = self.STEEP_MAX_ANGLE_DEG
+            ang_s = "off" if (not self.STEEP_CUTOFF or ang is None) \
+                else f">{float(ang):g}°"
+            self._log(
+                f"Очистка рельефа: грани {n0} → {new_faces.shape[0]} "
+                f"(вертикали {ang_s}, узкие/мелкие кластеры <{min_c:g} м).")
+        return new_verts, new_faces
+
+    @staticmethod
+    def _boundary_faces(faces):
+        """Bool mask of faces that own at least one OPEN (naked) edge — an edge
+        used by a single triangle. These sit on the outer perimeter or a hole
+        rim. A fully closed mesh returns an all-False mask."""
+        f = np.asarray(faces, dtype=np.int64)
+        nf = f.shape[0]
+        if nf == 0:
+            return np.zeros(0, dtype=bool)
+        e = np.sort(np.concatenate(
+            [f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], axis=0), axis=1)
+        # Edges are stacked [all e01; all e12; all e20], so edge-row k belongs
+        # to face k % nf  →  tile, not repeat.
+        face_of = np.tile(np.arange(nf), 3)
+        _, inv, cnt = np.unique(e, axis=0, return_inverse=True,
+                                return_counts=True)
+        naked = cnt[inv] == 1
+        bf = np.zeros(nf, dtype=bool)
+        np.logical_or.at(bf, face_of, naked)
+        return bf
+
+    @staticmethod
+    def _flood_faces_to_boundary(faces, removable, boundary_face):
+        """Of the `removable` faces, return the mask of those connected —
+        through other removable faces, across shared edges — to an open-boundary
+        face. Removing exactly these never opens an internal hole, because the
+        removed region always reaches the mesh edge; an isolated removable speck
+        sitting inside the surface is left in place. Pure numpy + scipy."""
+        f = np.asarray(faces, dtype=np.int64)
+        nf = f.shape[0]
+        rem = np.asarray(removable, dtype=bool)
+        seed = rem & np.asarray(boundary_face, dtype=bool)
+        if nf == 0 or not seed.any():
+            return np.zeros(nf, dtype=bool)
+        # Face adjacency: two faces are adjacent when they share an edge, found
+        # as identical consecutive rows in the lexicographically sorted edge
+        # list.
+        e = np.sort(np.concatenate(
+            [f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], axis=0), axis=1)
+        # Edge-row k belongs to face k % nf (edges stacked by type, see above).
+        face_of = np.tile(np.arange(nf), 3)
+        order = np.lexsort((e[:, 1], e[:, 0]))
+        e_s = e[order]
+        fo_s = face_of[order]
+        same = np.all(e_s[1:] == e_s[:-1], axis=1)
+        a = fo_s[:-1][same]
+        b = fo_s[1:][same]
+        # Keep only removable–removable adjacency, so the flood can't cross a
+        # kept (non-removable) face.
+        m = rem[a] & rem[b]
+        a, b = a[m], b[m]
+        try:
+            from scipy.sparse import csr_matrix
+            from scipy.sparse.csgraph import connected_components
+            ij = (np.concatenate([a, b]), np.concatenate([b, a]))
+            M = csr_matrix((np.ones(ij[0].size), ij), shape=(nf, nf))
+            _, labels = connected_components(M, directed=False)
+            seed_labels = np.unique(labels[seed])
+            return rem & np.isin(labels, seed_labels)
+        except Exception:
+            # Fallback: remove just the boundary-touching removable faces.
+            return seed
+
+    def _truck_wall_footprint(self):
+        """XY footprint polygon of the truck body (napolnitel) — the convex
+        hull of its vertices projected to the ground plane, i.e. the outline of
+        the bed walls. Cached on the instance (the truck is fixed per session).
+        Returns an (M,2) array of ordered polygon vertices, or None."""
+        cached = getattr(self, "_wall_footprint_xy", None)
+        if cached is not None:
+            return cached
+        loaded = self._load_tonar_obj()
+        if loaded is None:
+            return None
+        tv, _ = loaded
+        xy = np.asarray(tv, dtype=np.float64)[:, :2]
+        if xy.shape[0] < 3:
+            return None
+        try:
+            from scipy.spatial import ConvexHull
+            poly = xy[ConvexHull(xy).vertices]
+        except Exception:
+            mn = xy.min(axis=0)
+            mx = xy.max(axis=0)
+            poly = np.array([[mn[0], mn[1]], [mx[0], mn[1]],
+                             [mx[0], mx[1]], [mn[0], mx[1]]])
+        self._wall_footprint_xy = poly
+        return poly
+
+    @staticmethod
+    def _dist_point_to_polygon_edges(pts_xy, poly):
+        """Unsigned distance from each XY point to the nearest edge segment of
+        a closed polygon (its perimeter = the truck walls). Vectorised over
+        points × polygon edges. Returns (N,) distances in metres."""
+        P = np.asarray(pts_xy, dtype=np.float64)            # (N,2)
+        A = np.asarray(poly, dtype=np.float64)              # (M,2)
+        B = np.roll(A, -1, axis=0)                          # (M,2) next vertex
+        AB = B - A                                          # (M,2)
+        ab2 = np.maximum(np.einsum("ij,ij->i", AB, AB), 1e-12)  # (M,)
+        AP = P[:, None, :] - A[None, :, :]                  # (N,M,2)
+        t = np.clip(np.einsum("nmj,mj->nm", AP, AB) / ab2[None, :], 0.0, 1.0)
+        proj = A[None, :, :] + t[:, :, None] * AB[None, :, :]  # (N,M,2)
+        d = np.linalg.norm(P[:, None, :] - proj, axis=2)    # (N,M)
+        return d.min(axis=1)
+
+    @staticmethod
+    def _cluster_width_xy(pts):
+        """Width of a point cluster = the narrowest extent of its XY footprint,
+        measured along the cluster's own principal axes (PCA), so orientation
+        doesn't matter. A long-thin sliver has a small width even though it is
+        long; a compact speck is small in both axes; the main load area is wide
+        in both. Returns the minor-axis extent in metres (0 for <2 points)."""
+        xy = np.asarray(pts, dtype=np.float64)[:, :2]
+        if xy.shape[0] < 2:
+            return 0.0
+        c = xy - xy.mean(axis=0)
+        try:
+            # Right singular vectors = principal axes of the 2D footprint.
+            _, _, vt = np.linalg.svd(c, full_matrices=False)
+            proj = c @ vt.T                     # coords along principal axes
+            ext = proj.max(axis=0) - proj.min(axis=0)
+        except Exception:
+            # Fallback: axis-aligned minor extent.
+            ext = c.max(axis=0) - c.min(axis=0)
+        return float(ext.min())
+
+    # ------------------------------------------------------------------
     # Gradient-aware extrapolation with mirror-tiled texture
     # ------------------------------------------------------------------
-    def _build_target_extrapolated(self, verts_in, inside, stride):
-        """Extend the masked relief to a TARGET_SIZE_M axis-aligned rectangle.
-        Inside the mask: original measurements preserved verbatim. Outside:
+    def _build_target_extrapolated(self, valid_xyz):
+        """Extend the measured relief to a TARGET_SIZE_M axis-aligned rectangle.
+        `valid_xyz` is the (M,3) cloud of measured world points (after Stage 1
+        cutoff + Stage 2 truck-body clip), so the source bbox is bounded to the
+        truck and the target rectangle is centred on the real load — NOT on the
+        whole frame.
+        Inside the measured region: original measurements preserved verbatim.
+        Outside:
         each cell's Z is set by
 
             Z(out) = Z(nearest in-mask seed)
@@ -1561,7 +2110,7 @@ class DepthReconstructor:
         TX_m, TY_m = (float(v) for v in self.TARGET_SIZE_M)
         if TX_m <= 0.0 or TY_m <= 0.0:
             return None
-        valid_xyz = verts_in[inside]
+        valid_xyz = np.asarray(valid_xyz, dtype=np.float64)
         if valid_xyz.shape[0] < 10:
             return None
         sxmin = float(valid_xyz[:, 0].min())
@@ -1977,6 +2526,79 @@ class DepthReconstructor:
                 self._log(f"TONAR_OBJ_TRANSFORM некорректен: {exc} — игнорирую.")
         return verts.astype(np.float32), faces
 
+    def _clip_relief_to_body(self, relief_verts, relief_faces):
+        """Stage 2 — clip the relief to the truck body via a Boolean with the
+        napolnitel (filler) mesh. The napolnitel OBJ is a closed solid that
+        fills the inside of the truck body; we keep only the relief that lies
+        INSIDE it and discard every triangle that spills outside (the pile
+        geometry beyond the bed).
+
+        Each relief vertex is point-in-mesh tested against the napolnitel
+        solid; a triangle survives only when all 3 of its corners are inside.
+        Surviving faces are re-indexed onto the vertices they actually use.
+        Returns (verts (N,3) float64, faces (M,3) int64) or None on any
+        failure (no OBJ / non-watertight mesh / containment unavailable), in
+        which case the caller keeps the un-clipped relief.
+        """
+        loaded = self._load_tonar_obj()
+        if loaded is None:
+            return None
+        t_verts, t_faces = loaded
+        t_verts = np.asarray(t_verts, dtype=np.float64)
+        t_faces = np.asarray(t_faces, dtype=np.int64)
+
+        # Translucent overlay so the user sees the body the relief is cut to.
+        try:
+            if self._tonar_debug_node is not None:
+                try:
+                    self._tonar_debug_node.remove_node()
+                except Exception:
+                    pass
+                self._tonar_debug_node = None
+            self._tonar_debug_node = self._build_tonar_debug_mesh(
+                t_verts, t_faces)
+        except Exception as exc:
+            self._log(f"tonar overlay build failed: {exc}")
+
+        try:
+            body = trimesh.Trimesh(vertices=t_verts, faces=t_faces,
+                                   process=False)
+        except Exception as exc:
+            self._log(f"Клиппинг по кузову: не удалось собрать napolnitel: "
+                      f"{exc}")
+            return None
+        if not body.is_watertight:
+            self._log("Клиппинг по кузову: napolnitel не водонепроницаем — "
+                      "point-in-mesh может быть неточным.")
+
+        rv = np.asarray(relief_verts, dtype=np.float64)
+        rf = np.asarray(relief_faces, dtype=np.int64)
+        try:
+            inside_v = body.contains(rv)               # (N,) bool
+        except Exception as exc:
+            self._log(f"Клиппинг по кузову: contains() упал: {exc} — "
+                      f"оставляю необрезанный рельеф.")
+            return None
+
+        face_in = inside_v[rf].all(axis=1)             # all 3 corners inside
+        kept = rf[face_in]
+        if kept.shape[0] == 0:
+            self._log("Клиппинг по кузову: внутри napolnitel не осталось "
+                      "треугольников — оставляю необрезанный рельеф.")
+            return None
+
+        # Re-index onto the surviving vertices to drop the orphans.
+        used = np.unique(kept.reshape(-1))
+        remap = np.full(rv.shape[0], -1, dtype=np.int64)
+        remap[used] = np.arange(used.shape[0])
+        new_verts = rv[used]
+        new_faces = remap[kept]
+        self._log(
+            f"Клиппинг по кузову (napolnitel): оставлено "
+            f"{new_faces.shape[0]}/{rf.shape[0]} тр., "
+            f"{new_verts.shape[0]} верш. — отсечена геометрия вне кузова.")
+        return new_verts, new_faces
+
     def _clip_relief_to_target(self, relief_verts, relief_faces, grid_dims):
         """Turn the open rectangular relief heightfield into the closed
         FILLER VOLUME inside tonar_napolnitel via a headless Blender 2.70
@@ -2039,17 +2661,95 @@ class DepthReconstructor:
             f"Sealed solid: {sealed_v.shape[0]} верш., {sealed_f.shape[0]} тр. "
             f"(сетка {tnx}×{tny}, z_high={z_high:.2f}).")
 
-        res = self._blender_boolean(
+        res = self._mesh_boolean(
             t_verts, t_faces, sealed_v, sealed_f, operation="DIFFERENCE")
         if res is None:
             return None
-        new_verts, new_faces = res
+        new_verts, new_faces, engine = res
         vol = self._mesh_volume(new_verts, new_faces)
         self._log(
-            f"Blender boolean DIFFERENCE: tonar − sealed = "
+            f"Boolean DIFFERENCE ({engine}): tonar − sealed = "
             f"{new_verts.shape[0]} верш., {new_faces.shape[0]} тр.; "
             f"объём ≈ {vol:.3f} м³.")
         return new_verts, new_faces, float(vol)
+
+    # ------------------------------------------------------------------
+    # Boolean engine dispatch (manifold3d in-process, Blender fallback)
+    # ------------------------------------------------------------------
+    def _mesh_boolean(self, verts_a, faces_a, verts_b, faces_b,
+                      operation="DIFFERENCE"):
+        """Run a CSG boolean A∘B and return (verts, faces, engine_name) or
+        None. Honours BOOLEAN_ENGINE: "auto" tries the in-process manifold3d
+        engine first and only falls back to Blender if it is missing/fails;
+        "manifold" / "blender" force one engine. No external process is needed
+        for the manifold path, so the volume step works without a Blender
+        install."""
+        engine = str(getattr(self, "BOOLEAN_ENGINE", "auto")).lower()
+        order = {"auto": ("manifold", "blender"),
+                 "manifold": ("manifold",),
+                 "blender": ("blender",)}.get(engine, ("manifold", "blender"))
+        for eng in order:
+            if eng == "manifold":
+                r = self._manifold_boolean(
+                    verts_a, faces_a, verts_b, faces_b, operation)
+                if r is not None:
+                    return r[0], r[1], "manifold3d"
+            elif eng == "blender":
+                r = self._blender_boolean(
+                    verts_a, faces_a, verts_b, faces_b, operation)
+                if r is not None:
+                    return r[0], r[1], "blender"
+        return None
+
+    def _manifold_boolean(self, verts_a, faces_a, verts_b, faces_b,
+                          operation="DIFFERENCE"):
+        """In-process CSG boolean via manifold3d. `operation` is
+        DIFFERENCE / INTERSECT / UNION. Returns (verts (N,3) float64,
+        faces (M,3) int64) in world coords, or None if manifold3d is missing,
+        an operand isn't a valid 2-manifold, or the result is empty."""
+        try:
+            import manifold3d as m3d
+        except Exception as exc:
+            self._log(f"manifold3d недоступен ({exc}) — пробую Blender.")
+            return None
+
+        def _to_manifold(V, F):
+            mesh = m3d.Mesh(
+                vert_properties=np.asarray(V, dtype=np.float32),
+                tri_verts=np.asarray(F, dtype=np.uint32))
+            man = m3d.Manifold(mesh)
+            return man
+
+        try:
+            Ma = _to_manifold(verts_a, faces_a)
+            Mb = _to_manifold(verts_b, faces_b)
+            # An invalid (non-manifold) operand yields an empty Manifold.
+            if Ma.is_empty() or Mb.is_empty():
+                self._log("manifold3d: операнд не 2-многообразие "
+                          "(empty Manifold) — fallback на Blender.")
+                return None
+            op = str(operation).upper()
+            if op == "DIFFERENCE":
+                R = Ma - Mb
+            elif op == "INTERSECT":
+                R = Ma ^ Mb
+            elif op == "UNION":
+                R = Ma + Mb
+            else:
+                self._log(f"manifold3d: неизвестная операция {operation}.")
+                return None
+            if R.is_empty():
+                self._log("manifold3d: результат пуст — fallback на Blender.")
+                return None
+            msh = R.to_mesh()
+            rv = np.asarray(msh.vert_properties, dtype=np.float64)[:, :3]
+            rf = np.asarray(msh.tri_verts, dtype=np.int64)
+            if rv.shape[0] == 0 or rf.shape[0] == 0:
+                return None
+            return rv, rf
+        except Exception as exc:
+            self._log(f"manifold3d boolean упал: {exc} — fallback на Blender.")
+            return None
 
     # ------------------------------------------------------------------
     # Sealed-solid construction

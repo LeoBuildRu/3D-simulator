@@ -5,7 +5,7 @@ import traceback
 # Если приложение скомпилировано, базовый путь — каталог с exe,
 # иначе — текущая директория (для разработки)
 if getattr(sys, 'frozen', False):
-    base_path = os.path.dirname(sys.executable)
+    base_path = os.path.dirname(sys.exefcutable)
 else:
     base_path = os.path.dirname(os.path.abspath(__file__))
 
