@@ -50,7 +50,7 @@ except ImportError:                       # pragma: no cover
 from panda3d.core import (
     CollisionTraverser, CollisionHandlerQueue, CollisionNode, CollisionRay,
     CollisionPolygon, GeomNode, GeomVertexReader, Point2, Point3, LPoint3,
-    Vec3, Material, BitMask32,
+    Vec3, Material, BitMask32, TransparencyAttrib,
     GeomVertexFormat, GeomVertexData, Geom, GeomTriangles, GeomVertexWriter,
 )
 
@@ -94,6 +94,98 @@ class DepthReconstructor:
     # sampled mask by this many cells first so the surface reaches the true
     # mask edge instead of being trimmed short. 0 = off.
     MASK_DILATE_CELLS = 1
+    # Extrapolation: after the masked relief is built, extend it to a fixed
+    # axis-aligned rectangle in world XY (metres) by mirror-tiling the
+    # pattern outside the mask's XY bbox. The trend (plane fit) is added
+    # back so the seam stays C0-continuous. Set to None to disable and
+    # keep the original mask-only mesh.
+    TARGET_SIZE_M = (3.0, 6.0)  # XY-прямоугольник (м), покрывает MAZ ≈ 2.14×5.10
+    # Density of the target grid (vertices per metre along X and Y).
+    TARGET_RES_PER_M = 25
+    # Light smoothing of the target grid AFTER extrapolation (mask data is
+    # preserved — only extrapolated cells are smoothed). 0 = off.
+    TARGET_SMOOTH_ITERS = 0  # сглаживание целевой сетки временно отключено
+    # Outside the mask the relief descends. The descent rate at each external
+    # cell is the steeper of two contenders:
+    #   • the LOCAL OUTWARD GRADIENT at the nearest in-mask boundary cell —
+    #     captures how fast the visible face was already dropping. A steep
+    #     pile face that faces the front wall of the truck keeps falling at
+    #     its observed angle until it hits the floor (no plateau, no fake
+    #     "second pile").
+    #   • tan(EXTRAP_ANGLE_DEG) — angle-of-repose fallback for cases where
+    #     the boundary gradient is flat or rising (e.g. behind a hidden
+    #     peak), so the relief still drops at a natural granular slope
+    #     instead of plateauing.
+    # 30-45° covers most granular materials; the gradient takes over when
+    # the visible face is steeper than this.
+    EXTRAP_ANGLE_DEG = 35.0
+    # Hard cap on the descent rate so a noisy one-sided boundary gradient
+    # can't blow up Z to nonsense values. Vertical = 90° → tan=∞; capping
+    # at 75° keeps even single-pixel artifacts bounded.
+    EXTRAP_MAX_ANGLE_DEG = 75.0
+    # Floor for the extrapolated relief: external cells are clipped at
+    # min(visible Z) − EXTRAP_FLOOR_FROM_MIN_M. None (default) → no clamp;
+    # the MAZ Boolean bounds the volume from below. A value here can
+    # introduce a "tent" plateau when the visible mask only shows the top
+    # of the pile (so min(visible Z) is well above the actual truck floor)
+    # — keep at None unless you have a reason to clip earlier than the
+    # Boolean.
+    EXTRAP_FLOOR_FROM_MIN_M = None
+    # Optional absolute Z floor (metres). Takes effect when
+    # EXTRAP_FLOOR_FROM_MIN_M is None — useful when you know the truck
+    # floor in world Z.
+    EXTRAP_FLOOR_M = None
+    # Residual texture preservation: the visible relief's high-frequency
+    # variation (original Z minus its smoothed trend) is mirror-tiled onto
+    # the extrapolated area so the hidden back side keeps the look of the
+    # visible front, instead of being a featureless smooth slope. Weight
+    # 0 = pure descent (smooth), 1 = full mirror-residual amplitude.
+    EXTRAP_TEXTURE_WEIGHT = 0.7
+    # Exponential decay scale (metres) of the texture amplitude with
+    # distance from the mask. Cells right next to the mask boundary get
+    # almost the full residual; cells far away fade smoothly to the pure
+    # descent baseline. exp(−d / decay).
+    EXTRAP_TEXTURE_DECAY_M = 1.5
+    # Smoothing iterations used to extract the low-frequency trend from
+    # the in-mask field (residual = original − trend). Heavier smoothing
+    # makes the residual capture only fine texture; lighter smoothing
+    # keeps medium-scale features.
+    EXTRAP_TEXTURE_SMOOTH_ITERS = 10
+    # ------------------------------------------------------------------
+    # Clipping the extrapolated relief into the truck filler volume.
+    # After the rectangular relief is built, a headless Blender 2.70
+    # instance is invoked: the relief is sealed into a closed solid
+    # representing the empty space ABOVE it (floor = heightfield,
+    # ceiling = flat plane above tonar, walls = perimeter), and a
+    # Boolean DIFFERENCE is applied: tonar_napolnitel − sealed_solid.
+    # The result is a closed manifold of the part of the container BELOW
+    # the relief — the filler whose volume can be measured directly via
+    # the divergence-theorem formula. This mirrors the server's
+    # mesh_reconstruction.cpp + boolean_operations.cpp pipeline.
+    # TONAR_OBJ_REL_PATH is resolved relative to the project root;
+    # empty/None disables the step (the un-clipped open relief is kept).
+    #
+    # NOTE: both meshes are sent in their native coordinates. If the OBJ is
+    # in a different frame than the Panda render world (e.g. Y-up vs Z-up),
+    # set TONAR_OBJ_TRANSFORM to a 4×4 numpy matrix that maps OBJ-local
+    # coords into world coords before sending. None = identity.
+    TONAR_OBJ_REL_PATH = "assets/height_examples/stand/MAZ_napolnitel.obj"
+    # tonar_napolnitel.obj is exported Y-up (Blender convention); Panda is
+    # Z-up. Composed transform: Y↔Z swap (Y-up → Z-up), then R_z(180°) to
+    # flip the truck's front/back. Net mapping: (x, y, z) → (−x, −z, y).
+    # Set to None to skip any transform, or override at runtime for a
+    # different alignment.
+    TONAR_OBJ_TRANSFORM = [
+        [-1.0,  0.0,  0.0, 0.0],
+        [ 0.0,  0.0, -1.0, 0.0],
+        [ 0.0,  1.0,  0.0, 0.0],
+        [ 0.0,  0.0,  0.0, 1.0],
+    ]
+    # Path to a local Blender 2.70 install used for the boolean step.
+    # Empty/None or a missing file disables clipping (the un-clipped
+    # extrapolated relief is kept). Timeout is in seconds.
+    BLENDER_EXE = r"C:\Program Files\Blender Foundation\Blender\blender.exe"
+    BLENDER_TIMEOUT_S = 120
     # --- Automatic reference-point search ----------------------------
     # Instead of manual picking, cast an AUTO_GRID x AUTO_GRID grid of rays
     # across the screen; every ray that hits the truck is a candidate anchor.
@@ -160,6 +252,7 @@ class DepthReconstructor:
         self._saved_films: list[tuple[float, float]] = []
 
         self._mesh_node = None                        # last reconstruction
+        self._tonar_debug_node = None                 # translucent .obj overlay
         self._truck_np = None                         # cached pick target
         self._truck_collider = None                   # CollisionPolygon node
         self._collider_truck_id = None                # whose collider we built
@@ -282,6 +375,12 @@ class DepthReconstructor:
                 except ValueError:
                     pass
             self._mesh_node = None
+        if self._tonar_debug_node is not None:
+            try:
+                self._tonar_debug_node.removeNode()
+            except Exception:
+                pass
+            self._tonar_debug_node = None
 
     # ==================================================================
     # Click handling
@@ -609,17 +708,55 @@ class DepthReconstructor:
             verts[k, 1] = wp.y
             verts[k, 2] = wp.z
 
-        # Build triangles. No geometric culling: the region is fully defined
-        # by the mask (or the whole frame), so every cell whose 4 corners are
-        # in-region becomes 2 triangles (inf edge/vertical limits).
-        faces, _dropped = self._build_grid_faces(
-            G, inside, verts, float("inf"), float("inf"))
+        # Branch 1: extrapolate the masked relief to TARGET_SIZE_M via
+        #           mirror-tiling, producing a single rectangular mesh.
+        # Branch 2: keep the mask/whole-frame mesh (no geometric culling).
+        target_built = False
+        target_dims = None
+        if self.TARGET_SIZE_M is not None and bool(inside.any()):
+            ext = self._build_target_extrapolated(verts, inside, stride)
+            if ext is not None:
+                verts, faces, ext_info = ext
+                target_built = True
+                TX_m, TY_m = self.TARGET_SIZE_M
+                sw_m, sh_m = ext_info["src_size_m"]
+                tnx, tny = ext_info["target_grid"]
+                target_dims = (tnx, tny)
+                self._log(
+                    f"Экстраполяция: маска {sw_m:.2f}×{sh_m:.2f} м → цель "
+                    f"{TX_m:.1f}×{TY_m:.1f} м (mirror-tiling, сетка {tnx}×{tny}, "
+                    f"{ext_info['src_valid_cells']} валидных ячеек источника).")
+
+        if not target_built:
+            # Build triangles. No geometric culling: the region is fully defined
+            # by the mask (or the whole frame), so every cell whose 4 corners are
+            # in-region becomes 2 triangles (inf edge/vertical limits).
+            faces, _dropped = self._build_grid_faces(
+                G, inside, verts, float("inf"), float("inf"))
         if len(faces) == 0:
             self._log("Нет ячеек для меша (маска пуста / регион вырожден).")
             self._finish(False, {})
             return False
-        z_min = float(Z_grid[inside].min())
-        z_max = float(Z_grid[inside].max())
+        if target_built:
+            z_min = float(verts[:, 2].min())
+            z_max = float(verts[:, 2].max())
+        else:
+            z_min = float(Z_grid[inside].min())
+            z_max = float(Z_grid[inside].max())
+
+        # Seal the relief into a closed solid representing the empty space
+        # ABOVE the relief, then run Blender 2.70 boolean DIFFERENCE:
+        #   tonar_napolnitel − sealed_solid = part of the truck container
+        # BELOW the relief (the filler volume, closed and measurable). On
+        # any failure (no path / Blender missing / empty result) the
+        # un-clipped relief is kept silently.
+        clip_volume = None
+        if target_built and self.TONAR_OBJ_REL_PATH:
+            clip_res = self._clip_relief_to_target(verts, faces, target_dims)
+            if clip_res is not None:
+                verts, faces, clip_volume = clip_res
+                z_min = float(verts[:, 2].min())
+                z_max = float(verts[:, 2].max())
 
         # Vertex normals for proper lighting (computed from the grid mesh).
         normals = self._compute_normals(verts, faces)
@@ -659,6 +796,8 @@ class DepthReconstructor:
         info = {"A": A, "B": B, "z_min": z_min, "z_max": z_max,
                 "points": int(n_pts),
                 "verts": int(verts.shape[0]), "faces": int(len(faces))}
+        if clip_volume is not None:
+            info["volume_m3"] = float(clip_volume)
         self._log(f"✅ Реконструкция готова по {n_pts} точкам: "
                   f"{info['faces']} треугольников.")
         self._finish(True, info)
@@ -1098,6 +1237,48 @@ class DepthReconstructor:
         # track it for disposal via depth_recon_mesh.
         return node
 
+    def _build_tonar_debug_mesh(self, verts, faces):
+        """Attach a semi-transparent visualization of the tonar_napolnitel
+        mesh (with TONAR_OBJ_TRANSFORM already applied) to the scene, so
+        the user can see exactly which volume the Blender boolean is
+        operating on. Returns the attached NodePath."""
+        app = self.panda_app
+        n = int(verts.shape[0])
+        fmt = GeomVertexFormat.getV3()
+        vdata = GeomVertexData("depth_recon_tonar_debug", fmt, Geom.UHStatic)
+        vdata.set_num_rows(n)
+        vw = GeomVertexWriter(vdata, "vertex")
+        for i in range(n):
+            vw.add_data3f(float(verts[i, 0]),
+                          float(verts[i, 1]),
+                          float(verts[i, 2]))
+        tris = GeomTriangles(Geom.UHStatic)
+        for f in faces:
+            tris.add_vertices(int(f[0]), int(f[1]), int(f[2]))
+        tris.close_primitive()
+        geom = Geom(vdata)
+        geom.add_primitive(tris)
+        gnode = GeomNode("depth_recon_tonar_debug")
+        gnode.add_geom(geom)
+        node = app.render.attach_new_node(gnode)
+        # Translucent cyan overlay, both faces visible. Disable depth
+        # write so the overlay doesn't block geometry behind it from
+        # passing the depth test (otherwise the relief / truck would
+        # disappear behind the see-through tonar).
+        node.set_transparency(TransparencyAttrib.M_alpha)
+        node.set_color(0.35, 0.75, 1.0, 0.25)
+        node.set_two_sided(True)
+        try:
+            node.set_depth_write(False)
+        except Exception:
+            pass
+        # Don't get picked up by the truck raycast.
+        try:
+            node.set_collide_mask(BitMask32.allOff())
+        except Exception:
+            pass
+        return node
+
     def _apply_selected_texture(self, node) -> None:
         """Apply the UI-selected texture set (panda_app.current_texture_set)
         to the reconstructed mesh, mirroring the truck/perlin material path.
@@ -1345,6 +1526,894 @@ class DepthReconstructor:
         # In-region triangles rejected (by edge length or verticality).
         dropped = int(2 * int(cell_in.sum()) - faces.shape[0])
         return faces, dropped
+
+    # ------------------------------------------------------------------
+    # Gradient-aware extrapolation with mirror-tiled texture
+    # ------------------------------------------------------------------
+    def _build_target_extrapolated(self, verts_in, inside, stride):
+        """Extend the masked relief to a TARGET_SIZE_M axis-aligned rectangle.
+        Inside the mask: original measurements preserved verbatim. Outside:
+        each cell's Z is set by
+
+            Z(out) = Z(nearest in-mask seed)
+                   + min(outward_grad_at_seed, −tan(EXTRAP_ANGLE_DEG))
+                     × distance_to_seed
+                   + texture_weight × mirror_residual × exp(−dist / decay)
+
+        where outward_grad is the directional derivative of Z at the boundary
+        cell in the direction pointing to this external cell. Taking the
+        steeper (more negative) of that and the angle-of-repose lets a steep
+        visible pile face keep falling at its observed rate (so the relief
+        reaches the truck floor instead of forming a fake 'second pile'),
+        while a flat or hidden peak still drops at a natural granular slope.
+
+        The mirror-tiled residual carries the high-frequency texture of the
+        visible side over to the hidden side, so the back of the pile keeps
+        the look of a granular surface instead of being a featureless slope.
+        Texture amplitude fades exponentially with distance from the mask.
+
+        A floor clamp at min(visible Z) − EXTRAP_FLOOR_FROM_MIN_M (or an
+        absolute EXTRAP_FLOOR_M) catches whatever the descent + texture
+        produce so the extrapolated relief doesn't rise back up far from
+        the mask via averaging artifacts.
+
+        Returns (verts_target, faces_target, info) or None on failure."""
+        TX_m, TY_m = (float(v) for v in self.TARGET_SIZE_M)
+        if TX_m <= 0.0 or TY_m <= 0.0:
+            return None
+        valid_xyz = verts_in[inside]
+        if valid_xyz.shape[0] < 10:
+            return None
+        sxmin = float(valid_xyz[:, 0].min())
+        sxmax = float(valid_xyz[:, 0].max())
+        symin = float(valid_xyz[:, 1].min())
+        symax = float(valid_xyz[:, 1].max())
+        sw = sxmax - sxmin
+        sh = symax - symin
+        if sw < 1e-3 or sh < 1e-3:
+            return None
+
+        # Target rectangle, centred on mask centroid.
+        cx = 0.5 * (sxmin + sxmax)
+        cy = 0.5 * (symin + symax)
+        txmin = cx - 0.5 * TX_m
+        txmax = cx + 0.5 * TX_m
+        tymin = cy - 0.5 * TY_m
+        tymax = cy + 0.5 * TY_m
+
+        # Working grid covers union of mask bbox and target rect, with a
+        # half-metre pad so the bilinear sampler doesn't clamp at the edge.
+        pad = 0.5
+        gxmin = min(sxmin, txmin) - pad
+        gxmax = max(sxmax, txmax) + pad
+        gymin = min(symin, tymin) - pad
+        gymax = max(symax, tymax) + pad
+        gw = gxmax - gxmin
+        gh = gymax - gymin
+
+        # Rasterize masked verts onto the working grid.
+        src_field, src_valid = self._rasterize_xyz(
+            valid_xyz, gxmin, gymin, gw, gh)
+        if not src_valid.any():
+            return None
+
+        ny_s, nx_s = src_field.shape
+        cell_dx = gw / max(nx_s - 1, 1)
+        cell_dy = gh / max(ny_s - 1, 1)
+
+        # Pass 1: BFS-Dijkstra from in-mask seeds. For every cell we get the
+        # (y, x) of its nearest in-mask cell and the path distance (in cell
+        # steps, 1 ortho / √2 diag, accumulated). The directional info we
+        # use afterwards comes from the true Euclidean vector cell → seed.
+        seed_y, seed_x, _dist_cells = self._bfs_seeds(src_valid)
+
+        # Pass 2: ∂Z/∂x, ∂Z/∂y inside the mask (one-sided at boundary,
+        # central in the interior). Smooth the gradient field a couple of
+        # iterations to suppress single-cell noise from the rasterizer.
+        grad_y, grad_x = self._masked_gradient_2d(
+            src_field, src_valid, cell_dx, cell_dy)
+        grad_x = self._smooth_grid_z(grad_x, src_valid, 2)
+        grad_y = self._smooth_grid_z(grad_y, src_valid, 2)
+
+        # Per-cell world XY and the true Euclidean vector to its seed.
+        yy_idx, xx_idx = np.meshgrid(
+            np.arange(ny_s), np.arange(nx_s), indexing="ij")
+        cell_X = gxmin + xx_idx * cell_dx
+        cell_Y = gymin + yy_idx * cell_dy
+        seed_X = gxmin + seed_x * cell_dx
+        seed_Y = gymin + seed_y * cell_dy
+        dvec_x = cell_X - seed_X
+        dvec_y = cell_Y - seed_Y
+        dist_m = np.sqrt(dvec_x * dvec_x + dvec_y * dvec_y)
+        safe_dist = np.where(dist_m > 1e-9, dist_m, 1.0)
+        out_x = dvec_x / safe_dist
+        out_y = dvec_y / safe_dist
+
+        # Outward directional derivative of Z at the seed.
+        seed_gx = grad_x[seed_y, seed_x]
+        seed_gy = grad_y[seed_y, seed_x]
+        out_grad = seed_gx * out_x + seed_gy * out_y
+
+        # Effective descent rate (per metre): pick the more negative of
+        # outward gradient and −tan(angle of repose); cap at −tan(max angle)
+        # so a noisy one-sided gradient can't drive Z to infinity.
+        tan_aor = math.tan(math.radians(float(self.EXTRAP_ANGLE_DEG)))
+        tan_max = math.tan(math.radians(float(self.EXTRAP_MAX_ANGLE_DEG)))
+        eff_desc = np.minimum(out_grad, -tan_aor)
+        eff_desc = np.maximum(eff_desc, -tan_max)
+
+        # Baseline Z field: in-mask keeps original, others get seed_Z + descent.
+        seed_z = src_field[seed_y, seed_x]
+        src_extrap = np.where(
+            src_valid, src_field, seed_z + eff_desc * dist_m)
+
+        # Texture: mirror-tile high-frequency residual from the visible
+        # side onto the extrapolated cells, attenuated by distance from
+        # the mask. CRITICAL: only apply texture where descent is governed
+        # by the angle-of-repose fallback (hidden peak side). Where the
+        # local outward gradient is steeper than AoR (the camera-facing
+        # wall side, with the visible face falling toward the floor), the
+        # texture is suppressed — otherwise mirror-tiling produces an
+        # "echo" of the visible peak at a symmetric distance, which the
+        # observer reads as a fake second pile near the near wall.
+        tex_w = float(self.EXTRAP_TEXTURE_WEIGHT)
+        if tex_w > 0.0:
+            smooth_iters = max(1, int(self.EXTRAP_TEXTURE_SMOOTH_ITERS))
+            z_for_trend = np.where(src_valid, src_field, 0.0)
+            z_trend = self._smooth_grid_z(
+                z_for_trend, src_valid, smooth_iters)
+            residual_field = np.where(src_valid, src_field - z_trend, 0.0)
+            sample_X = self._mirror_into(cell_X, sxmin, sxmax)
+            sample_Y = self._mirror_into(cell_Y, symin, symax)
+            sampled_residual = self._bilinear_sample(
+                residual_field, sample_X, sample_Y,
+                gxmin, gxmax, gymin, gymax)
+            decay = max(float(self.EXTRAP_TEXTURE_DECAY_M), 1e-6)
+            attenuation = np.exp(-dist_m / decay)
+            # Smooth ramp 0..1 as out_grad goes from −tan(AoR) (steep) up
+            # to 0 (flat) — full texture above 0, zero texture in steep
+            # descent zones.
+            tan_aor_safe = max(tan_aor, 1e-6)
+            gradient_weight = np.clip(
+                (out_grad + tan_aor_safe) / tan_aor_safe, 0.0, 1.0)
+            texture_add = np.where(
+                src_valid, 0.0,
+                tex_w * gradient_weight * sampled_residual * attenuation)
+            src_extrap = src_extrap + texture_add
+
+        # Floor clamp — kills any artifact that would lift the extrapolated
+        # relief back above the bottom of the visible pile.
+        floor_z = None
+        if self.EXTRAP_FLOOR_FROM_MIN_M is not None:
+            z_min_visible = float(src_field[src_valid].min())
+            floor_z = z_min_visible - float(self.EXTRAP_FLOOR_FROM_MIN_M)
+        elif self.EXTRAP_FLOOR_M is not None:
+            floor_z = float(self.EXTRAP_FLOOR_M)
+        if floor_z is not None:
+            src_extrap = np.maximum(src_extrap, floor_z)
+
+        # Sample on the target grid.
+        tnx = max(2, int(round(TX_m * self.TARGET_RES_PER_M)) + 1)
+        tny = max(2, int(round(TY_m * self.TARGET_RES_PER_M)) + 1)
+        TXg, TYg = np.meshgrid(np.linspace(txmin, txmax, tnx),
+                               np.linspace(tymin, tymax, tny))
+        Z_target = self._bilinear_sample(
+            src_extrap, TXg, TYg, gxmin, gxmax, gymin, gymax)
+
+        # Smoothing of extrapolated cells only (preserve direct in-mask
+        # measurements).
+        iters = int(self.TARGET_SMOOTH_ITERS)
+        if iters > 0:
+            valid_direct = self._bilinear_sample(
+                src_valid.astype(np.float64), TXg, TYg,
+                gxmin, gxmax, gymin, gymax) > 0.5
+            ones = np.ones_like(Z_target, dtype=bool)
+            Z_smooth = self._smooth_grid_z(Z_target, ones, iters)
+            Z_target = np.where(valid_direct, Z_target, Z_smooth)
+
+        n_total = tnx * tny
+        verts_t = np.empty((n_total, 3), dtype=np.float64)
+        verts_t[:, 0] = TXg.ravel()
+        verts_t[:, 1] = TYg.ravel()
+        verts_t[:, 2] = Z_target.ravel()
+        faces_t = self._build_regular_grid_faces(tnx, tny)
+
+        info = {
+            "src_bbox": (sxmin, sxmax, symin, symax),
+            "target_bbox": (txmin, txmax, tymin, tymax),
+            "src_size_m": (sw, sh),
+            "target_size_m": (TX_m, TY_m),
+            "target_grid": (tnx, tny),
+            "src_valid_cells": int(src_valid.sum()),
+            "extrap_angle_deg": float(self.EXTRAP_ANGLE_DEG),
+            "extrap_texture_weight": tex_w,
+            "extrap_floor_z": floor_z,
+        }
+        return verts_t, faces_t, info
+
+    def _rasterize_xyz(self, pts, xmin, ymin, w, h):
+        """Bin (M, 3) world points into a regular XY grid covering
+        [xmin, xmin+w] × [ymin, ymin+h] at TARGET_RES_PER_M density.
+        Returns (field (ny, nx), valid_mask (ny, nx))."""
+        nx = max(2, int(round(w * self.TARGET_RES_PER_M)) + 1)
+        ny = max(2, int(round(h * self.TARGET_RES_PER_M)) + 1)
+        ix = np.clip(
+            np.round((pts[:, 0] - xmin) / max(w, 1e-9) * (nx - 1)),
+            0, nx - 1).astype(np.int64)
+        iy = np.clip(
+            np.round((pts[:, 1] - ymin) / max(h, 1e-9) * (ny - 1)),
+            0, ny - 1).astype(np.int64)
+        accum = np.zeros((ny, nx), dtype=np.float64)
+        counts = np.zeros((ny, nx), dtype=np.int64)
+        np.add.at(accum, (iy, ix), pts[:, 2].astype(np.float64))
+        np.add.at(counts, (iy, ix), 1)
+        valid = counts > 0
+        field = np.where(valid, accum / np.maximum(counts, 1), 0.0)
+        return field, valid
+
+    @staticmethod
+    def _bfs_seeds(valid):
+        """Multi-source Dijkstra-style BFS over the boolean array `valid`.
+        For each grid cell, returns the (y, x) coords of its nearest True
+        cell and the accumulated path distance in cell-step units (1 for
+        orthogonal moves, √2 for diagonals). True cells get distance 0 and
+        seed = themselves.
+
+        Returns (seed_y int32, seed_x int32, dist float64), all with the
+        shape of `valid`. Cells unreachable from any seed (only possible
+        when `valid` is empty) keep distance=inf and seed=−1."""
+        Hh, Ww = valid.shape
+        seed_y = np.full((Hh, Ww), -1, dtype=np.int32)
+        seed_x = np.full((Hh, Ww), -1, dtype=np.int32)
+        dist = np.full((Hh, Ww), np.inf, dtype=np.float64)
+        yi, xi = np.where(valid)
+        if yi.size == 0:
+            return seed_y, seed_x, dist
+        seed_y[yi, xi] = yi.astype(np.int32)
+        seed_x[yi, xi] = xi.astype(np.int32)
+        dist[yi, xi] = 0.0
+
+        sqrt2 = math.sqrt(2.0)
+        # Worst-case BFS depth is the grid's longest axis; ×2 gives slack
+        # for the Gauss-Seidel relaxation order.
+        max_iters = max(Hh, Ww) * 2
+        for _ in range(max_iters):
+            improved = False
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    step = 1.0 if (dx == 0 or dy == 0) else sqrt2
+                    ys_d, ye_d = max(0, -dy), Hh - max(0, dy)
+                    xs_d, xe_d = max(0, -dx), Ww - max(0, dx)
+                    ys_s, ye_s = max(0, dy), Hh - max(0, -dy)
+                    xs_s, xe_s = max(0, dx), Ww - max(0, -dx)
+                    src_dist = dist[ys_s:ye_s, xs_s:xe_s]
+                    tgt_dist = dist[ys_d:ye_d, xs_d:xe_d]
+                    cand = src_dist + step
+                    upd = cand < tgt_dist
+                    if upd.any():
+                        tgt_dist[upd] = cand[upd]
+                        seed_y[ys_d:ye_d, xs_d:xe_d][upd] = \
+                            seed_y[ys_s:ye_s, xs_s:xe_s][upd]
+                        seed_x[ys_d:ye_d, xs_d:xe_d][upd] = \
+                            seed_x[ys_s:ye_s, xs_s:xe_s][upd]
+                        improved = True
+            if not improved:
+                break
+        return seed_y, seed_x, dist
+
+    @staticmethod
+    def _masked_gradient_2d(field, valid, dx, dy):
+        """Per-cell ∂Z/∂x and ∂Z/∂y, computed using only in-mask neighbours.
+        Central difference when both neighbours are in-mask; forward or
+        backward one-sided diff when only one side is. Out-of-mask cells
+        return 0 gradient. dx, dy are the world-space cell sizes in metres.
+        Returns (grad_y, grad_x)."""
+        Hh, Ww = field.shape
+        v = valid.astype(bool)
+        f = field.astype(np.float64)
+
+        # X direction (right neighbour at column j+1, left at j-1).
+        v_R = np.zeros_like(v); v_R[:, :-1] = v[:, 1:]
+        v_L = np.zeros_like(v); v_L[:, 1:] = v[:, :-1]
+        z_R = np.zeros_like(f); z_R[:, :-1] = f[:, 1:]
+        z_L = np.zeros_like(f); z_L[:, 1:] = f[:, :-1]
+        central_x = (z_R - z_L) / (2.0 * dx)
+        fwd_x = (z_R - f) / dx
+        bwd_x = (f - z_L) / dx
+        grad_x = np.where(
+            v & v_R & v_L, central_x,
+            np.where(v & v_R, fwd_x,
+                     np.where(v & v_L, bwd_x, 0.0)))
+
+        # Y direction (down neighbour at row i+1, up at i-1).
+        v_D = np.zeros_like(v); v_D[:-1, :] = v[1:, :]
+        v_U = np.zeros_like(v); v_U[1:, :] = v[:-1, :]
+        z_D = np.zeros_like(f); z_D[:-1, :] = f[1:, :]
+        z_U = np.zeros_like(f); z_U[1:, :] = f[:-1, :]
+        central_y = (z_D - z_U) / (2.0 * dy)
+        fwd_y = (z_D - f) / dy
+        bwd_y = (f - z_U) / dy
+        grad_y = np.where(
+            v & v_D & v_U, central_y,
+            np.where(v & v_D, fwd_y,
+                     np.where(v & v_U, bwd_y, 0.0)))
+
+        return grad_y, grad_x
+
+    @staticmethod
+    def _mirror_into(t, lo, hi):
+        """Triangle-wave reflection of `t` into [lo, hi]. Used to sample the
+        in-mask residual texture at mirrored positions for the back side
+        of the pile. Vectorised."""
+        span = float(hi) - float(lo)
+        if span <= 1e-9:
+            return np.full_like(t, lo)
+        period = 2.0 * span
+        d = np.mod(t - lo, period)
+        return np.where(d <= span, lo + d, lo + (period - d))
+
+    @staticmethod
+    def _bilinear_sample(field, xs, ys, xmin, xmax, ymin, ymax):
+        """Bilinear sample `field` (ny, nx) defined over
+        [xmin, xmax] × [ymin, ymax] at world coords (xs, ys). Clamps to the
+        nearest edge outside the source domain."""
+        ny, nx = field.shape
+        if (nx < 2 or ny < 2 or
+                xmax - xmin <= 1e-9 or ymax - ymin <= 1e-9):
+            fill = float(field.mean()) if field.size else 0.0
+            return np.full_like(xs, fill, dtype=np.float64)
+        u = (xs - xmin) / (xmax - xmin) * (nx - 1)
+        v = (ys - ymin) / (ymax - ymin) * (ny - 1)
+        u = np.clip(u, 0.0, nx - 1)
+        v = np.clip(v, 0.0, ny - 1)
+        i0 = np.floor(u).astype(np.int64)
+        j0 = np.floor(v).astype(np.int64)
+        i1 = np.minimum(i0 + 1, nx - 1)
+        j1 = np.minimum(j0 + 1, ny - 1)
+        fu = u - i0
+        fv = v - j0
+        z00 = field[j0, i0]
+        z01 = field[j0, i1]
+        z10 = field[j1, i0]
+        z11 = field[j1, i1]
+        return ((1.0 - fu) * (1.0 - fv) * z00 + fu * (1.0 - fv) * z01 +
+                (1.0 - fu) * fv * z10 + fu * fv * z11)
+
+    @staticmethod
+    def _build_regular_grid_faces(nx, ny):
+        """Triangulate a regular (nx by ny)-vertex grid: 2 tris per cell."""
+        cx = nx - 1
+        cy = ny - 1
+        if cx <= 0 or cy <= 0:
+            return np.zeros((0, 3), np.int64)
+        ti = np.arange(cy)[:, None]
+        si = np.arange(cx)[None, :]
+        a = (ti * nx + si).ravel()
+        b = a + 1
+        c = a + nx
+        d = c + 1
+        f1 = np.stack([a, b, d], axis=1)
+        f2 = np.stack([a, d, c], axis=1)
+        return np.concatenate([f1, f2], axis=0).astype(np.int64)
+
+    # ------------------------------------------------------------------
+    # Local clipping (relief ∩ tonar_napolnitel) via point-in-mesh test
+    # ------------------------------------------------------------------
+    def _tonar_obj_path(self) -> str:
+        """Absolute path to tonar_napolnitel.obj, resolved relative to the
+        project root (two levels above this module file)."""
+        rel = self.TONAR_OBJ_REL_PATH
+        if not rel:
+            return ""
+        here = os.path.dirname(os.path.abspath(__file__))
+        proj_root = os.path.dirname(os.path.dirname(here))
+        return os.path.normpath(os.path.join(proj_root, rel))
+
+    def _load_tonar_obj(self):
+        """Load tonar_napolnitel.obj as (verts float32 (N,3),
+        faces uint32 (M,3)). Applies TONAR_OBJ_TRANSFORM if set.
+        Returns None on failure."""
+        if trimesh is None:
+            self._log("trimesh не установлен — boolean невозможен.")
+            return None
+        p = self._tonar_obj_path()
+        if not p or not os.path.exists(p):
+            self._log(f"tonar OBJ не найден: {p}")
+            return None
+        try:
+            m = trimesh.load(p, force="mesh", process=False)
+        except Exception as exc:
+            self._log(f"Не удалось загрузить {os.path.basename(p)}: {exc}")
+            return None
+        verts = np.asarray(m.vertices, dtype=np.float64)
+        faces = np.asarray(m.faces, dtype=np.uint32)
+
+        # Blender-exported OBJs carry per-corner UV/normals, and
+        # trimesh.load(process=False) treats every distinct (v, vt, vn)
+        # tuple as a separate vertex — so a 36-vertex tonar becomes 108
+        # vertices, all in coincident triples that share no topology
+        # with their neighbours. Carve in Blender 2.70 sees this as a
+        # disconnected triangle soup and bails with "non intersecting
+        # group is not IN or OUT". Collapse exact-position duplicates
+        # back into a manifold mesh.
+        n_before = verts.shape[0]
+        unique_v, inverse = np.unique(
+            np.round(verts, decimals=6), axis=0, return_inverse=True)
+        if unique_v.shape[0] < n_before:
+            # Recover the original (un-rounded) coords for the surviving
+            # vertices by taking the first occurrence of each unique key.
+            first_idx = np.zeros(unique_v.shape[0], dtype=np.int64)
+            seen = np.full(unique_v.shape[0], -1, dtype=np.int64)
+            for i, j in enumerate(inverse):
+                if seen[j] < 0:
+                    seen[j] = i
+            first_idx = seen
+            verts = verts[first_idx]
+            faces = inverse[faces].astype(np.uint32)
+            self._log(f"Tonar: дедупликация вершин {n_before} → "
+                      f"{verts.shape[0]} (Carve требует разделяемой "
+                      f"топологии, не triangle soup).")
+
+        tr = self.TONAR_OBJ_TRANSFORM
+        if tr is not None:
+            try:
+                T = np.asarray(tr, dtype=np.float64).reshape(4, 4)
+                v4 = np.column_stack([verts, np.ones(verts.shape[0])])
+                verts = (v4 @ T.T)[:, :3]
+                # A transform with negative determinant (reflection,
+                # not a proper rotation) reverses every triangle's
+                # winding — the result has inward-facing normals, and
+                # Blender 2.70's Carve solver then silently bails out
+                # of any Boolean op (mod_apply returns FINISHED but the
+                # mesh is unmodified). Restore outward winding by
+                # swapping the first and last index of every face.
+                if float(np.linalg.det(T[:3, :3])) < 0.0:
+                    faces = faces[:, [2, 1, 0]].astype(np.uint32)
+                    self._log("TONAR_OBJ_TRANSFORM имеет det<0 — winding "
+                              "перевёрнут, чтобы нормали смотрели наружу.")
+            except Exception as exc:
+                self._log(f"TONAR_OBJ_TRANSFORM некорректен: {exc} — игнорирую.")
+        return verts.astype(np.float32), faces
+
+    def _clip_relief_to_target(self, relief_verts, relief_faces, grid_dims):
+        """Turn the open rectangular relief heightfield into the closed
+        FILLER VOLUME inside tonar_napolnitel via a headless Blender 2.70
+        Boolean DIFFERENCE.
+
+        Algorithm (mirrors mesh_reconstruction.cpp::create_mesh_advanced
+        and boolean_operations.cpp::perform_boolean_difference):
+          1. Seal the relief into a watertight solid representing the
+             empty space ABOVE the relief — floor = the heightfield,
+             ceiling = flat plane at z_high = max(tonar.z) + 1 m, walls
+             = perimeter strips connecting them.
+          2. Blender DIFFERENCE: tonar − sealed_solid → the part of the
+             container BELOW the relief = the filler.
+
+        The result is a closed manifold with a measurable volume (the
+        Stokes/divergence-theorem formula  V = |Σ v0·(v1×v2)| / 6).
+        Returns (verts, faces, volume_m3) or None on any failure (the
+        caller then keeps the un-clipped, open relief).
+        """
+        if grid_dims is None:
+            self._log("Клиппинг: нет размеров сетки рельефа — пропуск.")
+            return None
+        tnx, tny = int(grid_dims[0]), int(grid_dims[1])
+        loaded = self._load_tonar_obj()
+        if loaded is None:
+            return None
+        t_verts, t_faces = loaded
+        t_verts = t_verts.astype(np.float64)
+        t_faces = np.asarray(t_faces, dtype=np.int64)
+
+        # Refresh the translucent tonar overlay before the boolean runs,
+        # so the user sees the .obj that's fed into the operation even if
+        # Blender later fails.
+        try:
+            if self._tonar_debug_node is not None:
+                try:
+                    self._tonar_debug_node.remove_node()
+                except Exception:
+                    pass
+                self._tonar_debug_node = None
+            self._tonar_debug_node = self._build_tonar_debug_mesh(
+                t_verts, t_faces)
+            self._log(f"Tonar overlay: {t_verts.shape[0]} верш., "
+                      f"{t_faces.shape[0]} тр., alpha 25%.")
+        except Exception as exc:
+            self._log(f"tonar overlay build failed: {exc}")
+
+        r_verts = np.asarray(relief_verts, dtype=np.float64)
+        if r_verts.shape[0] != tnx * tny:
+            self._log(
+                f"Клиппинг: вершин рельефа ({r_verts.shape[0]}) ≠ "
+                f"tnx*tny ({tnx*tny}) — пропуск.")
+            return None
+
+        # z_high — потолок sealed_solid, гарантированно выше любого z в tonar.
+        z_high = float(t_verts[:, 2].max()) + 1.0
+        sealed_v, sealed_f = self._build_sealed_solid(
+            r_verts, tnx, tny, z_high)
+        self._log(
+            f"Sealed solid: {sealed_v.shape[0]} верш., {sealed_f.shape[0]} тр. "
+            f"(сетка {tnx}×{tny}, z_high={z_high:.2f}).")
+
+        res = self._blender_boolean(
+            t_verts, t_faces, sealed_v, sealed_f, operation="DIFFERENCE")
+        if res is None:
+            return None
+        new_verts, new_faces = res
+        vol = self._mesh_volume(new_verts, new_faces)
+        self._log(
+            f"Blender boolean DIFFERENCE: tonar − sealed = "
+            f"{new_verts.shape[0]} верш., {new_faces.shape[0]} тр.; "
+            f"объём ≈ {vol:.3f} м³.")
+        return new_verts, new_faces, float(vol)
+
+    # ------------------------------------------------------------------
+    # Sealed-solid construction
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_sealed_solid(relief_verts, tnx, tny, z_high):
+        """Build a closed watertight manifold representing the empty
+        space ABOVE the rectangular relief grid: floor = the heightfield,
+        ceiling = flat plane at z_high, walls = vertical strips around
+        the four perimeter edges. Mirrors mesh_reconstruction.cpp:1067-
+        1146 (floor + ceiling + horizontal + vertical wall edges, then a
+        global winding flip so all normals face OUTWARD).
+
+        Returns (verts (2*tnx*tny, 3) float64, faces (M, 3) int64)."""
+        W = int(tnx)
+        H = int(tny)
+        r = np.asarray(relief_verts, dtype=np.float64).reshape(-1, 3)
+        n = W * H
+
+        # Floor (relief) + ceiling (flat at z_high). Floor verts go first
+        # so flat_index(iy, ix) == iy * W + ix in both layers (+ n for the
+        # ceiling).
+        floor_v = r.copy()
+        ceil_v = r.copy()
+        ceil_v[:, 2] = float(z_high)
+        verts = np.concatenate([floor_v, ceil_v], axis=0)
+
+        # Per-cell flat indices for the 4 corners (matches the C++ a/b/c/d
+        # naming: a = top-left, b = bottom-left, c = top-right, d = bottom-
+        # right of cell (iy, ix)).
+        iy = np.arange(H - 1)[:, None]
+        ix = np.arange(W - 1)[None, :]
+        a = (iy * W + ix).ravel()
+        b = ((iy + 1) * W + ix).ravel()
+        c = (iy * W + (ix + 1)).ravel()
+        d = ((iy + 1) * W + (ix + 1)).ravel()
+
+        # Floor — wound (c, b, a) and (d, b, c). Normal points +Z (INTO
+        # the body, which sits above the relief).
+        floor_tris = np.concatenate([
+            np.stack([c, b, a], axis=1),
+            np.stack([d, b, c], axis=1),
+        ], axis=0)
+        # Ceiling — wound (a, b, c) and (c, b, d) at the upper layer.
+        # Normal points −Z (INTO the body, which sits below the ceiling).
+        a2, b2, c2, d2 = a + n, b + n, c + n, d + n
+        ceil_tris = np.concatenate([
+            np.stack([a2, b2, c2], axis=1),
+            np.stack([c2, b2, d2], axis=1),
+        ], axis=0)
+
+        # Walls — only the 4 outer edges of the rectangle. C++ uses two
+        # winding branches depending on which side of the edge holds the
+        # body; for a regular rectangle the assignment per edge is fixed.
+        wall_chunks = []
+        # Top edge (iy = 0): body is on the iy=0 side (south). Branch 2.
+        iy0 = 0
+        f0 = iy0 * W + np.arange(W - 1)
+        f1 = iy0 * W + np.arange(1, W)
+        c0 = f0 + n
+        c1 = f1 + n
+        wall_chunks.append(np.stack([f1, f0, c0], axis=1))
+        wall_chunks.append(np.stack([f1, c0, c1], axis=1))
+        # Bottom edge (iy = H - 1): body is on the iy=H-2 side. Branch 1.
+        iy1 = H - 1
+        f0 = iy1 * W + np.arange(W - 1)
+        f1 = iy1 * W + np.arange(1, W)
+        c0 = f0 + n
+        c1 = f1 + n
+        wall_chunks.append(np.stack([f0, f1, c1], axis=1))
+        wall_chunks.append(np.stack([f0, c1, c0], axis=1))
+        # Left edge (ix = 0): body is on the ix=0 side (right). Branch 1
+        # in the vertical-edge loop ("right && !left").
+        ix0 = 0
+        f0 = np.arange(H - 1) * W + ix0
+        f1 = np.arange(1, H) * W + ix0
+        c0 = f0 + n
+        c1 = f1 + n
+        wall_chunks.append(np.stack([f0, f1, c1], axis=1))
+        wall_chunks.append(np.stack([f0, c1, c0], axis=1))
+        # Right edge (ix = W - 1): body is on the ix=W-2 side. Branch 2.
+        ix1 = W - 1
+        f0 = np.arange(H - 1) * W + ix1
+        f1 = np.arange(1, H) * W + ix1
+        c0 = f0 + n
+        c1 = f1 + n
+        wall_chunks.append(np.stack([f1, f0, c0], axis=1))
+        wall_chunks.append(np.stack([f1, c0, c1], axis=1))
+
+        walls = np.concatenate(wall_chunks, axis=0)
+        faces = np.concatenate(
+            [floor_tris, ceil_tris, walls], axis=0).astype(np.int64)
+        # Global winding flip: triangles above were built with normals
+        # pointing INTO the body (matches the C++ convention); swap v0
+        # and v2 → normals now face OUTWARD, which is what Carve expects
+        # to treat the mesh as a closed volume.
+        faces = faces[:, [2, 1, 0]]
+        return verts, faces
+
+    @staticmethod
+    def _mesh_volume(verts, faces):
+        """Signed volume of a closed triangle mesh by the divergence
+        theorem: V = |Σ v0 · (v1 × v2)| / 6. Open / non-manifold meshes
+        give a meaningless number — caller is responsible for ensuring
+        the mesh is closed."""
+        v = np.asarray(verts, dtype=np.float64)
+        f = np.asarray(faces, dtype=np.int64)
+        if f.shape[0] == 0:
+            return 0.0
+        v0 = v[f[:, 0]]
+        v1 = v[f[:, 1]]
+        v2 = v[f[:, 2]]
+        cross_ = np.cross(v1, v2)
+        triple = np.einsum("ij,ij->i", v0, cross_)
+        return float(abs(triple.sum()) / 6.0)
+
+    # ------------------------------------------------------------------
+    # Blender 2.70 headless boolean
+    # ------------------------------------------------------------------
+    def _blender_boolean(self, verts_a, faces_a, verts_b, faces_b,
+                         operation="DIFFERENCE"):
+        """Run Blender 2.70's Boolean modifier on mesh A with mesh B as
+        the operand. `operation` is forwarded to mod.operation
+        ('DIFFERENCE' / 'INTERSECT' / 'UNION'). Returns (verts (N,3)
+        float64, faces (M,3) int64) of the result in world coords, or
+        None on any failure (Blender missing, non-zero exit, empty
+        result)."""
+        import subprocess
+        import tempfile
+        import shutil
+
+        exe = self.BLENDER_EXE
+        if not exe or not os.path.exists(exe):
+            self._log(f"Blender 2.70 не найден ({exe}) — клиппинг пропущен.")
+            return None
+        if verts_a.shape[0] == 0 or faces_a.shape[0] == 0:
+            return None
+        if verts_b.shape[0] == 0 or faces_b.shape[0] == 0:
+            return None
+
+        op = str(operation).upper()
+        if op not in ("DIFFERENCE", "INTERSECT", "UNION"):
+            self._log(f"Неизвестная булева операция: {operation}")
+            return None
+
+        # Persistent debug dump under the project root so the user (or
+        # we, later) can open the inputs / output in Blender for
+        # inspection. Overwritten on every call.
+        debug_dir = self._boolean_debug_dir()
+
+        tmp = tempfile.mkdtemp(prefix="depth_recon_bool_")
+        keep_tmp = False
+        try:
+            mesh_a = os.path.join(tmp, "mesh_a.obj")
+            mesh_b = os.path.join(tmp, "mesh_b.obj")
+            result = os.path.join(tmp, "result.obj")
+            script = os.path.join(tmp, "boolean.py")
+            self._write_obj(mesh_a, verts_a, faces_a)
+            self._write_obj(mesh_b, verts_b, faces_b)
+            self._write_blender_boolean_script(script)
+            # Mirror the inputs into the debug folder *before* we run
+            # Blender, so we still have them if Blender hangs / crashes.
+            self._copy_to_debug(mesh_a, debug_dir, "mesh_a.obj")
+            self._copy_to_debug(mesh_b, debug_dir, "mesh_b.obj")
+            self._copy_to_debug(script, debug_dir, "boolean.py")
+            cmd = [exe, "-b", "-P", script, "--",
+                   mesh_a, mesh_b, result, op]
+            self._log(f"Blender boolean {op}: запуск "
+                      f"'{os.path.basename(exe)}' "
+                      f"(A: {verts_a.shape[0]}v/{faces_a.shape[0]}f, "
+                      f"B: {verts_b.shape[0]}v/{faces_b.shape[0]}f)…")
+            self._log(f"Debug-дамп входов: {debug_dir}")
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=float(self.BLENDER_TIMEOUT_S))
+            except subprocess.TimeoutExpired:
+                self._log(f"Blender boolean: таймаут "
+                          f"{self.BLENDER_TIMEOUT_S}s — клиппинг пропущен.")
+                keep_tmp = True
+                return None
+            except Exception as exc:
+                self._log(f"Blender запуск упал: {exc}")
+                return None
+            # Surface the [bool] diagnostics from the embedded script.
+            bool_lines = [ln for ln in (proc.stdout or "").splitlines()
+                          if ln.startswith("[bool]")]
+            for ln in bool_lines:
+                self._log(ln)
+            # Save the full Blender stdout/stderr alongside the OBJ
+            # dumps regardless of outcome.
+            try:
+                with open(os.path.join(debug_dir, "blender_stdout.txt"),
+                          "w", encoding="utf-8") as f:
+                    f.write(proc.stdout or "")
+                with open(os.path.join(debug_dir, "blender_stderr.txt"),
+                          "w", encoding="utf-8") as f:
+                    f.write(proc.stderr or "")
+            except Exception:
+                pass
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout or "").strip()[-600:]
+                self._log(f"Blender вернул код {proc.returncode}; "
+                          f"temp сохранён: {tmp}\n…{tail}")
+                keep_tmp = True
+                return None
+            if not os.path.exists(result):
+                self._log(f"Blender завершился, но result.obj не создан. "
+                          f"temp: {tmp}")
+                keep_tmp = True
+                return None
+            # Copy the result into the debug folder too.
+            self._copy_to_debug(result, debug_dir, "result.obj")
+            rv, rf = self._read_obj(result)
+            if rv is None or rv.shape[0] == 0 or rf.shape[0] == 0:
+                self._log(f"Результат Blender boolean пуст. temp: {tmp}")
+                keep_tmp = True
+                return None
+            return rv, rf
+        finally:
+            if not keep_tmp:
+                try:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                except Exception:
+                    pass
+
+    def _boolean_debug_dir(self):
+        """Return (and create) a stable project-relative directory where
+        the latest Blender-boolean inputs and outputs are dumped. Path:
+        <project_root>/debug_boolean/. Falls back to a temp folder if
+        the project root is unwritable."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        proj_root = os.path.dirname(os.path.dirname(here))
+        d = os.path.join(proj_root, "debug_boolean")
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            import tempfile
+            return tempfile.mkdtemp(prefix="depth_recon_dbg_")
+
+    @staticmethod
+    def _copy_to_debug(src, dst_dir, dst_name):
+        try:
+            import shutil
+            shutil.copyfile(src, os.path.join(dst_dir, dst_name))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _write_obj(path, verts, faces):
+        """Minimal Wavefront OBJ writer (v + f only, 1-indexed)."""
+        with open(path, "w", encoding="utf-8") as f:
+            for v in verts:
+                f.write(f"v {float(v[0])} {float(v[1])} {float(v[2])}\n")
+            for tri in faces:
+                f.write(f"f {int(tri[0]) + 1} {int(tri[1]) + 1} "
+                        f"{int(tri[2]) + 1}\n")
+
+    @staticmethod
+    def _read_obj(path):
+        """Read a Wavefront OBJ (v + f) and triangulate any n-gons by
+        fanning from vertex 0. Returns (verts (N,3) float64,
+        faces (M,3) int64) or (None, None) if the file has no vertices."""
+        verts = []
+        faces = []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("v "):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        verts.append((float(parts[1]), float(parts[2]),
+                                      float(parts[3])))
+                elif line.startswith("f "):
+                    idxs = []
+                    ok = True
+                    for tok in line.split()[1:]:
+                        slash = tok.find("/")
+                        s = tok if slash < 0 else tok[:slash]
+                        if not s:
+                            continue
+                        try:
+                            idxs.append(int(s) - 1)
+                        except ValueError:
+                            ok = False
+                            break
+                    if ok and len(idxs) >= 3:
+                        for i in range(1, len(idxs) - 1):
+                            faces.append((idxs[0], idxs[i], idxs[i + 1]))
+        if not verts:
+            return None, None
+        return (np.asarray(verts, dtype=np.float64),
+                np.asarray(faces, dtype=np.int64))
+
+    @staticmethod
+    def _write_blender_boolean_script(path):
+        """Headless Blender 2.70 script that mirrors the server's
+        boolean_operations.cpp pattern, with diagnostics around Carve:
+        select mesh_a explicitly before applying the modifier, check the
+        return code of modifier_apply, log vert/face counts before and
+        after the apply, and exit non-zero if Carve silently produced
+        the same mesh as the input (which happens when the solver bails
+        out on a non-manifold or self-intersecting operand)."""
+        src = (
+            "import bpy\n"
+            "import sys\n"
+            "\n"
+            'argv = sys.argv[sys.argv.index("--") + 1:]\n'
+            "mesh_a, mesh_b, out_file = argv[0], argv[1], argv[2]\n"
+            "op = argv[3] if len(argv) > 3 else 'DIFFERENCE'\n"
+            "print('[bool] op=' + op)\n"
+            "\n"
+            "bpy.ops.object.select_all(action='SELECT')\n"
+            "bpy.ops.object.delete()\n"
+            "\n"
+            "bpy.ops.import_scene.obj(filepath=mesh_a)\n"
+            "ob_a = bpy.context.selected_objects[0]\n"
+            "ob_a.name = 'MeshA'\n"
+            "bpy.ops.object.select_all(action='DESELECT')\n"
+            "\n"
+            "bpy.ops.import_scene.obj(filepath=mesh_b)\n"
+            "ob_b = bpy.context.selected_objects[0]\n"
+            "ob_b.name = 'MeshB'\n"
+            "bpy.ops.object.select_all(action='DESELECT')\n"
+            "\n"
+            "va0 = len(ob_a.data.vertices); fa0 = len(ob_a.data.polygons)\n"
+            "vb0 = len(ob_b.data.vertices); fb0 = len(ob_b.data.polygons)\n"
+            "print('[bool] A in: {}v/{}f  B in: {}v/{}f'"
+            ".format(va0, fa0, vb0, fb0))\n"
+            "def _bbox(o):\n"
+            "    bb = [o.matrix_world * v.co for v in o.data.vertices]\n"
+            "    if not bb: return None\n"
+            "    xs=[p.x for p in bb]; ys=[p.y for p in bb]; "
+            "zs=[p.z for p in bb]\n"
+            "    return (min(xs), min(ys), min(zs),\n"
+            "            max(xs), max(ys), max(zs))\n"
+            "print('[bool] A bbox:', _bbox(ob_a))\n"
+            "print('[bool] B bbox:', _bbox(ob_b))\n"
+            "\n"
+            "mod = ob_a.modifiers.new(name='Boolean', type='BOOLEAN')\n"
+            "mod.operation = op\n"
+            "mod.object = ob_b\n"
+            "bpy.context.scene.objects.active = ob_a\n"
+            "ob_a.select = True\n"
+            "res = bpy.ops.object.modifier_apply(modifier=mod.name)\n"
+            "print('[bool] modifier_apply -> ' + repr(res))\n"
+            "\n"
+            "va1 = len(ob_a.data.vertices); fa1 = len(ob_a.data.polygons)\n"
+            "print('[bool] A out: {}v/{}f'.format(va1, fa1))\n"
+            "\n"
+            "if va1 == va0 and fa1 == fa0:\n"
+            "    print('[bool] ERROR: Carve made no change. modifier_apply\\n'\n"
+            "          '  returned without modifying ob_a.data — Carve\\n'\n"
+            "          '  likely bailed on a non-manifold / self-intersect\\n'\n"
+            "          '  operand. modifier_apply result was: ' + repr(res))\n"
+            "    sys.exit(2)\n"
+            "\n"
+            "bpy.ops.object.select_all(action='DESELECT')\n"
+            "ob_a.select = True\n"
+            "bpy.context.scene.objects.active = ob_a\n"
+            "bpy.ops.export_scene.obj(filepath=out_file, use_selection=True)\n"
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(src)
 
     @staticmethod
     def _unproject(lens, cam_np, render, fx, fy, Z):
