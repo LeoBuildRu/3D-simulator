@@ -120,7 +120,7 @@ class DepthReconstructor:
     # only the offending cells). LONGPOLY_CUTOFF=False disables Stage 1.
     LONGPOLY_CUTOFF = True
     LONGPOLY_MAX_EDGE_RATIO = 0.15
-    LONGPOLY_MAX_EDGE_M = 0.30
+    LONGPOLY_MAX_EDGE_M = 0.15
     LONGPOLY_PROPAGATE_CELLS = 1
     # Final mesh cleanup (runs on the finished triangle mesh — after the
     # truck-body Boolean and, if enabled, after extrapolation + volume, so it
