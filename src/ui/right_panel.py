@@ -1168,7 +1168,6 @@ class RightPanel(QWidget):
         col.addWidget(self._make_card(
             "Камера · Выравнивание",
             self._build_camera_controls(),
-            status="FOV",
         ))
 
         # ---- Bottom row: Load more + Reconstruct -------------------
@@ -1356,6 +1355,15 @@ class RightPanel(QWidget):
             )
             return lbl
 
+        # Everything below lives inside the collapsible "Дополнительно"
+        # container (FOV, roll, overlay + point-picking controls). The main
+        # camera card stays minimal — just the disclosure toggle.
+        self._adv_holder = QWidget()
+        self._adv_holder.setStyleSheet("background: transparent;")
+        ah = QVBoxLayout(self._adv_holder)
+        ah.setContentsMargins(0, 0, 0, 0)
+        ah.setSpacing(8)
+
         # ----- FOV row ------------------------------------------------
         fov_row = QHBoxLayout()
         fov_row.setContentsMargins(0, 0, 0, 0)
@@ -1378,7 +1386,7 @@ class RightPanel(QWidget):
         fov_row.addWidget(_caption("FOV"), 0, Qt.AlignmentFlag.AlignVCenter)
         fov_row.addWidget(self.fov_slider, 1, Qt.AlignmentFlag.AlignVCenter)
         fov_row.addWidget(self.fov_value_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
-        v.addLayout(fov_row)
+        ah.addLayout(fov_row)
 
         # ----- Roll dial ("крутилка" about the view axis) -------------
         roll_row = QHBoxLayout()
@@ -1434,7 +1442,7 @@ class RightPanel(QWidget):
         roll_row.addWidget(self.roll_dial, 0, Qt.AlignmentFlag.AlignVCenter)
         roll_row.addWidget(self.roll_value_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
         roll_row.addWidget(self.btn_roll_reset, 0, Qt.AlignmentFlag.AlignVCenter)
-        v.addLayout(roll_row)
+        ah.addLayout(roll_row)
 
         # ----- Reference-overlay controls (stand snapshots only) ------
         self._ref_controls_holder = QWidget()
@@ -1558,10 +1566,12 @@ class RightPanel(QWidget):
         pts_row.addWidget(self.btn_point_viz, 0)
         rc.addLayout(pts_row)
 
+        ah.addWidget(self._ref_controls_holder)
+
         # ----- Collapsible "Дополнительно" section --------------------
-        # The overlay opacity/visibility, manual/auto point picking and the
-        # point visualisation all live behind a disclosure toggle so the main
-        # camera card stays clean. Collapsed by default.
+        # FOV, roll, overlay opacity/visibility, manual/auto point picking and
+        # the point visualisation all live behind a disclosure toggle so the
+        # main camera card stays clean. Collapsed by default.
         self._adv_toggle = QToolButton()
         self._adv_toggle.setText("  Дополнительно")
         self._adv_toggle.setCheckable(True)
@@ -1572,7 +1582,7 @@ class RightPanel(QWidget):
         )
         self._adv_toggle.setArrowType(Qt.ArrowType.RightArrow)
         self._adv_toggle.setToolTip(
-            "Наложение снимка, ручной/авто выбор опорных точек, "
+            "FOV, крен, наложение снимка, ручной/авто выбор опорных точек, "
             "визуализация точек."
         )
         self._adv_toggle.setStyleSheet(
@@ -1586,7 +1596,7 @@ class RightPanel(QWidget):
         )
 
         def _on_adv_toggled(checked: bool):
-            self._ref_controls_holder.setVisible(bool(checked))
+            self._adv_holder.setVisible(bool(checked))
             self._adv_toggle.setArrowType(
                 Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
             )
@@ -1599,10 +1609,10 @@ class RightPanel(QWidget):
         self._adv_toggle.toggled.connect(_on_adv_toggled)
 
         # Collapsed initially: the advanced controls are hidden until expanded.
-        self._ref_controls_holder.setVisible(False)
+        self._adv_holder.setVisible(False)
 
         v.addWidget(self._adv_toggle)
-        v.addWidget(self._ref_controls_holder)
+        v.addWidget(self._adv_holder)
         return holder
 
     def set_point_count(self, n: int) -> None:

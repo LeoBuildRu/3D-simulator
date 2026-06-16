@@ -664,8 +664,6 @@ class MainWindow(QMainWindow):
         # ---- Depth-fill reconstruction (N-point picking) -----------
         self._active_stand_rec = None
         self._last_auto_recon_depth = ""   # de-dupe auto-reconstruct calls
-        self._build_scheduled = False      # coalesce snapshot auto-builds
-        self._pending_build_depth = ""
         try:
             from src.rendering.depth_reconstruction import DepthReconstructor
             self.depth_reconstructor = DepthReconstructor(panda_app)
@@ -967,6 +965,12 @@ class MainWindow(QMainWindow):
             print("[Recon] panda_app not attached - aborting.")
             return
         if rec is None:
+            return
+
+        # Stand snapshots use the depth pipeline (anchor points + depth map),
+        # not the server JSON/PLY mesh reconstruction.
+        if getattr(rec, "data_type", "") == "stand":
+            self._run_stand_reconstruction(rec)
             return
 
         recon_module = getattr(self.panda_app, "mesh_reconstruction", None)
@@ -1838,10 +1842,19 @@ class MainWindow(QMainWindow):
                 lens = camnode.node().get_lens()
                 if lens is not None and hasattr(lens, "get_fov"):
                     fov = float(lens.get_fov().x)
+            # Remember the active truck model so recall restores it too.
+            model_key = None
+            rp = getattr(self, "right_panel", None)
+            if rp is not None and hasattr(rp, "current_model_key"):
+                try:
+                    model_key = rp.current_model_key()
+                except Exception:
+                    model_key = None
             return {
                 "pos": [float(pos.x), float(pos.y), float(pos.z)],
                 "hpr": [float(hpr[0]), float(hpr[1]), float(hpr[2])],
                 "fov": fov,
+                "model": model_key,
             }
         except Exception as exc:
             print(f"[Preset] capture failed: {exc}")
@@ -2028,6 +2041,9 @@ class MainWindow(QMainWindow):
                 self._on_camera_mode("free")
         except Exception as exc:
             print(f"[Preset] switch to free failed: {exc}")
+        # Restore the truck model bound to the preset (if any), loading it only
+        # when it differs from the one already on the scene.
+        self._apply_preset_model(preset.get("model"))
         try:
             px, py, pz = preset.get("pos", [0.0, 0.0, 0.0])
             h, p, r = preset.get("hpr", [0.0, 0.0, 0.0])
@@ -2050,6 +2066,33 @@ class MainWindow(QMainWindow):
             print(f"[Preset] recalled slot {slot + 1}")
         except Exception as exc:
             print(f"[Preset] recall failed: {exc}")
+
+    def _apply_preset_model(self, model_key) -> None:
+        """Select + load the truck model bound to a preset. No-op when the key
+        is empty or that model set is already the active one."""
+        if not model_key:
+            return
+        model_key = str(model_key)
+        rp = getattr(self, "right_panel", None)
+        already = False
+        if rp is not None and hasattr(rp, "current_model_key"):
+            try:
+                already = (rp.current_model_key() == model_key)
+            except Exception:
+                already = False
+        # Reflect the choice in the combo (blocks its signal — no double load).
+        if rp is not None and hasattr(rp, "set_current_model_key"):
+            try:
+                rp.set_current_model_key(model_key)
+            except Exception as exc:
+                print(f"[Preset] set_current_model_key failed: {exc}")
+        if already:
+            return
+        try:
+            self._on_model_set_changed(model_key)
+            print(f"[Preset] model loaded: {model_key}")
+        except Exception as exc:
+            print(f"[Preset] model load failed: {exc}")
 
     def _on_preset_save_armed(self, checked: bool) -> None:
         self._set_preset_save_armed(bool(checked))
@@ -2165,8 +2208,13 @@ class MainWindow(QMainWindow):
         self._mirror_depth_camera_fov()
 
     def _on_stand_reference_selected(self, rec) -> None:
-        """Show / hide the full-viewport reference snapshot used for manual
-        camera alignment. `rec` is a stand Reconstruction, or None."""
+        """Selecting a stand snapshot. Jumps the camera to the FIRST saved
+        preset (so its bound anchor points line up with the live view) and
+        feeds the snapshot's depth/colour to the reconstructor. It does NOT
+        reconstruct — that happens only when the user presses the
+        "Реконструировать" button (_on_reconstruction_run).
+
+        `rec` is a stand Reconstruction, or None."""
         ov = getattr(self, "reference_overlay", None)
         if ov is None:
             return
@@ -2190,24 +2238,23 @@ class MainWindow(QMainWindow):
                 (getattr(rec, "color_path", "") or "").strip(),
             )
         ov.set_image(path)
-        # Manual alignment needs a movable camera — drop into free-fly so
-        # WASD / RMB-look work (STATIC / BOARD freeze the camera).
-        if getattr(self, "_camera_mode", None) != "free":
-            try:
-                self._on_camera_mode("free")
-            except Exception as exc:
-                print(f"[Camera] auto free-mode for alignment failed: {exc}")
-
-        # If the camera is parked at a saved preset that carries anchor points,
-        # this is a one-click "восстановление по глубине (стенд)": load those
-        # points and rebuild automatically. The alignment photo is NOT shown —
-        # the user isn't aligning by hand, and a translucent frame over the
-        # fresh mesh just gets in the way (full frame is on the preview button).
-        depth_p = (getattr(rec, "depth_path", "") or "").strip()
-        preset_pts = self._matching_preset_points() if depth_p else None
 
         rp = getattr(self, "right_panel", None)
-        if preset_pts is not None:
+        # Jump to the first camera preset, if one is saved. Its bound anchor
+        # points then match the live view, ready for the reconstruct button.
+        applied_preset = False
+        presets = getattr(self, "_cam_presets", None) or []
+        if presets and isinstance(presets[0], dict):
+            try:
+                self._recall_preset(0)
+                applied_preset = True
+            except Exception as exc:
+                print(f"[Preset] авто-применение первого пресета упало: {exc}")
+
+        if applied_preset:
+            # At a preset → no manual alignment needed; keep the overlay hidden
+            # (it's available via "Дополнительно" → "Показать снимок", and the
+            # full frame is on the list's preview button).
             ov.hide_overlay()
             if rp is not None and hasattr(rp, "btn_ref_toggle"):
                 try:
@@ -2217,20 +2264,17 @@ class MainWindow(QMainWindow):
                     rp.btn_ref_toggle.blockSignals(blocked)
                 except Exception:
                     pass
-            if dr is not None:
-                try:
-                    dr.set_saved_films(preset_pts)
-                    print(f"[Preset] камера в пресете → авто-восстановление "
-                          f"по {len(preset_pts)} опорным точкам")
-                except Exception as exc:
-                    print(f"[Preset] set_saved_films failed: {exc}")
-            self._schedule_snapshot_build(depth_p)
             return
 
-        # No matching preset → manual-alignment behaviour: show the reference
-        # photo so the user can fly the camera to match it (e.g. before saving
-        # a preset). Opacity / visibility are driven from the "Дополнительно"
-        # sub-section.
+        # No preset saved yet → fall back to manual alignment: drop into
+        # free-fly and show the reference photo so the user can line the camera
+        # up and then save a preset. Opacity / visibility live in the
+        # "Дополнительно" sub-section.
+        if getattr(self, "_camera_mode", None) != "free":
+            try:
+                self._on_camera_mode("free")
+            except Exception as exc:
+                print(f"[Camera] auto free-mode for alignment failed: {exc}")
         try:
             if rp is not None and hasattr(rp, "ref_opacity_slider"):
                 ov.set_opacity(rp.ref_opacity_slider.value() / 100.0)
@@ -2243,11 +2287,6 @@ class MainWindow(QMainWindow):
             pass
         ov.show_overlay()
         self._raise_huds_above_reference()
-
-        # Reuse a prior MANUAL pick at the same camera (new depth map). The
-        # automatic point search stays an explicit action ("Авто-точки").
-        if depth_p:
-            self._schedule_snapshot_build(depth_p)
 
     def _on_reference_opacity_changed(self, value: float) -> None:
         ov = getattr(self, "reference_overlay", None)
@@ -2340,31 +2379,42 @@ class MainWindow(QMainWindow):
         if rp is not None:
             rp.set_point_count(int(n))
 
-    def _schedule_snapshot_build(self, depth_p: str) -> None:
-        """Coalesce the auto-build for a stand snapshot. Selecting a row fires
-        the signal twice (currentItemChanged + itemClicked); a 0-delay timer
-        collapses that into one build, while a real re-click still rebuilds."""
-        self._pending_build_depth = depth_p
-        if getattr(self, "_build_scheduled", False):
-            return
-        self._build_scheduled = True
-        QTimer.singleShot(0, self._run_pending_snapshot_build)
-
-    def _run_pending_snapshot_build(self) -> None:
-        self._build_scheduled = False
-        depth_p = getattr(self, "_pending_build_depth", "")
+    def _run_stand_reconstruction(self, rec) -> None:
+        """Run the depth reconstruction for a stand snapshot when the user
+        presses "Реконструировать". Uses the anchor points bound to the camera
+        preset the view is parked at (or a prior manual pick as a fallback)."""
         dr = getattr(self, "depth_reconstructor", None)
-        if dr is None or not depth_p or dr.is_picking():
+        if dr is None:
+            print("[DepthRecon] реконструктор недоступен.")
             return
-        # Only reuse a saved MANUAL pick; never run the automatic point search
-        # on snapshot selection (that's the "Авто-точки" button now).
-        if not dr.has_manual_saved_points():
+        if dr.is_picking():
+            print("[DepthRecon] идёт выбор точек — завершите его сначала.")
             return
+        depth_p = (getattr(rec, "depth_path", "") or "").strip()
+        if not depth_p or not os.path.exists(depth_p):
+            print("[DepthRecon] у снимка нет карты глубины.")
+            return
+        dr.set_source(depth_p, (getattr(rec, "color_path", "") or "").strip())
+
+        preset_pts = self._matching_preset_points()
+        if preset_pts is not None:
+            try:
+                dr.set_saved_films(preset_pts)
+                print(f"[DepthRecon] восстановление по {len(preset_pts)} "
+                      f"опорным точкам пресета.")
+            except Exception as exc:
+                print(f"[DepthRecon] set_saved_films failed: {exc}")
+        elif not dr.has_manual_saved_points():
+            print("[DepthRecon] нет опорных точек: камера не в пресете и нет "
+                  "ручного выбора. Примените пресет с точками или выберите "
+                  "точки в «Дополнительно».")
+            return
+
         self._last_auto_recon_depth = depth_p
         try:
             dr.reconstruct_saved(depth_p)
         except Exception as exc:
-            print(f"[DepthRecon] реконструкция по сохранённым точкам упала: {exc}")
+            print(f"[DepthRecon] реконструкция упала: {exc}")
 
     def _on_auto_points_requested(self) -> None:
         """Explicit automatic anchor-point search + rebuild for the active
