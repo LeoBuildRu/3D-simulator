@@ -356,6 +356,10 @@ class DepthReconstructor:
         self._color_path = ""
 
         self._picking = False
+        # When set, finishing a pick hands the collected film coords to this
+        # callback (used to bind anchor points to a camera preset) instead of
+        # running a reconstruction.
+        self._commit_cb = None
         self._films: list[tuple[float, float]] = []   # clicked film coords
         self._hits: list[Point3] = []                 # raycast world points
         # Film coords of the last successful pick — reused to auto-reconstruct
@@ -395,11 +399,21 @@ class DepthReconstructor:
     def is_picking(self) -> bool:
         return self._picking
 
-    def start_picking(self) -> None:
+    def start_picking(self, commit_cb=None) -> None:
+        """Enter point-picking mode.
+
+        Normally finishing the pick (RMB / Esc) runs a reconstruction. If
+        `commit_cb` is given the collected film coords are handed back to it
+        instead — used to bind anchor points to a camera preset, where no
+        depth map is required (we only raycast against the truck)."""
         if self._picking:
             return
-        if not self._depth_path or not os.path.exists(self._depth_path):
+        self._commit_cb = commit_cb
+        # Preset binding only needs the truck collider, not a depth map.
+        if commit_cb is None and (
+                not self._depth_path or not os.path.exists(self._depth_path)):
             self._log("Нет карты глубины для реконструкции.")
+            self._commit_cb = None
             return
         self._picking = True
         self.clear_points()
@@ -428,6 +442,7 @@ class DepthReconstructor:
         if not self._picking:
             return
         self._picking = False
+        self._commit_cb = None
         if self._do is not None:
             try:
                 self._do.ignore_all()
@@ -450,8 +465,18 @@ class DepthReconstructor:
         points; otherwise just cancel and restore the UI."""
         if not self._picking:
             return
-        n = len(self._films)
+        films = list(self._films)
+        n = len(films)
+        commit_cb = self._commit_cb   # captured before stop_picking clears it
         self.stop_picking()
+        if commit_cb is not None:
+            # Preset binding: hand the picked film coords back; do NOT rebuild.
+            self.clear_points()
+            try:
+                commit_cb(films)
+            except Exception as exc:
+                self._log(f"commit опорных точек упал: {exc}")
+            return
         if n >= self.MIN_POINTS:
             self._auto_mode = False     # manual pick overrides auto mode
             self.reconstruct()
@@ -984,6 +1009,19 @@ class DepthReconstructor:
         """True only for points saved from a MANUAL pick. These are reused
         automatically on snapshot switch; auto-found points are not."""
         return self.has_saved_points() and not self._auto_mode
+
+    def set_saved_films(self, films) -> None:
+        """Load externally-stored anchor film coords (e.g. bound to a camera
+        preset) as the saved points. Marked as a manual pick so they rebuild
+        automatically on snapshot selection (reconstruct_saved)."""
+        cleaned: list[tuple[float, float]] = []
+        for f in films or []:
+            try:
+                cleaned.append((float(f[0]), float(f[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        self._saved_films = cleaned
+        self._auto_mode = False
 
     def clear_saved_points(self) -> None:
         self._saved_films = []

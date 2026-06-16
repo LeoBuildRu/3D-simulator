@@ -1558,6 +1558,50 @@ class RightPanel(QWidget):
         pts_row.addWidget(self.btn_point_viz, 0)
         rc.addLayout(pts_row)
 
+        # ----- Collapsible "Дополнительно" section --------------------
+        # The overlay opacity/visibility, manual/auto point picking and the
+        # point visualisation all live behind a disclosure toggle so the main
+        # camera card stays clean. Collapsed by default.
+        self._adv_toggle = QToolButton()
+        self._adv_toggle.setText("  Дополнительно")
+        self._adv_toggle.setCheckable(True)
+        self._adv_toggle.setChecked(False)
+        self._adv_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._adv_toggle.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self._adv_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self._adv_toggle.setToolTip(
+            "Наложение снимка, ручной/авто выбор опорных точек, "
+            "визуализация точек."
+        )
+        self._adv_toggle.setStyleSheet(
+            "QToolButton {"
+            "  background: transparent;"
+            f"  color: {COLOR_TEXT_MUTED};"
+            "  border: none; padding: 2px 0;"
+            "  font-size: 10px; font-weight: 600; letter-spacing: 1.0px;"
+            "}"
+            f"QToolButton:hover {{ color: {COLOR_TEXT}; }}"
+        )
+
+        def _on_adv_toggled(checked: bool):
+            self._ref_controls_holder.setVisible(bool(checked))
+            self._adv_toggle.setArrowType(
+                Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+            )
+            if hasattr(self, "_reposition"):
+                try:
+                    self._reposition()
+                except Exception:
+                    pass
+
+        self._adv_toggle.toggled.connect(_on_adv_toggled)
+
+        # Collapsed initially: the advanced controls are hidden until expanded.
+        self._ref_controls_holder.setVisible(False)
+
+        v.addWidget(self._adv_toggle)
         v.addWidget(self._ref_controls_holder)
         return holder
 

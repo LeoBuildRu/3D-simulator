@@ -464,8 +464,9 @@ class MainWindow(QMainWindow):
             self._btn_preset_save.setCursor(Qt.CursorShape.PointingHandCursor)
             self._btn_preset_save.setFixedHeight(22)
             self._btn_preset_save.setToolTip(
-                "Нажмите — слоты замигают; затем выберите слот 1/2/3,\n"
-                "чтобы сохранить туда текущую позицию, FOV и крен"
+                "Нажмите — слоты замигают; выберите слот 1/2/3, затем\n"
+                "кликайте опорные точки на кузове (кадр наложится на 30%).\n"
+                "ПКМ или Esc — завершить. Сохранятся поза, FOV, крен и точки"
             )
             self._btn_preset_save.toggled.connect(self._on_preset_save_armed)
             ph_lay.addWidget(self._btn_preset_save, 1)
@@ -1846,18 +1847,158 @@ class MainWindow(QMainWindow):
             print(f"[Preset] capture failed: {exc}")
             return None
 
-    def _save_preset(self, slot: int) -> None:
+    # Opacity of the original frame shown while binding a preset's anchor
+    # points (lets the user see the reference photo under their clicks).
+    _PRESET_PICK_OPACITY = 0.30
+
+    def _begin_preset_capture(self, slot: int) -> None:
+        """Saving a preset is a two-step flow: snapshot the camera pose, then
+        let the user click any number of anchor points on the truck (with the
+        reference frame overlaid at 30 %). The pose + picked film coords are
+        persisted together when picking finishes."""
         if not (0 <= slot < 3):
             return
         state = self._capture_camera_state()
         if state is None:
             print("[Preset] nothing to save (no camera).")
             return
+        self._pending_preset_slot = slot
+        self._pending_preset_state = state
+
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is None or getattr(dr, "is_picking", lambda: False)():
+            # No reconstructor (or already picking) — save pose only.
+            self._commit_preset_points([])
+            return
+
+        # Point the reconstructor at the active stand snapshot (for the truck
+        # collider + the overlay frame), then arm the 30 %-opacity overlay.
+        rec = getattr(self, "_active_stand_rec", None)
+        if rec is not None:
+            try:
+                dr.set_source(
+                    (getattr(rec, "depth_path", "") or "").strip(),
+                    (getattr(rec, "color_path", "") or "").strip(),
+                )
+            except Exception:
+                pass
+        self._begin_preset_overlay(rec)
+
+        dr.start_picking(commit_cb=self._commit_preset_points)
+        if not dr.is_picking():
+            # Couldn't start (e.g. truck model missing) — save pose only.
+            self._restore_preset_overlay()
+            self._commit_preset_points([])
+
+    def _begin_preset_overlay(self, rec) -> None:
+        """Show the reference frame at 30 % over the viewport so the user can
+        see where to click anchor points. Remembers the prior overlay state so
+        it can be restored afterwards."""
+        ov = getattr(self, "reference_overlay", None)
+        if ov is None:
+            return
+        path = ""
+        if rec is not None:
+            path = (getattr(rec, "color_path", "") or "").strip() \
+                or (getattr(rec, "path", "") or "").strip()
+        try:
+            self._preset_overlay_prev_visible = bool(ov.isVisible())
+            self._preset_overlay_prev_opacity = float(ov.windowOpacity())
+        except Exception:
+            self._preset_overlay_prev_visible = False
+            self._preset_overlay_prev_opacity = 0.5
+        if path:
+            ov.set_image(path)
+        ov.set_opacity(self._PRESET_PICK_OPACITY)
+        ov.show_overlay()
+        self._raise_huds_above_reference()
+
+    def _restore_preset_overlay(self) -> None:
+        """Undo _begin_preset_overlay: restore opacity from the panel slider
+        and hide the overlay unless a stand row is still the active selection."""
+        ov = getattr(self, "reference_overlay", None)
+        if ov is None:
+            return
+        rp = getattr(self, "right_panel", None)
+        try:
+            if rp is not None and hasattr(rp, "ref_opacity_slider"):
+                ov.set_opacity(rp.ref_opacity_slider.value() / 100.0)
+            else:
+                ov.set_opacity(getattr(self, "_preset_overlay_prev_opacity", 0.5))
+        except Exception:
+            pass
+        if not getattr(self, "_preset_overlay_prev_visible", False):
+            ov.hide_overlay()
+
+    def _commit_preset_points(self, films) -> None:
+        """Finish a preset capture: store the pose + picked film coords into
+        the slot and persist them to disk."""
+        slot = getattr(self, "_pending_preset_slot", None)
+        state = getattr(self, "_pending_preset_state", None)
+        self._pending_preset_slot = None
+        self._pending_preset_state = None
+        self._restore_preset_overlay()
+        if slot is None or state is None or not (0 <= slot < 3):
+            return
+        pts = []
+        for f in films or []:
+            try:
+                pts.append([float(f[0]), float(f[1])])
+            except (TypeError, ValueError, IndexError):
+                continue
+        state = dict(state)
+        state["points"] = pts
         self._cam_presets[slot] = state
         self._selected_preset = slot          # saving selects the slot
         self._save_cam_presets()
         self._apply_preset_styles()
-        print(f"[Preset] saved slot {slot + 1}: {state}")
+        print(f"[Preset] saved slot {slot + 1}: поза + {len(pts)} опорных точек")
+
+    # Tolerances for deciding the live camera is "at" a saved preset, so its
+    # bound anchor points can drive an automatic reconstruction.
+    _PRESET_MATCH_POS_TOL = 0.08      # world units
+    _PRESET_MATCH_ANG_TOL = 1.0       # degrees (per H/P/R axis)
+
+    @staticmethod
+    def _angle_close(a: float, b: float, tol: float) -> bool:
+        d = (float(a) - float(b) + 180.0) % 360.0 - 180.0
+        return abs(d) <= tol
+
+    def _camera_matches_preset(self, state: dict, preset: dict) -> bool:
+        """True if the current camera pose (position + rotation) matches a
+        saved preset within tolerance."""
+        try:
+            sp, pp = state.get("pos"), preset.get("pos")
+            sh, ph = state.get("hpr"), preset.get("hpr")
+            if not (sp and pp and sh and ph):
+                return False
+            for a, b in zip(sp, pp):
+                if abs(float(a) - float(b)) > self._PRESET_MATCH_POS_TOL:
+                    return False
+            for a, b in zip(sh, ph):
+                if not self._angle_close(a, b, self._PRESET_MATCH_ANG_TOL):
+                    return False
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _matching_preset_points(self) -> list | None:
+        """If the live camera is at a saved preset that carries enough anchor
+        points, return those points (list of [fx, fy]); else None."""
+        dr = getattr(self, "depth_reconstructor", None)
+        min_pts = getattr(dr, "MIN_POINTS", 2) if dr is not None else 2
+        state = self._capture_camera_state()
+        if state is None:
+            return None
+        for preset in getattr(self, "_cam_presets", []) or []:
+            if not isinstance(preset, dict):
+                continue
+            pts = preset.get("points") or []
+            if len(pts) < min_pts:
+                continue
+            if self._camera_matches_preset(state, preset):
+                return pts
+        return None
 
     def _clear_preset(self, slot: int) -> None:
         if not (0 <= slot < 3):
@@ -1917,8 +2058,8 @@ class MainWindow(QMainWindow):
         # Save mode → write the current camera into this slot, select it,
         # and leave save mode (stops the blinking).
         if getattr(self, "_preset_save_armed", False):
-            self._save_preset(slot)           # also selects the slot
             self._set_preset_save_armed(False)
+            self._begin_preset_capture(slot)  # captures pose, then anchor points
             return
         # Normal mode → load the preset if the slot holds one. Empty slots
         # do nothing (no accidental auto-save).
@@ -1931,12 +2072,13 @@ class MainWindow(QMainWindow):
         if btn is None:
             return
         menu = QMenu(btn)
-        act_save = menu.addAction(f"Сохранить текущую в слот {slot + 1}")
+        act_save = menu.addAction(
+            f"Сохранить камеру + опорные точки в слот {slot + 1}")
         act_clear = menu.addAction("Очистить слот")
         act_clear.setEnabled(self._cam_presets[slot] is not None)
         chosen = menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
         if chosen is act_save:
-            self._save_preset(slot)
+            self._begin_preset_capture(slot)
         elif chosen is act_clear:
             self._clear_preset(slot)
 
@@ -2055,12 +2197,43 @@ class MainWindow(QMainWindow):
                 self._on_camera_mode("free")
             except Exception as exc:
                 print(f"[Camera] auto free-mode for alignment failed: {exc}")
-        # Apply the current opacity from the panel slider, if present.
+
+        # If the camera is parked at a saved preset that carries anchor points,
+        # this is a one-click "восстановление по глубине (стенд)": load those
+        # points and rebuild automatically. The alignment photo is NOT shown —
+        # the user isn't aligning by hand, and a translucent frame over the
+        # fresh mesh just gets in the way (full frame is on the preview button).
+        depth_p = (getattr(rec, "depth_path", "") or "").strip()
+        preset_pts = self._matching_preset_points() if depth_p else None
+
         rp = getattr(self, "right_panel", None)
+        if preset_pts is not None:
+            ov.hide_overlay()
+            if rp is not None and hasattr(rp, "btn_ref_toggle"):
+                try:
+                    blocked = rp.btn_ref_toggle.blockSignals(True)
+                    rp.btn_ref_toggle.setChecked(False)
+                    rp.btn_ref_toggle.setText("Показать снимок")
+                    rp.btn_ref_toggle.blockSignals(blocked)
+                except Exception:
+                    pass
+            if dr is not None:
+                try:
+                    dr.set_saved_films(preset_pts)
+                    print(f"[Preset] камера в пресете → авто-восстановление "
+                          f"по {len(preset_pts)} опорным точкам")
+                except Exception as exc:
+                    print(f"[Preset] set_saved_films failed: {exc}")
+            self._schedule_snapshot_build(depth_p)
+            return
+
+        # No matching preset → manual-alignment behaviour: show the reference
+        # photo so the user can fly the camera to match it (e.g. before saving
+        # a preset). Opacity / visibility are driven from the "Дополнительно"
+        # sub-section.
         try:
             if rp is not None and hasattr(rp, "ref_opacity_slider"):
                 ov.set_opacity(rp.ref_opacity_slider.value() / 100.0)
-            # Reset the show/hide toggle to "shown".
             if rp is not None and hasattr(rp, "btn_ref_toggle"):
                 blocked = rp.btn_ref_toggle.blockSignals(True)
                 rp.btn_ref_toggle.setChecked(True)
@@ -2071,10 +2244,8 @@ class MainWindow(QMainWindow):
         ov.show_overlay()
         self._raise_huds_above_reference()
 
-        # Selecting a stand snapshot only rebuilds when a MANUAL pick was
-        # saved (same camera, new depth map). Automatic point search is no
-        # longer triggered here — it's an explicit action ("Авто-точки").
-        depth_p = (getattr(rec, "depth_path", "") or "").strip()
+        # Reuse a prior MANUAL pick at the same camera (new depth map). The
+        # automatic point search stays an explicit action ("Авто-точки").
         if depth_p:
             self._schedule_snapshot_build(depth_p)
 
