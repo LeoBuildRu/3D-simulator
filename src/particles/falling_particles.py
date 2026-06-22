@@ -191,7 +191,7 @@ class WarpFallingParticles:
         camera_np: Optional[NodePath] = None,
         effect_path: Optional[str] = None,
         effect_options: Optional[Dict[str, Any]] = None,
-        device: str = "cuda",
+        device: Optional[str] = None,
         task_name: Optional[str] = None,
         max_dt: float = 1.0 / 30.0,
         alpha_blend: bool = True,
@@ -205,8 +205,9 @@ class WarpFallingParticles:
         self.random_rotation = 1 if rotation_mode == self.RANDOM_ROTATION else 0
         self.effect_path = effect_path
         self.effect_options = dict(effect_options or {})
-        self.device = device
-        self.device_info = wp.get_device(device)
+        self.device = self._resolve_device(device)
+        self.device_info = wp.get_device(self.device)
+        self.is_cuda = self.device_info.is_cuda
         self.max_dt = float(max_dt)
         self.task_name = task_name or f"warp-falling-particles-{id(self)}"
         self.alpha_blend = alpha_blend
@@ -253,6 +254,25 @@ class WarpFallingParticles:
             self.start()
 
     @staticmethod
+    def _resolve_device(device: Optional[str]) -> str:
+        """Pick a usable Warp device, falling back to CPU when CUDA is absent.
+
+        A specific device string is honoured if Warp reports it as available;
+        otherwise (and when device is None) we prefer the first CUDA device and
+        fall back to "cpu" so the simulation also runs on machines without a GPU.
+        """
+        if device is not None:
+            try:
+                if wp.is_device_available(wp.get_device(device)):
+                    return device
+            except Exception:
+                pass
+
+        if wp.is_cuda_available():
+            return "cuda"
+        return "cpu"
+
+    @staticmethod
     def _validate_vec3(name: str, value: Tuple[float, float, float]) -> np.ndarray:
         vector = np.asarray(value, dtype=np.float32)
         if vector.shape != (3,):
@@ -291,10 +311,14 @@ class WarpFallingParticles:
         self.spin_axes = wp.empty(self.count, dtype=cvec, device=self.device)
         self.respawn_counts = wp.zeros(self.count, dtype=wp.int32, device=self.device)
 
-        self.positions_cpu = wp.zeros(self.count, dtype=cvec, device="cpu", pinned=True)
-        self.sizes_cpu = wp.zeros(self.count, dtype=cnum, device="cpu", pinned=True)
-        self.spin_angles_cpu = wp.zeros(self.count, dtype=cnum, device="cpu", pinned=True)
-        self.spin_axes_cpu = wp.zeros(self.count, dtype=cvec, device="cpu", pinned=True)
+        # Pinned host memory only makes sense (and is only supported) for
+        # CUDA<->host transfers. On a CPU device the staging arrays alias the
+        # compute arrays, so pinning is both unnecessary and unsupported.
+        pinned = self.is_cuda
+        self.positions_cpu = wp.zeros(self.count, dtype=cvec, device="cpu", pinned=pinned)
+        self.sizes_cpu = wp.zeros(self.count, dtype=cnum, device="cpu", pinned=pinned)
+        self.spin_angles_cpu = wp.zeros(self.count, dtype=cnum, device="cpu", pinned=pinned)
+        self.spin_axes_cpu = wp.zeros(self.count, dtype=cvec, device="cpu", pinned=pinned)
 
     def _default_effect_path(self) -> str:
         project_root = os.path.dirname(os.path.dirname(
