@@ -398,3 +398,30 @@ class TLS_client:
                 f.write(resp.content)
         except Exception as e:
             raise RuntimeError(f"Ошибка скачивания текстуры {filename} из {textures_dir}: {e}")
+
+    # ====================== Depth-пайплайн ======================
+    def list_depth_records(self, limit: int = 50) -> list:
+        """Возвращает список depth-записей с сервера (новые первыми)."""
+        response = self._post("list_depth_records", {"limit": int(limit)})
+        if response.get("status") != "success":
+            raise RuntimeError(
+                f"Ошибка получения depth-записей: {response.get('error', 'Неизвестная ошибка')}"
+            )
+        return response.get("records", []) or []
+
+    def download_depth_file(self, kind: str, name: str, local_path: str) -> None:
+        """Скачивает один файл из depth-пайплайна.
+        kind ∈ {'anydepth_png','anydepth_npy','masked','debarrel','uploaded'}."""
+        import os as _os
+        params = {"kind": kind, "name": name}
+        url = f"{self.base_url}/download_depth_file"
+        try:
+            resp = requests.get(url, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            parent_dir = _os.path.dirname(local_path)
+            if parent_dir:
+                _os.makedirs(parent_dir, exist_ok=True)
+            with open(local_path, 'wb') as f:
+                f.write(resp.content)
+        except Exception as e:
+            raise RuntimeError(f"Ошибка скачивания depth-файла {kind}:{name}: {e}")

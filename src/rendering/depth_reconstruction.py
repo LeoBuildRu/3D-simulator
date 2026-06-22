@@ -121,7 +121,9 @@ class DepthReconstructor:
     LONGPOLY_CUTOFF = True
     LONGPOLY_MAX_EDGE_RATIO = 0.15
     LONGPOLY_MAX_EDGE_M = 0.15
-    LONGPOLY_PROPAGATE_CELLS = 1
+    # 0 = срезаем только ту самую ячейку, без пропагации drop'ов на соседей,
+    # иначе края рельефа «отъедаются» лишним рядом ячеек и появляются дыры.
+    LONGPOLY_PROPAGATE_CELLS = 0
     # Final mesh cleanup (runs on the finished triangle mesh — after the
     # truck-body Boolean and, if enabled, after extrapolation + volume, so it
     # catches near-vertical walls no matter which stage created them; the
@@ -147,7 +149,10 @@ class DepthReconstructor:
     # near-wall steep face directly. Set STEEP_EDGE_ONLY=False to remove every
     # steep face regardless of distance to the walls.
     STEEP_CUTOFF = True
-    STEEP_MAX_ANGLE_DEG = 70.0
+    # 80° совпадает с EXTRAP_MAX_ANGLE_DEG — финальная очистка пропускает
+    # естественные крутые descent-стенки, но рубит ярко-вертикальные
+    # артефакты (борта кузова, окклюзионные стенки).
+    STEEP_MAX_ANGLE_DEG = 80.0
     STEEP_REMOVE_RADIUS_M = 0.01
     STEEP_EDGE_ONLY = True
     STEEP_NEAR_WALL_M = 0.5
@@ -179,19 +184,31 @@ class DepthReconstructor:
     # are inside. This is the mask-free replacement for the old 2D fill
     # mask: the truck-body solid bounds the mesh in 3D instead.
     CLIP_TO_NAPOLNITEL = True
-    # Stage 3 — legacy extrapolation + sealed-solid Boolean DIFFERENCE +
-    # volume. Disabled for now; set both True to bring the old behaviour
-    # back (it rebuilds the geometry from the grid, see reconstruct()).
+    # Stage 3 — legacy extrapolation + sealed-solid Boolean DIFFERENCE с
+    # napolnitel'ом (MAZ_napolnitel.obj — TONAR_OBJ_REL_PATH ниже) и
+    # подсчёт объёма получившейся замкнутой геометрии.
+    # Extrapolation removed from the pipeline; the function and helpers
+    # below are no longer called.
     ENABLE_EXTRAPOLATION = False
-    ENABLE_VOLUME = ENABLE_EXTRAPOLATION
+    # Boolean DIFFERENCE (sealed-solid volume) DEACTIVATED but the code
+    # — _clip_relief_to_target and friends — is preserved in this file
+    # for future use.
+    ENABLE_VOLUME = False
     # ==================================================================
-    # Per-snapshot fill mask (<depth>-mask.png, RGBA). DISABLED by default
-    # now (USE_MASKS=False) — the truck-body Boolean (Stage 2) bounds the
-    # mesh instead. When turned back on and a mask exists, the mesh covers
-    # exactly the masked pixels (alpha > MASK_ALPHA_MIN); otherwise the
-    # WHOLE frame is reconstructed.
-    USE_MASKS = False
-    MASK_SUFFIX = "-mask.png"
+    # Per-snapshot fill mask. The masked depth is a sibling of the full depth:
+    #   <name>_depth.png       — full depth map (load + body + background),
+    #                            used for anchor-point calibration.
+    #   <name>_depth_mask.png  — RGBA copy with alpha=0 outside the load (made
+    #                            by hand in Photoshop). The alpha channel is
+    #                            the inside-mask used for grid sampling; the
+    #                            RGB channel carries the depth values for the
+    #                            relief grid.
+    # When USE_MASKS=True and the mask file exists, anchors sample the full
+    # depth while the relief grid samples the masked depth — vertices climbing
+    # the body walls are excluded at the source instead of being 3D-clipped.
+    # Without the mask file the old single-depth path is used.
+    USE_MASKS = True
+    MASK_SUFFIX = "_mask.png"
     MASK_ALPHA_MIN = 0.5
     # The mesh-cell rule keeps a cell only when all 4 of its corners are in the
     # mask, which erodes the kept region inward by ~1 grid cell along the whole
@@ -204,12 +221,15 @@ class DepthReconstructor:
     # pattern outside the mask's XY bbox. The trend (plane fit) is added
     # back so the seam stays C0-continuous. Set to None to disable and
     # keep the original mask-only mesh.
+    # Unused while extrapolation is removed from the pipeline. Kept here
+    # because _clip_relief_to_target (boolean code) still references it.
     TARGET_SIZE_M = (3.0, 6.0)  # XY-прямоугольник (м), покрывает MAZ ≈ 2.14×5.10
-    # Density of the target grid (vertices per metre along X and Y).
-    TARGET_RES_PER_M = 25
+    TARGET_RES_PER_M = 35
     # Light smoothing of the target grid AFTER extrapolation (mask data is
-    # preserved — only extrapolated cells are smoothed). 0 = off.
-    TARGET_SMOOTH_ITERS = 0  # сглаживание целевой сетки временно отключено
+    # preserved — only extrapolated cells are smoothed). 3 итерации —
+    # компромисс: разрывы вдоль кромки закрываются, но рельеф не
+    # «размывается» лишним усреднением.
+    TARGET_SMOOTH_ITERS = 3
     # Outside the mask the relief descends. The descent rate at each external
     # cell is the steeper of two contenders:
     #   • the LOCAL OUTWARD GRADIENT at the nearest in-mask boundary cell —
@@ -221,21 +241,18 @@ class DepthReconstructor:
     #     the boundary gradient is flat or rising (e.g. behind a hidden
     #     peak), so the relief still drops at a natural granular slope
     #     instead of plateauing.
-    # 30-45° covers most granular materials; the gradient takes over when
-    # the visible face is steeper than this.
-    EXTRAP_ANGLE_DEG = 35.0
-    # Hard cap on the descent rate so a noisy one-sided boundary gradient
-    # can't blow up Z to nonsense values. Vertical = 90° → tan=∞; capping
-    # at 75° keeps even single-pixel artifacts bounded.
-    EXTRAP_MAX_ANGLE_DEG = 75.0
-    # Floor for the extrapolated relief: external cells are clipped at
-    # min(visible Z) − EXTRAP_FLOOR_FROM_MIN_M. None (default) → no clamp;
-    # the MAZ Boolean bounds the volume from below. A value here can
-    # introduce a "tent" plateau when the visible mask only shows the top
-    # of the pile (so min(visible Z) is well above the actual truck floor)
-    # — keep at None unless you have a reason to clip earlier than the
-    # Boolean.
-    EXTRAP_FLOOR_FROM_MIN_M = None
+    # УСТАРЕЛО: в новой архитектуре экстраполяции не используется
+    # (заменено на линейный blend к floor_z через EXTRAP_BLEND_RADIUS_M).
+    # Параметр оставлен для обратной совместимости с info-словарём.
+    EXTRAP_ANGLE_DEG = 50.0
+    EXTRAP_MAX_ANGLE_DEG = 80.0
+    # Радиус (в плоскости XY, метрах) плавного перехода Z от граничного
+    # seed-значения к floor_z. На границе маски — seed_z; за blend_radius
+    # — floor_z плато. Большое значение = более растянутый плавный
+    # спуск; малое = резкий обрыв. 0.6 м — комфортный дефолт.
+    EXTRAP_BLEND_RADIUS_M = 0.6
+    # Unused — extrapolation is no longer in the pipeline.
+    EXTRAP_FLOOR_FROM_MIN_M = 0.05
     # Optional absolute Z floor (metres). Takes effect when
     # EXTRAP_FLOOR_FROM_MIN_M is None — useful when you know the truck
     # floor in world Z.
@@ -245,7 +262,12 @@ class DepthReconstructor:
     # the extrapolated area so the hidden back side keeps the look of the
     # visible front, instead of being a featureless smooth slope. Weight
     # 0 = pure descent (smooth), 1 = full mirror-residual amplitude.
-    EXTRAP_TEXTURE_WEIGHT = 0.7
+    #
+    # 0.0 — mirror-tiling выключен: невидимые зоны заполняются плавным
+    # спуском по углу repose. Иначе при «торчащем» пике в дальней зоне он
+    # отзеркаливается в ближнюю и создаёт фантомный «бугор» у борта,
+    # которого на сцене нет.
+    EXTRAP_TEXTURE_WEIGHT = 0.0
     # Exponential decay scale (metres) of the texture amplitude with
     # distance from the mask. Cells right next to the mask boundary get
     # almost the full residual; cells far away fade smoothly to the pure
@@ -354,6 +376,7 @@ class DepthReconstructor:
 
         self._depth_path = ""
         self._color_path = ""
+        self._meta: dict = {}
 
         self._picking = False
         # When set, finishing a pick hands the collected film coords to this
@@ -391,10 +414,17 @@ class DepthReconstructor:
     # ==================================================================
     # Public API
     # ==================================================================
-    def set_source(self, depth_path: str, color_path: str = "") -> None:
-        """Point the reconstructor at the active stand snapshot."""
+    def set_source(self, depth_path: str, color_path: str = "",
+                   meta: dict | None = None) -> None:
+        """Point the reconstructor at the active stand snapshot.
+
+        `meta` (опционально) — содержимое серверного meta.json, который
+        пришёл вместе с depth-картой (например, {"type":"depth","model":"MAZ"}).
+        Сейчас он только запоминается (self._meta) для дальнейшей логики
+        (выбор модели и т.п.), но не меняет геометрию реконструкции."""
         self._depth_path = depth_path or ""
         self._color_path = color_path or ""
+        self._meta = dict(meta) if isinstance(meta, dict) else {}
 
     def is_picking(self) -> bool:
         return self._picking
@@ -735,11 +765,32 @@ class DepthReconstructor:
             self._finish(False, {})
             return False
 
-        depth = self._load_depth_norm()
-        if depth is None:
+        depth_full = self._load_depth_norm()
+        if depth_full is None:
             self._finish(False, {})
             return False
-        H, W = depth.shape
+        H, W = depth_full.shape
+
+        # Companion masked-depth (<depth>_mask.png) if it exists. Anchors are
+        # ALWAYS sampled from the full depth (they can land anywhere on the
+        # truck), but the relief grid samples this masked map and uses its
+        # alpha as the in-region mask — so vertices outside the load (e.g.
+        # climbing the body walls) are excluded at the source.
+        if self.USE_MASKS:
+            masked = self._load_masked_depth(W, H)
+        else:
+            masked = None
+        if masked is not None:
+            depth_grid, mask_alpha = masked
+            self._log(
+                f"Маска наполнения найдена ({os.path.basename(self._mask_path())}): "
+                f"калибровка по полной глубине, рельеф — по masked-depth.")
+        else:
+            depth_grid, mask_alpha = depth_full, None
+            if self.USE_MASKS:
+                self._log(
+                    "Маска наполнения не найдена — обе стадии работают по "
+                    "полной карте глубины.")
 
         app = self.panda_app
         cam_np = app.cam
@@ -755,13 +806,15 @@ class DepthReconstructor:
         fyh = self._vertical_film_span(W, H)
 
         # --- Control points: (film xy) -> (depth value, metric depth) -----
+        # Anchors sample the FULL depth — they can land on the body, not the
+        # load, where the masked-depth file has alpha=0.
         cfx = np.asarray([f[0] for f in self._films[:n_pts]], dtype=np.float64)
         cfy = np.asarray([f[1] for f in self._films[:n_pts]], dtype=np.float64)
         d_ctrl = np.empty(n_pts, dtype=np.float64)
         z_ctrl = np.empty(n_pts, dtype=np.float64)
         for i in range(n_pts):
             col, row = self._film_to_pixel(cfx[i], cfy[i], W, H, fyh)
-            d_ctrl[i] = float(depth[row, col])
+            d_ctrl[i] = float(depth_full[row, col])
             P = self._hits[i]
             z_ctrl[i] = float((P - cam_pos).dot(fwd))
 
@@ -777,14 +830,13 @@ class DepthReconstructor:
                   f"остатки {r_ctrl.min():+.2f}..{r_ctrl.max():+.2f} м "
                   f"(IDW-коррекция по районам).")
 
-        # --- Region: defined by the mask, NOT by the picked points --------
-        # The picked points are used ONLY for the depth calibration above.
-        #   mask present -> the mesh covers exactly the masked pixels
-        #                   (alpha > MASK_ALPHA_MIN), at full grid resolution
-        #                   over the mask's bounding box;
-        #   no mask      -> the whole frame is reconstructed and nothing is
-        #                   culled.
-        mask_alpha = self._load_mask_alpha(W, H) if self.USE_MASKS else None
+        # --- Region: defined by the alpha channel of the masked depth, NOT by
+        # the picked points. The picked points are used ONLY for calibration.
+        #   masked-depth present -> the mesh covers exactly the alpha>min
+        #                           pixels, at full grid resolution over the
+        #                           mask's bounding box;
+        #   no masked-depth      -> the whole frame is reconstructed, with the
+        #                           flood-fill background dropped.
         use_mask = mask_alpha is not None
 
         G = self.GRID
@@ -803,8 +855,11 @@ class DepthReconstructor:
         FY = FY.ravel()
 
         # Depth value + locally-corrected metric depth at every grid sample.
+        # Grid sampling uses the MASKED depth so manual Photoshop touchups
+        # inside the load region are honoured; anchors above used the full
+        # depth instead.
         cols, rows = self._film_to_pixel_vec(FX, FY, W, H, fyh)
-        d_grid = depth[rows, cols]
+        d_grid = depth_grid[rows, cols]
         resid = self._idw_residual(FX, FY, cfx, cfy, r_ctrl)
         Z_grid = A * d_grid + B + resid
 
@@ -818,17 +873,16 @@ class DepthReconstructor:
                 inside = self._dilate_grid_mask(
                     inside.reshape(stride, stride),
                     self.MASK_DILATE_CELLS).ravel()
-            self._log(f"Маска: регион = {n_mask} узлов "
+            self._log(f"Маска наполнения: регион = {n_mask} узлов "
                       f"(alpha > {self.MASK_ALPHA_MIN:.0%}, +"
-                      f"{self.MASK_DILATE_CELLS} ячейка к краю); "
-                      f"геометрические отсечения отключены.")
+                      f"{self.MASK_DILATE_CELLS} ячейка к краю).")
         else:
             inside = np.ones(FX.shape[0], dtype=bool)
             # Flood-fill background removal: a large gray-ish region flooded
             # from the image border (typically the sky/wall above the truck)
             # is dropped before reconstruction. Grid nodes that sample a
             # background pixel are marked out-of-region.
-            bg = self._detect_background(depth)
+            bg = self._detect_background(depth_full)
             if bg is not None:
                 bg_node = bg[rows, cols]
                 n_bg = int(bg_node.sum())
@@ -896,48 +950,10 @@ class DepthReconstructor:
             self._finish(False, {})
             return False
 
-        # ---- Stage 3 (optional): extrapolate the truck-bounded relief to
-        #      TARGET_SIZE_M, then (optional) seal + Boolean DIFFERENCE with the
-        #      napolnitel for a closed, measurable filler volume.
-        if self.ENABLE_EXTRAPOLATION and self.TARGET_SIZE_M is not None:
-            # Measured cloud = the vertices that survived Stages 1 & 2.
-            used = np.unique(np.asarray(faces).reshape(-1))
-            ext = self._build_target_extrapolated(verts[used])
-            if ext is not None:
-                verts, faces, ext_info = ext
-                TX_m, TY_m = self.TARGET_SIZE_M
-                sw_m, sh_m = ext_info["src_size_m"]
-                tnx, tny = ext_info["target_grid"]
-                target_dims = (tnx, tny)
-                self._log(
-                    f"Экстраполяция: измеренная зона {sw_m:.2f}×{sh_m:.2f} м → "
-                    f"цель {TX_m:.1f}×{TY_m:.1f} м (mirror-tiling, сетка "
-                    f"{tnx}×{tny}, {ext_info['src_valid_cells']} валидных "
-                    f"ячеек источника).")
-                volume_done = False
-                if (self.ENABLE_VOLUME and self.TONAR_OBJ_REL_PATH):
-                    # Seal the relief into the empty space above it, then run
-                    # the Boolean DIFFERENCE tonar − sealed → the closed,
-                    # measurable filler volume below the relief.
-                    clip_res = self._clip_relief_to_target(
-                        verts, faces, target_dims)
-                    if clip_res is not None:
-                        verts, faces, clip_volume = clip_res
-                        volume_done = True
-                if not volume_done:
-                    # No volume mesh (volume off, or every boolean engine
-                    # failed): the extrapolated TARGET_SIZE_M rectangle still
-                    # overhangs the bed, so clip it to the truck body with the
-                    # point-in-mesh test. Guarantees the geometry is bounded by
-                    # the napolnitel even without a working boolean engine.
-                    res = self._clip_relief_to_body(verts, faces)
-                    if res is not None:
-                        verts, faces = res
-                        self._log("Объёмный boolean не выполнен — "
-                                  "экстраполированный рельеф обрезан по кузову "
-                                  "(point-in-mesh).")
-            else:
-                self._log("Экстраполяция: недостаточно данных — пропуск.")
+        # Stage 3 (extrapolation + Boolean DIFFERENCE volume) removed from
+        # the pipeline. `_clip_relief_to_target` and the rest of the
+        # boolean machinery are still defined below for future reuse but
+        # nothing calls them now.
 
         # ---- Final cleanup: strip near-vertical walls (with a metric removal
         #      radius) and tiny disconnected clusters from the displayed mesh.
@@ -1507,12 +1523,40 @@ class DepthReconstructor:
 
     # ------------------------------------------------------------------
     def _load_depth_norm(self):
-        """Load the depth PNG as an HxW float array normalised to [0, 1]."""
+        """Load the depth map as an HxW float array normalised to [0, 1].
+
+        Supports:
+          * 8-bit PNG (legacy stand snapshots) — /255.
+          * 16-bit PNG (AnyDepth output, mode 'I' / 'I;16') — /65535.
+          * .npy float32 — robust [1, 99] percentile normalisation.
+        """
+        path = self._depth_path or ""
+        if not path:
+            return None
         try:
+            if path.lower().endswith(".npy"):
+                arr = np.load(path).astype(np.float32)
+                finite = arr[np.isfinite(arr)]
+                if finite.size == 0:
+                    return None
+                lo, hi = np.percentile(finite, [1.0, 99.0])
+                if hi - lo < 1e-8:
+                    hi = lo + 1e-8
+                return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
             from PIL import Image
-            im = Image.open(self._depth_path).convert("L")
-            arr = np.asarray(im, dtype=np.float32) / 255.0
-            return arr
+            im = Image.open(path)
+            mode = im.mode
+            arr = np.asarray(im)
+            if mode in ("I", "I;16", "I;16B", "I;16L"):
+                # 16-bit / 32-bit grayscale (AnyDepth кладёт I;16 — 0..65535).
+                return arr.astype(np.float32) / 65535.0
+            if arr.dtype == np.uint16:
+                return arr.astype(np.float32) / 65535.0
+            if arr.ndim == 3:
+                # RGB/RGBA — берём только luminance.
+                arr = np.asarray(im.convert("L"))
+            return arr.astype(np.float32) / 255.0
         except Exception as exc:
             self._log(f"Не удалось прочитать карту глубины: {exc}")
             return None
@@ -1590,18 +1634,35 @@ class DepthReconstructor:
         """Load the fill mask's alpha channel as an HxW float array in [0, 1]
         (resized to the depth size if needed). Returns None when there is no
         mask file for this snapshot."""
+        loaded = self._load_masked_depth(W, H)
+        if loaded is None:
+            return None
+        _, alpha = loaded
+        return alpha
+
+    def _load_masked_depth(self, W, H):
+        """Load `<depth>_mask.png` as a pair (depth_rgb, alpha), each HxW
+        float32 in [0, 1] resized to the depth size if needed:
+          • depth_rgb — RGB luminance, the manually-curated depth values
+                        inside the load region (used for the relief grid);
+          • alpha    — the load-region mask (alpha > MASK_ALPHA_MIN is the
+                        valid region).
+        Returns None when the mask PNG doesn't exist or is unreadable, so the
+        caller falls back to the single-depth path."""
         mp = self._mask_path()
         if not mp or not os.path.exists(mp):
-            self._log("Маска не найдена — применяю геометрические отсечения.")
             return None
         try:
             from PIL import Image
             im = Image.open(mp).convert("RGBA")
             if im.size != (W, H):
                 im = im.resize((W, H), Image.NEAREST)
-            return np.asarray(im, dtype=np.float32)[..., 3] / 255.0
+            arr = np.asarray(im, dtype=np.float32)
+            rgb = arr[..., :3].mean(axis=2) / 255.0   # luminance
+            alpha = arr[..., 3] / 255.0
+            return rgb, alpha
         except Exception as exc:
-            self._log(f"Не удалось прочитать маску: {exc}")
+            self._log(f"Не удалось прочитать masked-depth: {exc}")
             return None
 
     def _mask_film_bounds(self, mask_alpha, W, H, fyh):
@@ -1751,6 +1812,36 @@ class DepthReconstructor:
                     wsum[ys_d:ye_d, xs_d:xe_d] += vw
             new = np.where(wsum > 0, acc / np.maximum(wsum, 1e-12), Zc)
             Zc = np.where(valid, new, Zc)
+        return Zc
+
+    @staticmethod
+    def _erode_grid_z(Z, valid, iters):
+        """Mask-aware 3x3 MIN filter on a (stride, stride) depth grid, repeated
+        `iters` times. Each valid cell is replaced by the minimum of itself and
+        its valid 3x3 neighbours; invalid cells are left untouched and never
+        contribute. Morphological erosion of the height-field — used by the
+        extrapolation to build a LOWER ENVELOPE of the measured relief (pile
+        skirt instead of crown) so the seed for occluded cells is the nearest
+        LOW measurement, not whatever single tall point the BFS hit first."""
+        Zc = Z.astype(np.float64).copy()
+        Hh, Ww = Zc.shape
+        for _ in range(int(iters)):
+            cur = np.where(valid, Zc, np.inf)
+            new = cur.copy()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ys_d, ye_d = max(0, -dy), Hh - max(0, dy)
+                    xs_d, xe_d = max(0, -dx), Ww - max(0, dx)
+                    ys_s, ye_s = max(0, dy), Hh - max(0, -dy)
+                    xs_s, xe_s = max(0, dx), Ww - max(0, -dx)
+                    tgt = new[ys_d:ye_d, xs_d:xe_d]
+                    src = cur[ys_s:ye_s, xs_s:xe_s]
+                    np.minimum(tgt, src, out=tgt)
+            # Apply only to valid cells; invalids must not pick up the +inf or
+            # a far-away neighbour's value.
+            Zc = np.where(valid & np.isfinite(new), new, Zc)
         return Zc
 
     @staticmethod
@@ -2109,215 +2200,6 @@ class DepthReconstructor:
             ext = c.max(axis=0) - c.min(axis=0)
         return float(ext.min())
 
-    # ------------------------------------------------------------------
-    # Gradient-aware extrapolation with mirror-tiled texture
-    # ------------------------------------------------------------------
-    def _build_target_extrapolated(self, valid_xyz):
-        """Extend the measured relief to a TARGET_SIZE_M axis-aligned rectangle.
-        `valid_xyz` is the (M,3) cloud of measured world points (after Stage 1
-        cutoff + Stage 2 truck-body clip), so the source bbox is bounded to the
-        truck and the target rectangle is centred on the real load — NOT on the
-        whole frame.
-        Inside the measured region: original measurements preserved verbatim.
-        Outside:
-        each cell's Z is set by
-
-            Z(out) = Z(nearest in-mask seed)
-                   + min(outward_grad_at_seed, −tan(EXTRAP_ANGLE_DEG))
-                     × distance_to_seed
-                   + texture_weight × mirror_residual × exp(−dist / decay)
-
-        where outward_grad is the directional derivative of Z at the boundary
-        cell in the direction pointing to this external cell. Taking the
-        steeper (more negative) of that and the angle-of-repose lets a steep
-        visible pile face keep falling at its observed rate (so the relief
-        reaches the truck floor instead of forming a fake 'second pile'),
-        while a flat or hidden peak still drops at a natural granular slope.
-
-        The mirror-tiled residual carries the high-frequency texture of the
-        visible side over to the hidden side, so the back of the pile keeps
-        the look of a granular surface instead of being a featureless slope.
-        Texture amplitude fades exponentially with distance from the mask.
-
-        A floor clamp at min(visible Z) − EXTRAP_FLOOR_FROM_MIN_M (or an
-        absolute EXTRAP_FLOOR_M) catches whatever the descent + texture
-        produce so the extrapolated relief doesn't rise back up far from
-        the mask via averaging artifacts.
-
-        Returns (verts_target, faces_target, info) or None on failure."""
-        TX_m, TY_m = (float(v) for v in self.TARGET_SIZE_M)
-        if TX_m <= 0.0 or TY_m <= 0.0:
-            return None
-        valid_xyz = np.asarray(valid_xyz, dtype=np.float64)
-        if valid_xyz.shape[0] < 10:
-            return None
-        sxmin = float(valid_xyz[:, 0].min())
-        sxmax = float(valid_xyz[:, 0].max())
-        symin = float(valid_xyz[:, 1].min())
-        symax = float(valid_xyz[:, 1].max())
-        sw = sxmax - sxmin
-        sh = symax - symin
-        if sw < 1e-3 or sh < 1e-3:
-            return None
-
-        # Target rectangle, centred on mask centroid.
-        cx = 0.5 * (sxmin + sxmax)
-        cy = 0.5 * (symin + symax)
-        txmin = cx - 0.5 * TX_m
-        txmax = cx + 0.5 * TX_m
-        tymin = cy - 0.5 * TY_m
-        tymax = cy + 0.5 * TY_m
-
-        # Working grid covers union of mask bbox and target rect, with a
-        # half-metre pad so the bilinear sampler doesn't clamp at the edge.
-        pad = 0.5
-        gxmin = min(sxmin, txmin) - pad
-        gxmax = max(sxmax, txmax) + pad
-        gymin = min(symin, tymin) - pad
-        gymax = max(symax, tymax) + pad
-        gw = gxmax - gxmin
-        gh = gymax - gymin
-
-        # Rasterize masked verts onto the working grid.
-        src_field, src_valid = self._rasterize_xyz(
-            valid_xyz, gxmin, gymin, gw, gh)
-        if not src_valid.any():
-            return None
-
-        ny_s, nx_s = src_field.shape
-        cell_dx = gw / max(nx_s - 1, 1)
-        cell_dy = gh / max(ny_s - 1, 1)
-
-        # Pass 1: BFS-Dijkstra from in-mask seeds. For every cell we get the
-        # (y, x) of its nearest in-mask cell and the path distance (in cell
-        # steps, 1 ortho / √2 diag, accumulated). The directional info we
-        # use afterwards comes from the true Euclidean vector cell → seed.
-        seed_y, seed_x, _dist_cells = self._bfs_seeds(src_valid)
-
-        # Pass 2: ∂Z/∂x, ∂Z/∂y inside the mask (one-sided at boundary,
-        # central in the interior). Smooth the gradient field a couple of
-        # iterations to suppress single-cell noise from the rasterizer.
-        grad_y, grad_x = self._masked_gradient_2d(
-            src_field, src_valid, cell_dx, cell_dy)
-        grad_x = self._smooth_grid_z(grad_x, src_valid, 2)
-        grad_y = self._smooth_grid_z(grad_y, src_valid, 2)
-
-        # Per-cell world XY and the true Euclidean vector to its seed.
-        yy_idx, xx_idx = np.meshgrid(
-            np.arange(ny_s), np.arange(nx_s), indexing="ij")
-        cell_X = gxmin + xx_idx * cell_dx
-        cell_Y = gymin + yy_idx * cell_dy
-        seed_X = gxmin + seed_x * cell_dx
-        seed_Y = gymin + seed_y * cell_dy
-        dvec_x = cell_X - seed_X
-        dvec_y = cell_Y - seed_Y
-        dist_m = np.sqrt(dvec_x * dvec_x + dvec_y * dvec_y)
-        safe_dist = np.where(dist_m > 1e-9, dist_m, 1.0)
-        out_x = dvec_x / safe_dist
-        out_y = dvec_y / safe_dist
-
-        # Outward directional derivative of Z at the seed.
-        seed_gx = grad_x[seed_y, seed_x]
-        seed_gy = grad_y[seed_y, seed_x]
-        out_grad = seed_gx * out_x + seed_gy * out_y
-
-        # Effective descent rate (per metre): pick the more negative of
-        # outward gradient and −tan(angle of repose); cap at −tan(max angle)
-        # so a noisy one-sided gradient can't drive Z to infinity.
-        tan_aor = math.tan(math.radians(float(self.EXTRAP_ANGLE_DEG)))
-        tan_max = math.tan(math.radians(float(self.EXTRAP_MAX_ANGLE_DEG)))
-        eff_desc = np.minimum(out_grad, -tan_aor)
-        eff_desc = np.maximum(eff_desc, -tan_max)
-
-        # Baseline Z field: in-mask keeps original, others get seed_Z + descent.
-        seed_z = src_field[seed_y, seed_x]
-        src_extrap = np.where(
-            src_valid, src_field, seed_z + eff_desc * dist_m)
-
-        # Texture: mirror-tile high-frequency residual from the visible
-        # side onto the extrapolated cells, attenuated by distance from
-        # the mask. CRITICAL: only apply texture where descent is governed
-        # by the angle-of-repose fallback (hidden peak side). Where the
-        # local outward gradient is steeper than AoR (the camera-facing
-        # wall side, with the visible face falling toward the floor), the
-        # texture is suppressed — otherwise mirror-tiling produces an
-        # "echo" of the visible peak at a symmetric distance, which the
-        # observer reads as a fake second pile near the near wall.
-        tex_w = float(self.EXTRAP_TEXTURE_WEIGHT)
-        if tex_w > 0.0:
-            smooth_iters = max(1, int(self.EXTRAP_TEXTURE_SMOOTH_ITERS))
-            z_for_trend = np.where(src_valid, src_field, 0.0)
-            z_trend = self._smooth_grid_z(
-                z_for_trend, src_valid, smooth_iters)
-            residual_field = np.where(src_valid, src_field - z_trend, 0.0)
-            sample_X = self._mirror_into(cell_X, sxmin, sxmax)
-            sample_Y = self._mirror_into(cell_Y, symin, symax)
-            sampled_residual = self._bilinear_sample(
-                residual_field, sample_X, sample_Y,
-                gxmin, gxmax, gymin, gymax)
-            decay = max(float(self.EXTRAP_TEXTURE_DECAY_M), 1e-6)
-            attenuation = np.exp(-dist_m / decay)
-            # Smooth ramp 0..1 as out_grad goes from −tan(AoR) (steep) up
-            # to 0 (flat) — full texture above 0, zero texture in steep
-            # descent zones.
-            tan_aor_safe = max(tan_aor, 1e-6)
-            gradient_weight = np.clip(
-                (out_grad + tan_aor_safe) / tan_aor_safe, 0.0, 1.0)
-            texture_add = np.where(
-                src_valid, 0.0,
-                tex_w * gradient_weight * sampled_residual * attenuation)
-            src_extrap = src_extrap + texture_add
-
-        # Floor clamp — kills any artifact that would lift the extrapolated
-        # relief back above the bottom of the visible pile.
-        floor_z = None
-        if self.EXTRAP_FLOOR_FROM_MIN_M is not None:
-            z_min_visible = float(src_field[src_valid].min())
-            floor_z = z_min_visible - float(self.EXTRAP_FLOOR_FROM_MIN_M)
-        elif self.EXTRAP_FLOOR_M is not None:
-            floor_z = float(self.EXTRAP_FLOOR_M)
-        if floor_z is not None:
-            src_extrap = np.maximum(src_extrap, floor_z)
-
-        # Sample on the target grid.
-        tnx = max(2, int(round(TX_m * self.TARGET_RES_PER_M)) + 1)
-        tny = max(2, int(round(TY_m * self.TARGET_RES_PER_M)) + 1)
-        TXg, TYg = np.meshgrid(np.linspace(txmin, txmax, tnx),
-                               np.linspace(tymin, tymax, tny))
-        Z_target = self._bilinear_sample(
-            src_extrap, TXg, TYg, gxmin, gxmax, gymin, gymax)
-
-        # Smoothing of extrapolated cells only (preserve direct in-mask
-        # measurements).
-        iters = int(self.TARGET_SMOOTH_ITERS)
-        if iters > 0:
-            valid_direct = self._bilinear_sample(
-                src_valid.astype(np.float64), TXg, TYg,
-                gxmin, gxmax, gymin, gymax) > 0.5
-            ones = np.ones_like(Z_target, dtype=bool)
-            Z_smooth = self._smooth_grid_z(Z_target, ones, iters)
-            Z_target = np.where(valid_direct, Z_target, Z_smooth)
-
-        n_total = tnx * tny
-        verts_t = np.empty((n_total, 3), dtype=np.float64)
-        verts_t[:, 0] = TXg.ravel()
-        verts_t[:, 1] = TYg.ravel()
-        verts_t[:, 2] = Z_target.ravel()
-        faces_t = self._build_regular_grid_faces(tnx, tny)
-
-        info = {
-            "src_bbox": (sxmin, sxmax, symin, symax),
-            "target_bbox": (txmin, txmax, tymin, tymax),
-            "src_size_m": (sw, sh),
-            "target_size_m": (TX_m, TY_m),
-            "target_grid": (tnx, tny),
-            "src_valid_cells": int(src_valid.sum()),
-            "extrap_angle_deg": float(self.EXTRAP_ANGLE_DEG),
-            "extrap_texture_weight": tex_w,
-            "extrap_floor_z": floor_z,
-        }
-        return verts_t, faces_t, info
-
     def _rasterize_xyz(self, pts, xmin, ymin, w, h):
         """Bin (M, 3) world points into a regular XY grid covering
         [xmin, xmin+w] × [ymin, ymin+h] at TARGET_RES_PER_M density.
@@ -2484,6 +2366,25 @@ class DepthReconstructor:
         f1 = np.stack([a, b, d], axis=1)
         f2 = np.stack([a, d, c], axis=1)
         return np.concatenate([f1, f2], axis=0).astype(np.int64)
+
+    def _napolnitel_floor_z(self):
+        """World Z of the napolnitel solid's bottom — used by the extrapolation
+        as the plateau the unmeasured terrain rests on. Returns the lowest
+        transformed vertex Z plus a small upward margin (so the extrap stays
+        STRICTLY inside the body and the point-in-mesh clip keeps the whole
+        plateau, instead of trimming the rim where the rectangle's vertices
+        would otherwise sit right on / just below the floor). Returns None
+        when the napolnitel can't be loaded — the caller then falls back to
+        z_min_visible − EXTRAP_FLOOR_FROM_MIN_M."""
+        loaded = self._load_tonar_obj()
+        if loaded is None:
+            return None
+        verts, _faces = loaded
+        if verts is None or len(verts) == 0:
+            return None
+        margin = 0.02  # 2 cm above the literal floor — defensive against
+                      # point-in-mesh edge cases at the very bottom.
+        return float(verts[:, 2].min()) + margin
 
     # ------------------------------------------------------------------
     # Local clipping (relief ∩ tonar_napolnitel) via point-in-mesh test

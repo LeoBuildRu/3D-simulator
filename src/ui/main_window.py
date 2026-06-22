@@ -33,11 +33,14 @@ from src.ui.panel_data import (
     get_model_set_config, get_texture_set_config,
     load_texture_sets, Reconstruction, download_server_image,
     ensure_texture_cached, TEXTURE_PATH_KEYS, get_default_texture_set_key,
+    resolve_depth_record_files,
     PROJECT_ROOT,
 )
 
 # Where the 3 user camera presets (position + FOV) are persisted.
 CAMERA_PRESETS_PATH = os.path.join(PROJECT_ROOT, "presets", "camera_presets.json")
+# Опорные точки (world 3D) для авто-реконструкции по depth-записям.
+DEPTH_ANCHORS_PATH  = os.path.join(PROJECT_ROOT, "presets", "depth_anchors_world.json")
 
 
 def _is_child_of(hwnd: int, parent_hwnd: int) -> bool:
@@ -967,8 +970,17 @@ class MainWindow(QMainWindow):
         if rec is None:
             return
 
-        # Stand snapshots use the depth pipeline (anchor points + depth map),
-        # not the server JSON/PLY mesh reconstruction.
+        # Stand snapshots / серверные depth-записи используют depth-пайплайн
+        # (anchor points + depth map), не серверную JSON/PLY реконструкцию.
+        if getattr(rec, "data_type", "") == "depth":
+            # Серверные depth-записи приходят с именами файлов;
+            # скачиваем их и подставляем локальные абсолютные пути.
+            self._materialize_depth_record_paths(rec)
+            # Для depth-записей используем жёстко заданные 16 опорных
+            # точек (presets/depth_anchors_world.json) + первый camera
+            # preset — пользователю достаточно одной кнопки.
+            self._run_depth_reconstruction(rec)
+            return
         if getattr(rec, "data_type", "") == "stand":
             self._run_stand_reconstruction(rec)
             return
@@ -2224,6 +2236,9 @@ class MainWindow(QMainWindow):
         if rec is None:
             ov.hide_overlay()
             return
+        # Серверные depth-записи — резолвим имена файлов в локальные пути.
+        if getattr(rec, "data_type", "") == "depth":
+            self._materialize_depth_record_paths(rec)
         # Prefer the explicit colour-frame path; fall back to .path.
         path = (getattr(rec, "color_path", "") or "").strip() \
             or (getattr(rec, "path", "") or "").strip()
@@ -2233,48 +2248,34 @@ class MainWindow(QMainWindow):
         # Feed the reconstructor the snapshot's depth + colour paths.
         dr = getattr(self, "depth_reconstructor", None)
         if dr is not None:
+            meta = rec.raw if getattr(rec, "data_type", "") == "depth" else None
             dr.set_source(
                 (getattr(rec, "depth_path", "") or "").strip(),
                 (getattr(rec, "color_path", "") or "").strip(),
+                meta=meta,
             )
         ov.set_image(path)
-
-        rp = getattr(self, "right_panel", None)
-        # Jump to the first camera preset, if one is saved. Its bound anchor
-        # points then match the live view, ready for the reconstruct button.
-        applied_preset = False
-        presets = getattr(self, "_cam_presets", None) or []
-        if presets and isinstance(presets[0], dict):
-            try:
-                self._recall_preset(0)
-                applied_preset = True
-            except Exception as exc:
-                print(f"[Preset] авто-применение первого пресета упало: {exc}")
-
-        if applied_preset:
-            # At a preset → no manual alignment needed; keep the overlay hidden
-            # (it's available via "Дополнительно" → "Показать снимок", and the
-            # full frame is on the list's preview button).
-            ov.hide_overlay()
-            if rp is not None and hasattr(rp, "btn_ref_toggle"):
-                try:
-                    blocked = rp.btn_ref_toggle.blockSignals(True)
-                    rp.btn_ref_toggle.setChecked(False)
-                    rp.btn_ref_toggle.setText("Показать снимок")
-                    rp.btn_ref_toggle.blockSignals(blocked)
-                except Exception:
-                    pass
-            return
-
-        # No preset saved yet → fall back to manual alignment: drop into
-        # free-fly and show the reference photo so the user can line the camera
-        # up and then save a preset. Opacity / visibility live in the
-        # "Дополнительно" sub-section.
+        # Manual alignment needs a movable camera — drop into free-fly so
+        # WASD / RMB-look work (STATIC / BOARD freeze the camera). Это часть
+        # «как было раньше» — overlay показывается ВСЕГДА, без зависимости от
+        # пресетов: пользователь видит снимок поверх рендера и подгоняет
+        # камеру руками (или потом сохраняет пресет).
         if getattr(self, "_camera_mode", None) != "free":
             try:
                 self._on_camera_mode("free")
             except Exception as exc:
                 print(f"[Camera] auto free-mode for alignment failed: {exc}")
+        # Для серверной depth-записи сразу переводим камеру в первый
+        # пресет: пользователь жмёт «Реконструировать», и всё работает
+        # без ручного выравнивания.
+        if getattr(rec, "data_type", "") == "depth":
+            presets = getattr(self, "_cam_presets", None) or []
+            if presets and isinstance(presets[0], dict):
+                try:
+                    self._recall_preset(0)
+                except Exception as exc:
+                    print(f"[Preset] авто-применение первого пресета упало: {exc}")
+        rp = getattr(self, "right_panel", None)
         try:
             if rp is not None and hasattr(rp, "ref_opacity_slider"):
                 ov.set_opacity(rp.ref_opacity_slider.value() / 100.0)
@@ -2379,6 +2380,142 @@ class MainWindow(QMainWindow):
         if rp is not None:
             rp.set_point_count(int(n))
 
+    def _materialize_depth_record_paths(self, rec) -> None:
+        """Для серверной depth-записи скачивает её файлы в локальный кеш
+        и подменяет на абсолютные локальные пути поля `rec.depth_path`,
+        `rec.color_path`, `rec.path`. Идемпотентно: если оба пути уже
+        существуют локально — ничего не делает."""
+        if rec is None or getattr(rec, "data_type", "") != "depth":
+            return
+        depth_p = (getattr(rec, "depth_path", "") or "").strip()
+        color_p = (getattr(rec, "color_path", "") or "").strip()
+        if (depth_p and os.path.isabs(depth_p) and os.path.exists(depth_p)
+                and color_p and os.path.isabs(color_p) and os.path.exists(color_p)):
+            return
+        try:
+            paths = resolve_depth_record_files(rec)
+        except Exception as exc:
+            print(f"[Recon] resolve depth-record files failed: {exc}")
+            return
+        print(f"[Recon] depth-record paths resolved: "
+              f"depth={paths.get('depth','')!r} "
+              f"color={paths.get('color','')!r} "
+              f"uploaded={paths.get('uploaded','')!r}")
+        depth_local = paths.get("depth", "")
+        # Overlay поверх рендера — показываем ФИНАЛЬНОЕ обработанное
+        # изображение (после de-barrel и polygon-crop — `masked`). Это
+        # «та же картинка, что мы используем для восстановления по
+        # depth_map-е». Резервы: uploaded (исходный кадр) → depth-карта.
+        color_local = (paths.get("color", "")
+                       or paths.get("uploaded", "")
+                       or paths.get("depth", ""))
+        if depth_local:
+            rec.depth_path = depth_local
+        if color_local:
+            rec.color_path = color_local
+            rec.path = color_local  # reference-overlay показывает rec.path
+
+    def _load_depth_anchors_world(self) -> list:
+        """Загружает 16 опорных 3D-точек из presets/depth_anchors_world.json.
+        Возвращает список (x, y, z); при сбое — пустой список."""
+        try:
+            if not os.path.exists(DEPTH_ANCHORS_PATH):
+                return []
+            with open(DEPTH_ANCHORS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pts = data.get("points") or []
+            cleaned = []
+            for p in pts:
+                if len(p) == 3:
+                    cleaned.append((float(p[0]), float(p[1]), float(p[2])))
+            return cleaned
+        except Exception as exc:
+            print(f"[DepthRecon] не удалось прочитать {DEPTH_ANCHORS_PATH}: {exc}")
+            return []
+
+    def _run_depth_reconstruction(self, rec) -> None:
+        """Авто-реконструкция для серверной depth-записи: применяем первый
+        camera-preset, проецируем сохранённые 3D-точки в film-координаты
+        текущего вида, заполняем DepthReconstructor и запускаем
+        reconstruct() — пользователь жмёт одну кнопку, и всё."""
+        dr = getattr(self, "depth_reconstructor", None)
+        if dr is None:
+            print("[DepthRecon] реконструктор недоступен.")
+            return
+        if dr.is_picking():
+            print("[DepthRecon] идёт выбор точек — завершите его сначала.")
+            return
+
+        depth_p = (getattr(rec, "depth_path", "") or "").strip()
+        if not depth_p or not os.path.exists(depth_p):
+            print("[DepthRecon] у записи нет карты глубины.")
+            return
+
+        meta = rec.raw if getattr(rec, "data_type", "") == "depth" else None
+        dr.set_source(
+            depth_p,
+            (getattr(rec, "color_path", "") or "").strip(),
+            meta=meta,
+        )
+
+        # Применяем первый camera-preset, если есть. Это гарантирует, что
+        # 3D-точки проецируются на ту же камеру, для которой они снимались.
+        presets = getattr(self, "_cam_presets", None) or []
+        if presets and isinstance(presets[0], dict):
+            try:
+                self._recall_preset(0)
+            except Exception as exc:
+                print(f"[DepthRecon] не удалось применить пресет 0: {exc}")
+
+        world_points = self._load_depth_anchors_world()
+        if not world_points:
+            print(f"[DepthRecon] нет 3D-точек в {DEPTH_ANCHORS_PATH}.")
+            return
+
+        # Проецируем каждую world-точку в film-координаты текущей камеры
+        # (lens.project). Те, что не попадают в frustum — пропускаем.
+        from panda3d.core import Point2, Point3
+        cam_np = self.panda_app.cam
+        render = self.panda_app.render
+        lens = cam_np.node().get_lens()
+
+        films: list[tuple[float, float]] = []
+        hits: list[Point3] = []
+        for (wx, wy, wz) in world_points:
+            p_world = Point3(wx, wy, wz)
+            p_cam = cam_np.getRelativePoint(render, p_world)
+            film_pt = Point2()
+            try:
+                ok = bool(lens.project(p_cam, film_pt))
+            except Exception:
+                ok = False
+            if not ok:
+                continue
+            films.append((float(film_pt.x), float(film_pt.y)))
+            hits.append(p_world)
+
+        if len(films) < dr.MIN_POINTS:
+            print(f"[DepthRecon] точек спроецировано {len(films)}, "
+                  f"нужно ≥ {dr.MIN_POINTS}.")
+            return
+
+        # Подставляем напрямую в внутренние буферы и запускаем reconstruct.
+        dr._films = films
+        dr._hits = hits
+        dr._saved_films = list(films)
+        dr._auto_mode = False
+        try:
+            dr._emit_count()
+        except Exception:
+            pass
+
+        print(f"[DepthRecon] авто-реконструкция depth-записи "
+              f"по {len(films)} опорным точкам.")
+        try:
+            dr.reconstruct()
+        except Exception as exc:
+            print(f"[DepthRecon] реконструкция упала: {exc}")
+
     def _run_stand_reconstruction(self, rec) -> None:
         """Run the depth reconstruction for a stand snapshot when the user
         presses "Реконструировать". Uses the anchor points bound to the camera
@@ -2394,7 +2531,14 @@ class MainWindow(QMainWindow):
         if not depth_p or not os.path.exists(depth_p):
             print("[DepthRecon] у снимка нет карты глубины.")
             return
-        dr.set_source(depth_p, (getattr(rec, "color_path", "") or "").strip())
+        # Для серверных depth-записей meta хранится в rec.raw — пробрасываем
+        # его в DepthReconstructor (там лежит {"type":"depth","model":"MAZ",...}).
+        meta = rec.raw if getattr(rec, "data_type", "") == "depth" else None
+        dr.set_source(
+            depth_p,
+            (getattr(rec, "color_path", "") or "").strip(),
+            meta=meta,
+        )
 
         preset_pts = self._matching_preset_points()
         if preset_pts is not None:

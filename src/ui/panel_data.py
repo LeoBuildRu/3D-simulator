@@ -657,19 +657,141 @@ def _scan_local_stand_examples() -> List[Reconstruction]:
 RECON_PAGE_SIZE = 25
 
 
+# ---------------------------------------------------------------------------
+# Server-side depth records (image+meta upload pipeline)
+# ---------------------------------------------------------------------------
+SERVER_DEPTH_CACHE_DIR = os.path.join(
+    tempfile.gettempdir(), "toner_server_depth"
+)
+
+
+def _fetch_depth_records_from_server(limit: int = 50) -> List[Reconstruction]:
+    """Запрашивает у активного TLS-сервера список depth-загрузок и
+    превращает их в Reconstruction(data_type='depth')."""
+    cls = _get_tls_client_cls()
+    if cls is None:
+        print("[panel_data] depth-records: TLS_client class unavailable")
+        return []
+    server = _read_active_tls_server()
+    if server is None:
+        print("[panel_data] depth-records: no active TLS server in tls_config.yaml")
+        return []
+    host, port = server
+    try:
+        client = cls(host=host, port=port, timeout=5.0)
+        records = client.list_depth_records(limit=limit) or []
+    except Exception as exc:
+        print(f"[panel_data] TLS list_depth_records failed: {exc}")
+        return []
+    print(f"[panel_data] depth-records: получено {len(records)} с {host}:{port}")
+
+    out: List[Reconstruction] = []
+    for rec in records:
+        try:
+            stem = str(rec.get("stem") or rec.get("image_filename") or "depth")
+            dt_str = str(rec.get("datetime") or "")
+            dt = _parse_dt(dt_str)
+            time_disp = dt.strftime("%d.%m.%Y %H:%M") if dt is not datetime.min else dt_str
+            out.append(Reconstruction(
+                name=stem,
+                path=str(rec.get("record_name") or ""),
+                data_type="depth",
+                is_local=False,
+                model=str(rec.get("model") or ""),
+                car_number=str(rec.get("car_number") or "Неизвестно"),
+                time=time_disp,
+                datetime=dt,
+                # Preview thumbnail и overlay используют ФИНАЛЬНОЕ
+                # обработанное изображение — masked PNG (после de-barrel +
+                # polygon-crop). Это и есть «та же картинка, что мы
+                # используем для восстановления по depth_map-е».
+                img_file=str(rec.get("masked_output_name") or ""),
+                # depth_path / color_path заполняются именами серверных
+                # файлов; main_window резолвит их в локальные через
+                # resolve_depth_record_files() перед запуском реконструкции.
+                color_path=str(rec.get("masked_output_name") or ""),
+                depth_path=str(rec.get("anydepth_depth_png_name") or ""),
+                filler="",
+                target_volume=None,
+                raw=dict(rec),
+            ))
+        except Exception as exc:
+            print(f"[panel_data] skip malformed depth record: {exc}")
+    return out
+
+
+def resolve_depth_record_files(rec: Reconstruction) -> Dict[str, str]:
+    """Для серверной depth-записи скачивает все нужные файлы
+    в SERVER_DEPTH_CACHE_DIR и возвращает их локальные пути:
+    {'depth': <path>, 'color': <path>, 'uploaded': <path>?}.
+    Файлы переиспользуются, если уже в кеше."""
+    if rec is None or rec.data_type != "depth":
+        return {}
+    cls = _get_tls_client_cls()
+    server = _read_active_tls_server()
+    if cls is None or server is None:
+        return {}
+    host, port = server
+    try:
+        client = cls(host=host, port=port, timeout=30.0)
+    except Exception as exc:
+        print(f"[panel_data] TLS_client init failed: {exc}")
+        return {}
+
+    raw = rec.raw or {}
+    depth_name = raw.get("anydepth_depth_png_name")
+    # The masked-depth companion (<stem>_depth_mask.png) is hand-made in
+    # Photoshop and dropped into the same server folder as the depth PNG, so
+    # it's reachable via the same kind="anydepth_png" endpoint. The record
+    # JSON doesn't carry a dedicated field for it — we derive the name from
+    # the depth name. Missing on the server is fine (most records won't have
+    # one): the download attempt is best-effort and silent.
+    if depth_name:
+        stem, ext = os.path.splitext(depth_name)
+        mask_name = f"{stem}_mask{ext}"
+    else:
+        mask_name = None
+    plan = [
+        ("depth",      "anydepth_png", depth_name,                          True),
+        ("depth_mask", "anydepth_png", mask_name,                           False),
+        ("color",      "masked",       raw.get("masked_output_name"),       True),
+        ("uploaded",   "uploaded",     raw.get("uploaded_image_name"),      True),
+    ]
+    out: Dict[str, str] = {}
+    os.makedirs(SERVER_DEPTH_CACHE_DIR, exist_ok=True)
+    for key, kind, name, required in plan:
+        if not name:
+            continue
+        local_path = os.path.join(SERVER_DEPTH_CACHE_DIR, kind, name)
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            out[key] = local_path
+            continue
+        try:
+            client.download_depth_file(kind, name, local_path)
+            out[key] = local_path
+        except Exception as exc:
+            if required:
+                print(f"[panel_data] download_depth_file({kind},{name}) failed: {exc}")
+            if os.path.exists(local_path) and os.path.getsize(local_path) == 0:
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+    return out
+
+
 def load_reconstructions(limit: int = 25) -> List[Reconstruction]:
     """
     Return the merged list of reconstructions, newest first.
 
-    Mirrors `load_recon_jsons` from the legacy gui.py:
-      * Most-recent `limit` entries from `TLS_client.get_verified_models()`
-        (data_type from the server: "ply" or "height").
-      * Plus everything in `height_examples/*.json` (always tagged as
-        local "height" entries).
-      * Sorted by datetime DESC, newest first.
+    Источники:
+      * `TLS_client.get_verified_models()` — серверные PLY/height записи
+        (data_type: "ply" или "height").
+      * `TLS_client.list_depth_records()` — серверные depth-загрузки
+        (data_type: "depth"), от нашего pipeline /upload_image.
 
-    On TLS failure the list contains only local entries — the panel
-    stays usable offline.
+    Локальные источники (height_examples/*.json и stand-снимки) отключены
+    — в списке остаются только серверные записи.
     """
     server_files = _fetch_reconstructions_from_server(limit=limit)
 
@@ -700,10 +822,13 @@ def load_reconstructions(limit: int = 25) -> List[Reconstruction]:
         )
         out.append(rec)
 
-    # Local entries (always included).
-    out.extend(_scan_local_height_examples())
-    # Stand snapshot pairs (colour + depth) for manual camera alignment.
-    out.extend(_scan_local_stand_examples())
+    # Локальные источники (height_examples/*.json и stand-снимки) отключены —
+    # в списке 2D→3D остаются только серверные записи.
+    # out.extend(_scan_local_height_examples())
+    # out.extend(_scan_local_stand_examples())
+
+    # Серверные depth-записи (от /upload_image pipeline).
+    out.extend(_fetch_depth_records_from_server(limit=limit))
 
     # Newest first; entries with unparseable dates fall to the bottom.
     out.sort(key=lambda r: r.datetime, reverse=True)

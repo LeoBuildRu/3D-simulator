@@ -377,8 +377,16 @@ class CameraReferenceOverlay(QWidget):
         # WASD/RMB-look). Force real OS-level pass-through via WS_EX_TRANSPARENT.
         self._apply_native_click_through()
         self.raise_()
+        # Panda3D рендерится в DirectX/OpenGL native child HWND внутри
+        # panda_container, и Qt.Tool top-level окна не всегда выходят
+        # поверх него — особенно после перерисовки кадра. Принудительно
+        # ставим overlay в HWND_TOPMOST: фрейм-окно всегда выше Panda HWND.
+        self._force_topmost(True)
 
     def hide_overlay(self) -> None:
+        # Снимаем topmost при скрытии, чтобы окно не висело поверх
+        # системных диалогов / messageboxes, когда оно невидимо.
+        self._force_topmost(False)
         self.hide()
 
     # -- Internals ----------------------------------------------------
@@ -399,6 +407,26 @@ class CameraReferenceOverlay(QWidget):
                 win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, new_ex)
         except Exception as exc:
             print(f"[ReferenceOverlay] click-through setup failed: {exc}")
+
+    def _force_topmost(self, on: bool) -> None:
+        """SetWindowPos(HWND_TOPMOST | HWND_NOTOPMOST) — поднимает overlay
+        поверх Panda DX/GL native child HWND. SWP_NOMOVE|SWP_NOSIZE —
+        чтобы не двигать/ресайзить окно; SWP_NOACTIVATE — чтобы не
+        перехватывать фокус у Panda (важно для WASD/RMB-look)."""
+        try:
+            import win32gui
+            import win32con
+        except Exception:
+            return
+        try:
+            hwnd = int(self.winId())
+            target = win32con.HWND_TOPMOST if on else win32con.HWND_NOTOPMOST
+            flags = (win32con.SWP_NOMOVE
+                     | win32con.SWP_NOSIZE
+                     | win32con.SWP_NOACTIVATE)
+            win32gui.SetWindowPos(hwnd, target, 0, 0, 0, 0, flags)
+        except Exception as exc:
+            print(f"[ReferenceOverlay] force_topmost({on}) failed: {exc}")
 
     def paintEvent(self, event):
         # Draw the photo scaled to the FULL window WIDTH, centred vertically,

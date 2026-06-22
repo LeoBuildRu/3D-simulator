@@ -160,6 +160,21 @@ def _resolve_or_fetch_image_path(rec: Reconstruction) -> str | None:
         return p
     if rec.is_local:
         return None
+    # Серверные depth-записи: качаем через /download_depth_file (а не через
+    # старый /download?file=). Preview thumbnail в списке показывает
+    # ФИНАЛЬНОЕ изображение (kind='masked' — после de-barrel + polygon-crop),
+    # с резервами на исходный uploaded и depth-карту.
+    if getattr(rec, "data_type", "") == "depth":
+        from src.ui.panel_data import resolve_depth_record_files
+        try:
+            paths = resolve_depth_record_files(rec)
+        except Exception as exc:
+            print(f"[right_panel] resolve depth preview failed: {exc}")
+            return None
+        return (paths.get("color")
+                or paths.get("uploaded")
+                or paths.get("depth")
+                or None)
     return download_server_image(rec.img_file or "")
 
 
@@ -1444,15 +1459,18 @@ class RightPanel(QWidget):
         roll_row.addWidget(self.btn_roll_reset, 0, Qt.AlignmentFlag.AlignVCenter)
         ah.addLayout(roll_row)
 
-        # ----- Reference-overlay controls (stand snapshots only) ------
-        self._ref_controls_holder = QWidget()
-        self._ref_controls_holder.setStyleSheet("background: transparent;")
-        self._ref_controls_holder.setEnabled(False)
-        rc = QVBoxLayout(self._ref_controls_holder)
-        rc.setContentsMargins(0, 0, 0, 0)
-        rc.setSpacing(8)
+        # ----- Top reference-overlay controls (visible without spoiler) --
+        # Слайдер прозрачности и кнопка «Показать/Скрыть снимок» вынесены из
+        # «Дополнительно» наверх — пользователю не нужно разворачивать
+        # секцию, чтобы получить к ним доступ при работе со stand- или
+        # серверной depth-записью.
+        self._top_ref_controls = QWidget()
+        self._top_ref_controls.setStyleSheet("background: transparent;")
+        self._top_ref_controls.setEnabled(False)
+        trc = QVBoxLayout(self._top_ref_controls)
+        trc.setContentsMargins(0, 0, 0, 0)
+        trc.setSpacing(8)
 
-        # Opacity row.
         op_row = QHBoxLayout()
         op_row.setContentsMargins(0, 0, 0, 0)
         op_row.setSpacing(8)
@@ -1476,9 +1494,8 @@ class RightPanel(QWidget):
                          Qt.AlignmentFlag.AlignVCenter)
         op_row.addWidget(self.ref_opacity_lbl, 0,
                          Qt.AlignmentFlag.AlignVCenter)
-        rc.addLayout(op_row)
+        trc.addLayout(op_row)
 
-        # Show/hide toggle.
         self.btn_ref_toggle = QPushButton("Скрыть снимок")
         self.btn_ref_toggle.setCheckable(True)
         self.btn_ref_toggle.setChecked(True)
@@ -1492,7 +1509,16 @@ class RightPanel(QWidget):
             self.referenceVisibleToggled.emit(bool(checked))
 
         self.btn_ref_toggle.toggled.connect(_on_toggle)
-        rc.addWidget(self.btn_ref_toggle)
+        trc.addWidget(self.btn_ref_toggle)
+
+        # ----- Reference-overlay controls (stand snapshots only) ------
+        # Остаются в «Дополнительно»: точки и кнопки auto/manual picking.
+        self._ref_controls_holder = QWidget()
+        self._ref_controls_holder.setStyleSheet("background: transparent;")
+        self._ref_controls_holder.setEnabled(False)
+        rc = QVBoxLayout(self._ref_controls_holder)
+        rc.setContentsMargins(0, 0, 0, 0)
+        rc.setSpacing(8)
 
         # ----- Bed-corner picking + reconstruction --------------------
         pick_row = QHBoxLayout()
@@ -1611,6 +1637,9 @@ class RightPanel(QWidget):
         # Collapsed initially: the advanced controls are hidden until expanded.
         self._adv_holder.setVisible(False)
 
+        # Top reference controls (ползунок прозрачности + show/hide) — над
+        # «Дополнительно», всегда видимы (включаются при выборе stand/depth).
+        v.addWidget(self._top_ref_controls)
         v.addWidget(self._adv_toggle)
         v.addWidget(self._adv_holder)
         return holder
@@ -1788,13 +1817,17 @@ class RightPanel(QWidget):
 
     def _emit_stand_reference(self, rec: Reconstruction | None) -> None:
         """Tell the MainWindow to show the alignment overlay for `stand`
-        snapshots, or hide it for any other selection."""
-        is_stand = bool(rec is not None and rec.data_type == "stand")
-        self.standReferenceSelected.emit(rec if is_stand else None)
-        # Keep the reference-controls card enabled only while a stand row
-        # is the active selection.
+        snapshots ИЛИ серверных depth-записей (data_type='depth' — поведение
+        в UI такое же: выбор + кнопка «Реконструировать»)."""
+        is_ref = bool(rec is not None and rec.data_type in ("stand", "depth"))
+        self.standReferenceSelected.emit(rec if is_ref else None)
         if hasattr(self, "_ref_controls_holder"):
-            self._ref_controls_holder.setEnabled(is_stand)
+            self._ref_controls_holder.setEnabled(is_ref)
+        # Внешний (top) блок с ползунком прозрачности и кнопкой
+        # show/hide — синхронно включается/выключается с тем же набором
+        # типов записей.
+        if hasattr(self, "_top_ref_controls"):
+            self._top_ref_controls.setEnabled(is_ref)
 
     def _on_recon_context_menu(self, pos: QPoint) -> None:
         """Right-click menu on a recon row: copy its file name to clipboard."""
