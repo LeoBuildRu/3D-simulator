@@ -216,6 +216,65 @@ class DepthReconstructor:
     # sampled mask by this many cells first so the surface reaches the true
     # mask edge instead of being trimmed short. 0 = off.
     MASK_DILATE_CELLS = 1
+    # --- Mask-edge depth repair (rim de-spiking) ----------------------
+    # The masked depth is unreliable in a thin ring just inside the alpha
+    # edge: the hand-painted mask inevitably catches a sliver of the body
+    # wall or the depth map's soft (anti-aliased) silhouette, so the rim
+    # nodes carry depth that doesn't belong to the pile. Left alone they
+    # show up as spurious peaks / rises along the border. A plain pixel
+    # offset (eroding the mask) is NOT acceptable: on snapshots where the
+    # pile crest sits right on the mask edge it would shave off real top
+    # vertices.
+    #
+    # Instead we REPLACE each rim node's depth by a gradient-preserving
+    # extrapolation of the trusted interior. For every node within
+    # EDGE_EXTRAP_BAND_CELLS of the boundary we fit a local first-order
+    # (moving-least-squares) plane z ≈ a·dx + b·dy + c to the CORE nodes
+    # around it (those deeper than the band), measuring (dx,dy) from the
+    # rim node itself — so the extrapolated value is just c, the interior
+    # surface's own slope carried out to the rim. A node on a genuine steep
+    # crest keeps climbing at the interior's rate (the crest is preserved);
+    # a node on a phantom rim spike is pulled back onto the interior trend.
+    # This is the slope-aware extrapolation the naive "average the
+    # neighbours' height" approach can't do.
+    #
+    # EDGE_EXTRAP_BAND_CELLS — width (grid cells) of the rim ring to
+    #   re-estimate. Must be ≥ MASK_DILATE_CELLS so the dilated outer ring
+    #   (which samples OUTSIDE the original mask, the most contaminated) is
+    #   always covered. Bigger = more of the border is rebuilt from the
+    #   interior trend (safer against wide contamination, but trusts less
+    #   of the measured edge).
+    # EDGE_EXTRAP_WINDOW_CELLS — radius (grid cells) of the core
+    #   neighbourhood each rim node fits its plane to. Should comfortably
+    #   exceed the band so every rim node sees enough core samples; larger
+    #   = smoother / more global slope estimate, smaller = more local.
+    # EDGE_EXTRAP_IDW_POWER — inverse-distance weighting exponent for the
+    #   plane fit; higher keeps the fit tighter to the nearest core nodes.
+    # EDGE_EXTRAP_DISC_REACH — beyond the fixed rim band, the repair also
+    #   absorbs depth-DISCONTINUITY nodes (the LONGPOLY relative+absolute
+    #   criterion, evaluated on the grid depths BEFORE smoothing) that are
+    #   connected to the rim, up to this many cells deep. This catches a hard
+    #   spike that pokes inward FURTHER than `band` — without it the spike's
+    #   inner part is treated as trusted "core", so it both survives and
+    #   poisons the fit (the "long peaks the algorithm seemed to skip" case).
+    #   An interior crater wall, not connected to the rim, is left intact.
+    #   0 disables spike absorption (fixed rim band only). The thresholds are
+    #   shared with LONGPOLY_MAX_EDGE_* so this stage and the final cutoff
+    #   agree on what a discontinuity is.
+    # EDGE_EXTRAP_CLAMP_SLACK — anti-dip guard (LOWER bound only). A first-order
+    #   extrapolation of a surface descending toward the rim overshoots
+    #   downward, leaving a faint bend where an up-spike used to be; the result
+    #   is floored at the core window's min minus this fraction of the window
+    #   range. The upper side is left free so a real crest rising onto the edge
+    #   is preserved (upward spikes are removed by the absorption, not here).
+    #   Lower = firmer floor (less dip); None disables the guard.
+    # Set EDGE_EXTRAP=False to disable and keep the raw masked rim depth.
+    EDGE_EXTRAP = True
+    EDGE_EXTRAP_BAND_CELLS = 3
+    EDGE_EXTRAP_WINDOW_CELLS = 8
+    EDGE_EXTRAP_IDW_POWER = 2.0
+    EDGE_EXTRAP_DISC_REACH = 8
+    EDGE_EXTRAP_CLAMP_SLACK = 0.5
     # Extrapolation: after the masked relief is built, extend it to a fixed
     # axis-aligned rectangle in world XY (metres) by mirror-tiling the
     # pattern outside the mask's XY bbox. The trend (plane fit) is added
@@ -893,6 +952,38 @@ class DepthReconstructor:
                     f"реконструирую остаток кадра.")
             else:
                 self._log("Маски нет: реконструирую весь кадр без отсечений.")
+
+        # Mask-edge depth repair: re-estimate the thin rim ring just inside
+        # the alpha boundary from the interior's slope, so border spikes /
+        # rises that don't belong to the pile are pulled onto the surface
+        # trend WITHOUT eroding the mask (which would shave off a real crest
+        # sitting on the edge). Mask path only — the flood-fill path has no
+        # curated alpha edge to protect.
+        if (use_mask and self.EDGE_EXTRAP
+                and self.EDGE_EXTRAP_BAND_CELLS > 0):
+            Z2d = Z_grid.reshape(stride, stride)
+            in2d = inside.reshape(stride, stride)
+            # Discontinuity thresholds shared with the final LONGPOLY cutoff so
+            # the rim repair and the mesh-level cut agree on what a spike is.
+            disc_ratio = (self.LONGPOLY_MAX_EDGE_RATIO
+                          if self.LONGPOLY_CUTOFF else None)
+            disc_abs_m = (self.LONGPOLY_MAX_EDGE_M
+                          if self.LONGPOLY_CUTOFF else None)
+            Z2d, n_edge = self._extrapolate_edge_z(
+                Z2d, in2d,
+                self.EDGE_EXTRAP_BAND_CELLS,
+                self.EDGE_EXTRAP_WINDOW_CELLS,
+                self.EDGE_EXTRAP_IDW_POWER,
+                disc_ratio=disc_ratio,
+                disc_abs_m=disc_abs_m,
+                disc_reach=self.EDGE_EXTRAP_DISC_REACH,
+                clamp_slack=self.EDGE_EXTRAP_CLAMP_SLACK)
+            Z_grid = Z2d.ravel()
+            self._log(
+                f"Ремонт кромки: пересчитано {n_edge} приграничных узлов "
+                f"(полоса {self.EDGE_EXTRAP_BAND_CELLS} яч. + поглощение пиков "
+                f"до {self.EDGE_EXTRAP_DISC_REACH} яч.) экстраполяцией наклона "
+                f"внутренней области.")
 
         # Gentle smoothing of the (kept) grid depths to kill the 8-bit
         # quantization terracing before the surface is built.
@@ -1786,6 +1877,181 @@ class DepthReconstructor:
             out[1:, :-1] |= m[:-1, 1:]
             m = out
         return m
+
+    @staticmethod
+    def _discontinuity_nodes(Z, inside, ratio, abs_m):
+        """Flag grid nodes that touch a depth DISCONTINUITY — the same
+        "over-long polygon" criterion the final mesh cutoff (_build_grid_faces)
+        uses, but evaluated on the grid depths BEFORE smoothing/unprojection so
+        it can drive the edge repair. An edge between two adjacent nodes is a
+        discontinuity when |ΔZ| / Zmid > ratio (relative, scale-invariant — a
+        smoothly sampled surface has |ΔZ|/Z ≈ the angular pixel pitch, while a
+        silhouette / spike spikes far above it) OR |ΔZ| > abs_m metres
+        (absolute cap). Both endpoints of every such edge are flagged. Returns
+        an (stride,stride) bool grid restricted to `inside` nodes."""
+        Z = np.asarray(Z, dtype=np.float64)
+        inside = np.asarray(inside, dtype=bool)
+        r = float(ratio)
+        a = float(abs_m)
+        eps = 1e-3
+        disc = np.zeros(Z.shape, dtype=bool)
+        dH = np.abs(Z[:, 1:] - Z[:, :-1])
+        ZmH = np.maximum(0.5 * (Z[:, 1:] + Z[:, :-1]), eps)
+        badH = (dH / ZmH > r) | (dH > a)
+        disc[:, :-1] |= badH
+        disc[:, 1:] |= badH
+        dV = np.abs(Z[1:, :] - Z[:-1, :])
+        ZmV = np.maximum(0.5 * (Z[1:, :] + Z[:-1, :]), eps)
+        badV = (dV / ZmV > r) | (dV > a)
+        disc[:-1, :] |= badV
+        disc[1:, :] |= badV
+        return disc & inside
+
+    def _extrapolate_edge_z(self, Z2d, inside2d, band, win, idw_power=2.0,
+                            disc_ratio=None, disc_abs_m=None, disc_reach=0,
+                            clamp_slack=None):
+        """Re-estimate the depth of grid nodes near the mask boundary by a
+        gradient-preserving extrapolation of the trusted interior, and return
+        (Z2d_new, n_repaired_nodes).
+
+        Motivation: the masked depth is unreliable in a thin ring just inside
+        the alpha edge (the mask catches a sliver of the body wall / the depth
+        map's soft silhouette), which leaves spurious peaks and rises along the
+        rim. Eroding the mask by a fixed offset is not an option — it would
+        also shave off a real pile crest that happens to sit on the edge.
+
+        The repair set is built in two parts:
+          • RIM BAND  — inside nodes within `band` cells of the mask exterior
+            (catches the gradual soft-silhouette contamination); plus
+          • EDGE SPIKES — discontinuity nodes (the LONGPOLY criterion, see
+            _discontinuity_nodes) that are connected to the rim through other
+            discontinuity nodes, up to `disc_reach` cells deep. This catches a
+            hard spike that pokes several cells inward — wider than `band` — so
+            it is rebuilt in FULL instead of leaving its inner part behind
+            (and contaminating the fit). An interior crater wall, not connected
+            to the rim, is NOT absorbed and stays intact.
+
+        Every node in the repair set is re-estimated by a local first-order
+        (moving least-squares) plane  z ≈ a·dx + b·dy + c  fitted to the CORE
+        nodes around it (inside, not being repaired, not a discontinuity), with
+        (dx, dy) measured FROM the node — so the value at the node is simply c,
+        the interior surface's own slope carried outward. A node on a genuine
+        steep crest keeps climbing at the interior's rate; a phantom rim spike
+        is pulled back onto the interior trend.
+
+        `clamp_slack` (None = off) is an anti-dip guard: a first-order
+        extrapolation of a surface descending toward the rim overshoots
+        downward, so a former up-spike can leave a faint downward bend. The
+        result is floored at the core window's minimum minus clamp_slack·range.
+        Only the LOWER side is bounded — a genuine crest rising onto the edge
+        keeps climbing (upward spikes are removed by the absorption, not here).
+        """
+        Z = np.asarray(Z2d, dtype=np.float64).copy()
+        inside = np.asarray(inside2d, dtype=bool)
+        band = int(band)
+        win = int(win)
+        if band <= 0 or not inside.any():
+            return Z, 0
+
+        # Discontinuity (spike) nodes — the LONGPOLY test on the raw grid
+        # depths, BEFORE any smoothing, so the repair is driven by the real
+        # depth jumps rather than waiting for the final mesh-level cutoff.
+        if disc_ratio is not None or disc_abs_m is not None:
+            disc = self._discontinuity_nodes(
+                Z, inside,
+                float("inf") if disc_ratio is None else disc_ratio,
+                float("inf") if disc_abs_m is None else disc_abs_m)
+        else:
+            disc = np.zeros(inside.shape, dtype=bool)
+
+        # Layered Chebyshev distance to the mask exterior, computed up to
+        # band + disc_reach (outside = 0, first interior ring = 1, …). The rim
+        # band is gdist∈[1, band]; the absorption is allowed to extend out to
+        # gdist ≤ band + disc_reach.
+        reach = max(0, int(disc_reach))
+        maxd = band + reach
+        gdist = np.zeros(inside.shape, dtype=np.int32)
+        cur = ~inside
+        for k in range(1, maxd + 1):
+            nb = self._dilate_grid_mask(cur, 1) & inside & (gdist == 0)
+            if not nb.any():
+                break
+            gdist[nb] = k
+            cur = cur | nb
+        repair = inside & (gdist > 0) & (gdist <= band)
+
+        # Absorb edge-connected spikes: grow the repair set along discontinuity
+        # nodes that touch the rim, but ONLY within band+disc_reach cells of the
+        # boundary (`within`). The geometric bound stops the flood from walking
+        # deep along a wall that merely grazes the rim; the disc-connectivity
+        # requirement keeps interior crater walls (not reached from the rim)
+        # intact. Together they rebuild a wide rim spike in full without eating
+        # real geometry.
+        if reach > 0 and disc.any() and repair.any():
+            within = inside & (gdist > 0)
+            frontier = repair.copy()
+            for _ in range(reach):
+                grow = (self._dilate_grid_mask(frontier, 1)
+                        & disc & within & (~repair))
+                if not grow.any():
+                    break
+                repair |= grow
+                frontier = grow
+
+        # Core = trusted interior: inside, not repaired, not a discontinuity.
+        core = inside & (~repair) & (~disc)
+        if not repair.any() or int(core.sum()) < 3:
+            return Z, 0
+
+        Hh, Ww = Z.shape
+        er, ec = np.where(repair)
+        new = Z.copy()
+        p = float(idw_power)
+        slack = None if clamp_slack is None else float(clamp_slack)
+        n_done = 0
+        for r, c in zip(er.tolist(), ec.tolist()):
+            r0, r1 = max(0, r - win), min(Hh, r + win + 1)
+            c0, c1 = max(0, c - win), min(Ww, c + win + 1)
+            cm = core[r0:r1, c0:c1]
+            if int(cm.sum()) < 3:
+                continue
+            zz = Z[r0:r1, c0:c1][cm]
+            rr, cc = np.where(cm)
+            dx = (cc + c0 - c).astype(np.float64)
+            dy = (rr + r0 - r).astype(np.float64)
+            d2 = dx * dx + dy * dy
+            # Inverse-distance weights (+1 keeps them bounded and favours the
+            # nearest core nodes); never zero since core never overlaps repair.
+            w = 1.0 / (np.power(d2, p * 0.5) + 1.0)
+            # Weighted normal equations for the plane [dx, dy, 1] -> z.
+            Sxx = float(np.sum(w * dx * dx)); Sxy = float(np.sum(w * dx * dy))
+            Sx = float(np.sum(w * dx));       Syy = float(np.sum(w * dy * dy))
+            Sy = float(np.sum(w * dy));       S1 = float(np.sum(w))
+            Sxz = float(np.sum(w * dx * zz)); Syz = float(np.sum(w * dy * zz))
+            Sz = float(np.sum(w * zz))
+            M = np.array([[Sxx, Sxy, Sx],
+                          [Sxy, Syy, Sy],
+                          [Sx,  Sy,  S1]], dtype=np.float64)
+            rhs = np.array([Sxz, Syz, Sz], dtype=np.float64)
+            try:
+                # Value at the node (dx=dy=0) is the constant term.
+                val = float(np.linalg.solve(M, rhs)[2])
+            except np.linalg.LinAlgError:
+                # Degenerate (collinear core) — fall back to the weighted mean.
+                val = Sz / max(S1, 1e-12)
+            # Anti-dip guard (LOWER bound only): a first-order extrapolation of
+            # a surface that descends toward the rim overshoots downward, so a
+            # former up-spike leaves a faint dip. Floor the value at the core
+            # window's minimum minus slack·range. The UPPER side is left free
+            # so a genuine crest rising onto the edge keeps climbing (upward
+            # spikes are already removed by the absorption above, not here).
+            if slack is not None:
+                lo = float(zz.min())
+                rng = float(zz.max() - zz.min())
+                val = max(val, lo - slack * rng)
+            new[r, c] = val
+            n_done += 1
+        return new, n_done
 
     @staticmethod
     def _smooth_grid_z(Z, valid, iters):

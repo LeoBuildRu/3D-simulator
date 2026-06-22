@@ -3091,6 +3091,8 @@ class MainWindow(QMainWindow):
                 pass
 
     def closeEvent(self, e):
+        # 1. Stop the Qt-driven loops first, so neither taskMgr.step() nor the
+        #    telemetry callback runs against a Panda app we're tearing down.
         try:
             if hasattr(self, "_panda_timer"):
                 self._panda_timer.stop()
@@ -3101,4 +3103,26 @@ class MainWindow(QMainWindow):
                 self._telemetry_timer.stop()
         except Exception:
             pass
+        # 2. Clean, controlled stop of Panda subsystems (particles / Warp).
+        try:
+            if self.panda_app is not None:
+                self.panda_app.shutdown()
+        except Exception:
+            pass
         super().closeEvent(e)
+        # 3. Hard-exit to avoid a 10-30 s system-wide stall on shared-memory
+        #    (integrated) GPUs. CPython would otherwise finalize Panda's C++
+        #    object graph and delete RenderPipeline's entire GL context one
+        #    object at a time, which saturates the GPU driver / DWM and
+        #    stutters the cursor and audio across the whole system. The window
+        #    is already gone and nothing critical runs at a normal exit
+        #    (graphics.json is saved on change; crash_reporter only fires via
+        #    sys.excepthook), so let the OS reclaim the GL context and the
+        #    address space in a single operation.
+        import sys
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)

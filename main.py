@@ -423,6 +423,31 @@ class MyApp(ShowBase):
                 traceback.print_exc()
 
     # ==================================================================
+    # Controlled shutdown
+    # ==================================================================
+    def shutdown(self) -> None:
+        """Cleanly stop live subsystems before the process exits.
+
+        Called from MainWindow.closeEvent. Releases the particle system and
+        the NVIDIA Warp arrays it owns and breaks the render loop, so nothing
+        touches a half-torn-down scene graph during exit.
+
+        The heavy GL/GPU context teardown (RenderPipeline's render targets) is
+        deliberately NOT done here: deleting that many GL objects one-by-one
+        stalls the iGPU driver for 10-30 s on shared-memory graphics. We let
+        process termination hand the whole GL context back to the OS in a
+        single operation instead (see MainWindow.closeEvent)."""
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        try:
+            particles = getattr(self, "particles", None)
+            if particles is not None:
+                particles.destroy()
+        except Exception:
+            traceback.print_exc()
+
+    # ==================================================================
     # Lightweight renderer (PERFORMANCE preset) — no RenderPipeline
     # ==================================================================
     def _init_lightweight_renderer(self, preset):
