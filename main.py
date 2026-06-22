@@ -53,6 +53,7 @@ def load_tls_config(base_path):
 # (gui import removed - new MainWindow lives in main_window.py)
 from src.ui.panda_widget import Panda3DWidget
 from src.rendering.depth_map_renderer import DepthMapRenderer
+from src.rendering.segmentation_renderer import SegmentationRenderer
 from src.rendering.perlin_mesh_generator import PerlinMeshGenerator
 from src.rendering.renderer_utils import RendererUtils
 from src.rendering.mesh_reconstruction import MeshReconstruction
@@ -332,6 +333,10 @@ class MyApp(ShowBase):
 
         self.perlin_generator = PerlinMeshGenerator(self, tls_client=self.tls_client)
         self.renderer_utils = RendererUtils(self)
+
+        # Рендер карты сегментации для датасетов (GL-буфер создаётся лениво,
+        # при первом снимке). Глубинный рендерер остаётся без изменений.
+        self.segmentation_renderer = SegmentationRenderer(self)
 
         self.mesh_reconstruction = MeshReconstruction(self, tls_client=self.tls_client)
 

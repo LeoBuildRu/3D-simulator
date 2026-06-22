@@ -485,8 +485,11 @@ class MainWindow(QMainWindow):
                 QSpinBox as _QSB,
                 QPushButton as _QPB2,
                 QHBoxLayout as _QHB2,
+                QVBoxLayout as _QVB2,
                 QLabel as _QL2,
                 QFrame as _QFr2,
+                QComboBox as _QCB2,
+                QCheckBox as _QCk2,
             )
             from src.ui.ui_theme import (
                 COLOR_TEXT as _RCT,
@@ -499,9 +502,19 @@ class MainWindow(QMainWindow):
             save_holder.setStyleSheet(
                 "QFrame { background: transparent; border: none; }"
             )
-            sh_lay = _QHB2(save_holder)
+            # Две строки: 1) подпись + кол-во + тип датасета; 2) случайный
+            # фон + кнопка сохранения. Так контролы не сжимаются в одну
+            # узкую строку.
+            sh_lay = _QVB2(save_holder)
             sh_lay.setContentsMargins(0, 6, 0, 0)
             sh_lay.setSpacing(6)
+
+            sh_row1 = _QHB2()
+            sh_row1.setContentsMargins(0, 0, 0, 0)
+            sh_row1.setSpacing(6)
+            sh_row2 = _QHB2()
+            sh_row2.setContentsMargins(0, 0, 0, 0)
+            sh_row2.setSpacing(6)
 
             sr_label = _QL2("СНИМОК")
             sr_label.setStyleSheet(
@@ -525,6 +538,55 @@ class MainWindow(QMainWindow):
                 "  font-size: 11px;"
                 "}"
                 "QSpinBox::up-button, QSpinBox::down-button { width: 0; }"
+            )
+
+            # Тип датасета: глубина (как раньше) или сегментация.
+            self.cmb_dataset_type = _QCB2()
+            self.cmb_dataset_type.addItem("Глубина", "depth")
+            self.cmb_dataset_type.addItem("Сегментация", "segmentation")
+            self.cmb_dataset_type.setCurrentIndex(0)
+            self.cmb_dataset_type.setFixedHeight(22)
+            self.cmb_dataset_type.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.cmb_dataset_type.setStyleSheet(
+                "QComboBox {"
+                "  background: rgba(255,255,255,4);"
+                f"  color: {_RCT};"
+                f"  border: 1px solid {_RCH};"
+                "  border-radius: 4px;"
+                "  padding: 1px 6px;"
+                f"  font-family: {_RFM};"
+                "  font-size: 11px;"
+                "}"
+                "QComboBox::drop-down { border: none; width: 14px; }"
+                "QComboBox QAbstractItemView {"
+                f"  background: #1b1b1b;"
+                f"  color: {_RCT};"
+                f"  selection-background-color: rgba(0,255,136,40);"
+                f"  border: 1px solid {_RCH};"
+                "}"
+            )
+
+            # Случайный фон: на цветном рендере фон сцены/неба заменяется
+            # случайной картинкой из assets/backgrounds (кузов+груз остаются).
+            # В этом режиме вариации по времени суток не генерируются.
+            self.chk_random_bg = _QCk2("Случ. фон")
+            self.chk_random_bg.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.chk_random_bg.setToolTip(
+                "Заменять фон сцены/неба случайной картинкой из "
+                "assets/backgrounds (после дисторсии, только на цветном "
+                "кадре). Передний план — кузов и груз — сохраняется.\n"
+                "В этом режиме НЕ создаются вариации с разным временем суток."
+            )
+            self.chk_random_bg.setStyleSheet(
+                f"QCheckBox {{ color: {_RCT}; font-size: 10px;"
+                f" letter-spacing: 0.3px; background: transparent; }}"
+                "QCheckBox::indicator { width: 12px; height: 12px; }"
+                "QCheckBox::indicator:unchecked {"
+                f"  border: 1px solid {_RCH}; border-radius: 3px;"
+                "  background: rgba(255,255,255,4); }"
+                "QCheckBox::indicator:checked {"
+                "  border: 1px solid #00FF88; border-radius: 3px;"
+                "  background: #00FF88; }"
             )
 
             self.btn_save_render = _QPB2("Сохранить")
@@ -555,10 +617,18 @@ class MainWindow(QMainWindow):
             )
             self.btn_save_render.clicked.connect(self._on_save_render_clicked)
 
-            sh_lay.addWidget(sr_label, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_lay.addWidget(self.spn_render_count, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_lay.addStretch(1)
-            sh_lay.addWidget(self.btn_save_render, 0, Qt.AlignmentFlag.AlignVCenter)
+            # Строка 1: подпись + количество снимков + тип датасета.
+            sh_row1.addWidget(sr_label, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_row1.addWidget(self.spn_render_count, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_row1.addWidget(self.cmb_dataset_type, 1, Qt.AlignmentFlag.AlignVCenter)
+
+            # Строка 2: случайный фон + кнопка сохранения.
+            sh_row2.addWidget(self.chk_random_bg, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_row2.addStretch(1)
+            sh_row2.addWidget(self.btn_save_render, 0, Qt.AlignmentFlag.AlignVCenter)
+
+            sh_lay.addLayout(sh_row1)
+            sh_lay.addLayout(sh_row2)
 
             self.telemetry.attach_extra(save_holder)
         except Exception as exc:
@@ -2681,6 +2751,19 @@ class MainWindow(QMainWindow):
             count = 1
         count = max(1, count)
 
+        # Тип датасета из выпадающего списка: "depth" или "segmentation".
+        dataset_type = "depth"
+        cmb = getattr(self, "cmb_dataset_type", None)
+        if cmb is not None:
+            data = cmb.currentData()
+            if data:
+                dataset_type = str(data)
+
+        # Замена фона случайной картинкой (assets/backgrounds). В этом режиме
+        # НЕ генерируем вариации с разным временем суток.
+        chk_bg = getattr(self, "chk_random_bg", None)
+        random_background = bool(chk_bg.isChecked()) if chk_bg is not None else False
+
         # Resolve current model + texture from the right panel and pull
         # max_volume from the model's YAML config.
         rp = getattr(self, "right_panel", None)
@@ -2795,9 +2878,9 @@ class MainWindow(QMainWindow):
                 OFFSET_M = 0.05
                 ANG_DEG = 10.0
 
+                # Поза-вариации (угол/смещение) — общие для всех режимов.
                 variants: list[tuple[str, dict]] = [
                     ("orig",          {}),
-                    ("light_alt",     {"time": alt_time}),
                     ("h_plus10",      {"dh":  +ANG_DEG}),
                     ("h_minus10",     {"dh":  -ANG_DEG}),
                     ("p_plus10",      {"dp":  +ANG_DEG}),
@@ -2807,18 +2890,23 @@ class MainWindow(QMainWindow):
                     ("vert_plus5cm",  {"vert": +OFFSET_M}),
                     ("vert_minus5cm", {"vert": -OFFSET_M}),
                 ]
-                for t in tod_list:
-                    variants.append((f"tod_{t:04d}m", {"time": t}))
-                variants.append((
-                    "random_combined",
-                    {
-                        "dh":   random.uniform(-ANG_DEG,  ANG_DEG),
-                        "dp":   random.uniform(-ANG_DEG,  ANG_DEG),
-                        "lat":  random.uniform(-OFFSET_M, OFFSET_M),
-                        "vert": random.uniform(-OFFSET_M, OFFSET_M),
-                        "time": random.randint(0, 1439),
-                    },
-                ))
+                # Вариация по освещению (другое время суток) добавляется
+                # ТОЛЬКО если фон не подменяется случайной картинкой: со
+                # случайным фоном время суток роли не играет (по ТЗ).
+                if not random_background:
+                    variants.insert(1, ("light_alt", {"time": alt_time}))
+                    for t in tod_list:
+                        variants.append((f"tod_{t:04d}m", {"time": t}))
+
+                random_combined_params = {
+                    "dh":   random.uniform(-ANG_DEG,  ANG_DEG),
+                    "dp":   random.uniform(-ANG_DEG,  ANG_DEG),
+                    "lat":  random.uniform(-OFFSET_M, OFFSET_M),
+                    "vert": random.uniform(-OFFSET_M, OFFSET_M),
+                }
+                if not random_background:
+                    random_combined_params["time"] = random.randint(0, 1439)
+                variants.append(("random_combined", random_combined_params))
 
                 for v_idx, (v_name, p) in enumerate(variants):
                     # 1) Восстанавливаем базовую позу
@@ -2869,6 +2957,8 @@ class MainWindow(QMainWindow):
                     )
                     extra_meta = {
                         "render_type": "dataset",
+                        "dataset_type": dataset_type,
+                        "random_background": random_background,
                         "iteration": i,
                         "iteration_total": count,
                         "variant": v_name,
@@ -2897,11 +2987,18 @@ class MainWindow(QMainWindow):
                         f"v{v_idx:02d}_{v_name}"
                     )
 
+                    out_dir = (
+                        "renders/dataset_segmentation"
+                        if dataset_type == "segmentation"
+                        else "renders/dataset"
+                    )
                     try:
                         ok = ru.save_single_render(
-                            output_dir="renders/dataset",
+                            output_dir=out_dir,
                             filename_prefix=prefix,
                             extra_metadata=extra_meta,
+                            dataset_type=dataset_type,
+                            random_background=random_background,
                         )
                         if ok:
                             ok_count += 1

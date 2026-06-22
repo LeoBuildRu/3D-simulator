@@ -8,9 +8,130 @@ import datetime
 import random
 from panda3d.core import *
 
+# Каталог случайных фонов для замены фона на обычном рендере.
+# renderer_utils.py лежит в <root>/src/rendering/, поэтому корень — три уровня вверх.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_BACKGROUNDS_DIR = os.path.join(_PROJECT_ROOT, "assets", "backgrounds")
+_BACKGROUND_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+
 class RendererUtils:
     def __init__(self, panda_app):
         self.panda_app = panda_app
+
+    def _pick_random_background(self):
+        """Случайный путь к фоновой картинке из assets/backgrounds или None."""
+        try:
+            files = [
+                os.path.join(_BACKGROUNDS_DIR, f)
+                for f in os.listdir(_BACKGROUNDS_DIR)
+                if f.lower().endswith(_BACKGROUND_EXTS)
+            ]
+        except OSError:
+            return None
+        return random.choice(files) if files else None
+
+    def _composite_random_background(self, img_final, mask_final, bg_path):
+        """Заменить фон на цветном кадре случайной картинкой.
+
+        Передний план (кузов + груз) определяется по маске сегментации
+        mask_final (уже с теми же дисторсией/кропом/растяжением, что и
+        img_final). Все пиксели, кроме cargo/cuzov, заполняются картинкой
+        bg_path. Возвращает новый PNMImage или None при ошибке.
+        """
+        try:
+            import io
+            import numpy as np
+            from PIL import Image
+            from src.rendering.segmentation_renderer import SEG_COLORS
+        except Exception as exc:
+            print(f"[Render] замена фона недоступна (PIL/numpy): {exc}")
+            return None
+
+        def _pnm_to_rgb_array(pnm):
+            stream = StringStream()
+            pnm.write(stream, "png")
+            pil = Image.open(io.BytesIO(stream.getData())).convert("RGB")
+            return np.asarray(pil), pil.size
+
+        try:
+            img_arr, size = _pnm_to_rgb_array(img_final)
+            mask_arr, _ = _pnm_to_rgb_array(mask_final)
+            bg_pil = Image.open(bg_path).convert("RGB").resize(
+                size, Image.LANCZOS)
+            bg_arr = np.asarray(bg_pil)
+
+            mask_i = mask_arr.astype(np.int16)
+
+            def _close(color, tol=40):
+                d = np.abs(mask_i - np.array(color, dtype=np.int16))
+                return (d[..., 0] <= tol) & (d[..., 1] <= tol) & (d[..., 2] <= tol)
+
+            # Передний план = груз (cargo) + кузов (cuzov). Остальное — фон.
+            keep = _close(SEG_COLORS["cargo"]) | _close(SEG_COLORS["cuzov"])
+
+            # Подгоняем цветовую температуру переднего плана под фон, чтобы
+            # вставленный кузов+груз не выглядели «холоднее/теплее» картинки.
+            fg_arr = self._match_color_temperature(img_arr, keep, bg_arr)
+
+            out = np.where(keep[..., None], fg_arr, bg_arr).astype(np.uint8)
+
+            out_buf = io.BytesIO()
+            Image.fromarray(out).save(out_buf, format="PNG")
+            out_buf.seek(0)
+            new_pnm = PNMImage()
+            new_pnm.read(StringStream(out_buf.read()), "png")
+            return new_pnm
+        except Exception as exc:
+            print(f"[Render] ошибка замены фона: {exc}")
+            return None
+
+    def _match_color_temperature(self, img_arr, keep, bg_arr,
+                                 strength=0.85, gain_min=0.6, gain_max=1.7):
+        """Подогнать цветовую температуру переднего плана под фон.
+
+        Оцениваем «точку белого» каждого изображения как среднюю линейную
+        яркость по каналам (gray-world): для фона — по всей картинке, для
+        переднего плана — только по сохраняемым пикселям (keep). Затем —
+        яркостно-нейтральная адаптация фон Криза: масштабируем каналы R и B
+        переднего плана так, чтобы баланс R/G и B/G совпал с фоном (G не
+        трогаем, чтобы не менять общую яркость). Тёплый фон → передний план
+        теплеет, холодный → холоднеет.
+
+        img_arr, bg_arr — HxWx3 uint8 (RGB); keep — HxW bool.
+        Возвращает HxWx3 uint8 (только передний план реально используется).
+        strength — сила коррекции (0..1); gain_min/max — клип усиления.
+        """
+        import numpy as np
+
+        eps = 1e-4
+
+        def to_linear(a):
+            # sRGB(8-бит) -> линейный свет (приближённая гамма 2.2).
+            return np.power(a.astype(np.float32) / 255.0, 2.2)
+
+        fg_lin = to_linear(img_arr)
+        fg_pixels = fg_lin[keep]
+        # Слишком мало переднего плана — не из чего оценивать, не трогаем.
+        if fg_pixels.shape[0] < 64:
+            return img_arr
+
+        fg_mean = fg_pixels.reshape(-1, 3).mean(axis=0) + eps
+        bg_mean = to_linear(bg_arr).reshape(-1, 3).mean(axis=0) + eps
+
+        # Баланс относительно зелёного (нормировка по яркости).
+        fg_wb = fg_mean / fg_mean[1]
+        bg_wb = bg_mean / bg_mean[1]
+        gains = bg_wb / fg_wb                       # (g_r, 1.0, g_b)
+
+        # Умеренная сила + клип, чтобы не уехать в крайности.
+        gains = 1.0 + (gains - 1.0) * float(strength)
+        gains = np.clip(gains, gain_min, gain_max)
+        gains[1] = 1.0                              # зелёный не трогаем
+
+        corrected = np.clip(fg_lin * gains, 0.0, 1.0)
+        corrected = np.power(corrected, 1.0 / 2.2) * 255.0
+        return np.clip(corrected, 0, 255).astype(np.uint8)
 
     def barrel_distortion(self, img, k1=0.15, k2=0.35):
         tex = Texture()
@@ -95,50 +216,71 @@ class RendererUtils:
 
         return img
 
-    def stretch_to_1920x1080(self, img):
+    def stretch_to_1920x1080(self, img, nearest=False):
+        # nearest=True — ближайший сосед (без интерполяции). Нужен для масок
+        # сегментации: билинейное смешение размывало бы границы классов и
+        # порождало промежуточные цвета, которых нет в палитре.
         target_width = 1920
         target_height = 1080
-        
+
         current_width = img.getXSize()
         current_height = img.getYSize()
-        
+
         if current_width == target_width and current_height == target_height:
-            return PNMImage(img)  
-        
+            return PNMImage(img)
+
         stretched_img = PNMImage(target_width, target_height, img.getNumChannels(), img.getMaxval())
-        
+
         scale_x = target_width / current_width
         scale_y = target_height / current_height
-        
+
+        if nearest:
+            for y in range(target_height):
+                src_y = min(int(y / scale_y), current_height - 1)
+                for x in range(target_width):
+                    src_x = min(int(x / scale_x), current_width - 1)
+                    stretched_img.setXel(x, y, img.getXel(src_x, src_y))
+            return stretched_img
+
         for y in range(target_height):
             for x in range(target_width):
                 src_x = x / scale_x
                 src_y = y / scale_y
-                
+
                 x0 = int(math.floor(src_x))
                 x1 = min(x0 + 1, current_width - 1)
                 y0 = int(math.floor(src_y))
                 y1 = min(y0 + 1, current_height - 1)
-                
+
                 dx = src_x - x0
                 dy = src_y - y0
-                
+
                 c00 = img.getXel(x0, y0)
                 c10 = img.getXel(x1, y0)
                 c01 = img.getXel(x0, y1)
                 c11 = img.getXel(x1, y1)
-                
+
                 c0 = [c00[i] * (1 - dx) + c10[i] * dx for i in range(3)]
                 c1 = [c01[i] * (1 - dx) + c11[i] * dx for i in range(3)]
-                
+
                 color = [c0[i] * (1 - dy) + c1[i] * dy for i in range(3)]
-                
+
                 stretched_img.setXel(x, y, color[0], color[1], color[2])
-        
+
         return stretched_img
     
-    def _process_render_image(self, img, depthImg, camera_fov_x=None, camera_fov_y=None, output_dir="renders", 
-                         filename_prefix="render", metadata=None):
+    def _process_render_image(self, img, depthImg=None, camera_fov_x=None, camera_fov_y=None, output_dir="renders",
+                         filename_prefix="render", metadata=None, dataset_type="depth",
+                         seg_mask=None, bg_path=None):
+        # dataset_type: "depth" — depthImg это карта глубины (суффикс _depth);
+        #               "segmentation" — depthImg это маска сегментации
+        #               (суффикс _seg, масштабирование ближайшим соседом,
+        #                чтобы не размывать границы классов).
+        # seg_mask + bg_path: заменить фон на цветном кадре (только на нём!)
+        #               случайной картинкой bg_path. seg_mask (1920x1080)
+        #               проходит ту же дисторсию и используется как вырез
+        #               переднего плана (кузов + груз).
+        is_segmentation = (dataset_type == "segmentation")
         orig_width = img.getXSize()
         orig_height = img.getYSize()
         
@@ -218,7 +360,8 @@ class RendererUtils:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{filename_prefix}_{timestamp}.png"
         output_path = os.path.join(output_dir, filename)
-        filenameDepth = f"{filename_prefix}_{timestamp}_depth.png"
+        second_suffix = "_seg" if is_segmentation else "_depth"
+        filenameDepth = f"{filename_prefix}_{timestamp}{second_suffix}.png"
         output_path_depth = os.path.join(output_dir, filenameDepth)
 
         # Параметры преобразований
@@ -239,15 +382,37 @@ class RendererUtils:
         img_cropped = self.crop_image(img_distorted, left=crop_left, top=crop_top, right=crop_right, bottom=crop_bottom)
         img_final = self.stretch_to_1920x1080(img_cropped)
 
-        # Те же самые искажения применяем к карте глубины,
-        # чтобы цветной и depth кадры попиксельно совпадали.
-        depth_distorted = self.barrel_distortion(depthImg, k1=k1, k2=k2)
-        depth_cropped = self.crop_image(
-            depth_distorted, left=crop_left, top=crop_top,
-            right=crop_right, bottom=crop_bottom,
-        )
-        depth_final = self.stretch_to_1920x1080(depth_cropped)
-        depth_final = self.fix_alpha_to_opaque(depth_final)
+        # Замена фона случайной картинкой — ТОЛЬКО на цветном кадре и уже
+        # после дисторсии. Маску гоним через те же дисторсию/кроп/растяжение,
+        # затем оставляем кузов+груз, остальное заливаем картинкой.
+        background_name = None
+        if bg_path is not None and seg_mask is not None:
+            mask_distorted = self.barrel_distortion(seg_mask, k1=k1, k2=k2)
+            mask_cropped = self.crop_image(
+                mask_distorted, left=crop_left, top=crop_top,
+                right=crop_right, bottom=crop_bottom,
+            )
+            mask_final = self.stretch_to_1920x1080(mask_cropped, nearest=True)
+            composited = self._composite_random_background(
+                img_final, mask_final, bg_path)
+            if composited is not None:
+                img_final = composited
+                background_name = os.path.basename(bg_path)
+
+        # Те же самые искажения применяем ко второму кадру (карта глубины
+        # ИЛИ маска сегментации), чтобы он попиксельно совпадал с цветным.
+        # Для сегментации финальный stretch — ближайшим соседом, иначе
+        # билинейная интерполяция размыла бы границы классов.
+        depth_final = None
+        if depthImg is not None:
+            depth_distorted = self.barrel_distortion(depthImg, k1=k1, k2=k2)
+            depth_cropped = self.crop_image(
+                depth_distorted, left=crop_left, top=crop_top,
+                right=crop_right, bottom=crop_bottom,
+            )
+            depth_final = self.stretch_to_1920x1080(
+                depth_cropped, nearest=is_segmentation)
+            depth_final = self.fix_alpha_to_opaque(depth_final)
         
         # Преобразуем 2D точки с учетом всех примененных трансформаций
         transformed_points_2d = []
@@ -366,11 +531,30 @@ class RendererUtils:
         
         # Сохраняем финальное изображение
         img_final.write(Filename.from_os_specific(output_path))
-        depth_final.write(Filename.from_os_specific(output_path_depth))
+        if depth_final is not None:
+            depth_final.write(Filename.from_os_specific(output_path_depth))
         
         # Формируем render_metadata только с необходимыми данными
         render_metadata = {}
-        
+
+        # Тип датасета (depth / segmentation) + легенда цветов для масок.
+        render_metadata["dataset_type"] = dataset_type
+        render_metadata["random_background"] = background_name
+        render_metadata["second_image"] = (
+            os.path.basename(output_path_depth) if depth_final is not None else None
+        )
+        if is_segmentation:
+            try:
+                from src.rendering.segmentation_renderer import (
+                    SEG_COLORS, SEG_BACKGROUND,
+                )
+                render_metadata["segmentation_palette"] = {
+                    "background": list(SEG_BACKGROUND),
+                    **{k: list(v) for k, v in SEG_COLORS.items()},
+                }
+            except Exception:
+                pass
+
         # Параметры barrel distortion
         render_metadata["barrel_distortion"] = {
             "k1": k1,
@@ -489,7 +673,20 @@ class RendererUtils:
 
     def save_single_render(self, output_dir="renders/single",
                            filename_prefix="single_render",
-                           extra_metadata=None):
+                           extra_metadata=None,
+                           dataset_type="depth",
+                           random_background=False):
+        # dataset_type: "depth" (снимок + карта глубины, как раньше) или
+        # "segmentation" (снимок + маска сегментации). Цветной кадр снимается
+        # одинаково; меняется только второй кадр.
+        #
+        # random_background: на ОБЫЧНОМ цветном рендере (после дисторсии) фон
+        # сцены/неба заменяется случайной картинкой из assets/backgrounds;
+        # передний план (кузов + груз) остаётся. Карта глубины и маска
+        # сегментации при этом НЕ меняются — маска используется только чтобы
+        # вырезать передний план.
+        is_segmentation = (dataset_type == "segmentation")
+
         lens = self.panda_app.cam.node().getLens()
         if isinstance(lens, PerspectiveLens):
             fov = lens.getFov()
@@ -497,7 +694,7 @@ class RendererUtils:
             camera_fov_y = fov[1]
         else:
             camera_fov_x = camera_fov_y = None
-        
+
         # Скрываем depth overlay, ждём пока кадр устаканится, делаем
         # цветной скриншот. Увеличенный wait_panda_render + sleep здесь
         # нужны, чтобы убрать моушн-блюр от только что выполненных
@@ -512,21 +709,52 @@ class RendererUtils:
             self.panda_app.depth_renderer.set_overlay_visibility(False)
             return False
 
-        self.panda_app.depth_renderer.set_overlay_visibility(True)
-        self.wait_panda_render(ticks=10)
-        time.sleep(1.0)
-        self.wait_panda_render(ticks=6)
+        # Маска сегментации для вырезания переднего плана (только при замене
+        # фона). Снимается всегда отдельно — это один дешёвый GPU-кадр.
+        seg_mask_raw = None
+        if random_background:
+            seg_mask_raw = self.panda_app.segmentation_renderer.capture()
+            if seg_mask_raw is None:
+                print("[Render] seg mask for background replace failed; "
+                      "сохраняю без замены фона.")
 
-        depthImg = PNMImage()
-        if not self.panda_app.win.getScreenshot(depthImg):
+        if is_segmentation:
+            # Маска сегментации рендерится в отдельный offscreen-буфер
+            # (плоские цвета, без постобработки). Overlay глубины не нужен.
+            if seg_mask_raw is not None:
+                depthImg = PNMImage(seg_mask_raw)   # переиспользуем захват
+            else:
+                depthImg = self.panda_app.segmentation_renderer.capture()
+            if depthImg is None:
+                print("[Render] segmentation capture failed.")
+                return False
+        else:
+            self.panda_app.depth_renderer.set_overlay_visibility(True)
+            self.wait_panda_render(ticks=10)
+            time.sleep(1.0)
+            self.wait_panda_render(ticks=6)
+
+            depthImg = PNMImage()
+            if not self.panda_app.win.getScreenshot(depthImg):
+                self.panda_app.depth_renderer.set_overlay_visibility(False)
+                return False
+
             self.panda_app.depth_renderer.set_overlay_visibility(False)
-            return False
-
-        self.panda_app.depth_renderer.set_overlay_visibility(False)
 
         img = self.stretch_to_1920x1080(img)
-        depthImg = self.stretch_to_1920x1080(depthImg)
+        depthImg = self.stretch_to_1920x1080(depthImg, nearest=is_segmentation)
         depthImg = self.fix_alpha_to_opaque(depthImg)
+
+        # Маску под вырезание приводим к 1920x1080 тем же ближайшим соседом
+        # (как img/depth), чтобы геометрия совпала.
+        seg_mask_1080 = None
+        bg_path = None
+        if seg_mask_raw is not None:
+            seg_mask_1080 = self.stretch_to_1920x1080(seg_mask_raw, nearest=True)
+            bg_path = self._pick_random_background()
+            if bg_path is None:
+                print("[Render] assets/backgrounds пуста — замена фона пропущена.")
+                seg_mask_1080 = None
 
         # Клиентский пересчёт объёма реально сгенерированного меша
         # наполнения (в старой версии писался как actual_volume).
@@ -571,6 +799,9 @@ class RendererUtils:
             output_dir=output_dir,
             filename_prefix=filename_prefix,
             metadata=metadata,
+            dataset_type=dataset_type,
+            seg_mask=seg_mask_1080,
+            bg_path=bg_path,
         )
 
         return True
