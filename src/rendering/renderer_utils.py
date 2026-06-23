@@ -68,11 +68,18 @@ class RendererUtils:
                 return (d[..., 0] <= tol) & (d[..., 1] <= tol) & (d[..., 2] <= tol)
 
             # Передний план = груз (cargo) + кузов (cuzov). Остальное — фон.
-            keep = _close(SEG_COLORS["cargo"]) | _close(SEG_COLORS["cuzov"])
+            cuzov_mask = _close(SEG_COLORS["cuzov"])
+            keep = _close(SEG_COLORS["cargo"]) | cuzov_mask
 
-            # Подгоняем цветовую температуру переднего плана под фон, чтобы
-            # вставленный кузов+груз не выглядели «холоднее/теплее» картинки.
+            # 1) Цветовую температуру переднего плана подгоняем под фон, чтобы
+            #    вставленный кузов+груз не выглядели «холоднее/теплее» картинки.
             fg_arr = self._match_color_temperature(img_arr, keep, bg_arr)
+
+            # 2) Яркость фоновой картинки подгоняем под яркость рендера кузова
+            #    (эталон — пиксели cuzov; если их мало, берём весь передний
+            #    план). Так фон тускнеет ночью и светлеет днём вместе со сценой.
+            ref_mask = cuzov_mask if int(cuzov_mask.sum()) >= 64 else keep
+            bg_arr = self._match_brightness(bg_arr, img_arr, ref_mask)
 
             out = np.where(keep[..., None], fg_arr, bg_arr).astype(np.uint8)
 
@@ -132,6 +139,42 @@ class RendererUtils:
         corrected = np.clip(fg_lin * gains, 0.0, 1.0)
         corrected = np.power(corrected, 1.0 / 2.2) * 255.0
         return np.clip(corrected, 0, 255).astype(np.uint8)
+
+    def _match_brightness(self, bg_arr, fg_arr, ref_mask,
+                          scale_min=0.02, scale_max=8.0):
+        """Подогнать яркость фоновой картинки под яркость рендера.
+
+        Считаем среднюю линейную яркость (luma Rec.709) эталонной области
+        переднего плана (ref_mask — обычно пиксели кузова) и всей фоновой
+        картинки, затем масштабируем фон так, чтобы его средняя яркость
+        совпала с эталоном. Тёмный (ночной) рендер -> фон темнеет, светлый
+        (дневной) -> фон светлеет.
+
+        bg_arr, fg_arr — HxWx3 uint8 (RGB); ref_mask — HxW bool.
+        Возвращает HxWx3 uint8.
+        """
+        import numpy as np
+
+        eps = 1e-4
+        coef = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+        def to_linear(a):
+            return np.power(a.astype(np.float32) / 255.0, 2.2)
+
+        ref_pixels = to_linear(fg_arr)[ref_mask]
+        # Слишком мало эталона — не из чего оценивать, фон не трогаем.
+        if ref_pixels.shape[0] < 64:
+            return bg_arr
+
+        fg_lum = float((ref_pixels.reshape(-1, 3) @ coef).mean()) + eps
+        bg_lin = to_linear(bg_arr)
+        bg_lum = float((bg_lin.reshape(-1, 3) @ coef).mean()) + eps
+
+        scale = float(np.clip(fg_lum / bg_lum, scale_min, scale_max))
+
+        out = np.clip(bg_lin * scale, 0.0, 1.0)
+        out = np.power(out, 1.0 / 2.2) * 255.0
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     def barrel_distortion(self, img, k1=0.15, k2=0.35):
         tex = Texture()

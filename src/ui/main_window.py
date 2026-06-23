@@ -568,14 +568,14 @@ class MainWindow(QMainWindow):
 
             # Случайный фон: на цветном рендере фон сцены/неба заменяется
             # случайной картинкой из assets/backgrounds (кузов+груз остаются).
-            # В этом режиме вариации по времени суток не генерируются.
             self.chk_random_bg = _QCk2("Случ. фон")
             self.chk_random_bg.setCursor(Qt.CursorShape.PointingHandCursor)
             self.chk_random_bg.setToolTip(
                 "Заменять фон сцены/неба случайной картинкой из "
                 "assets/backgrounds (после дисторсии, только на цветном "
                 "кадре). Передний план — кузов и груз — сохраняется.\n"
-                "В этом режиме НЕ создаются вариации с разным временем суток."
+                "Цветовая температура переднего плана и яркость фоновой "
+                "картинки подгоняются под рендер кузова."
             )
             self.chk_random_bg.setStyleSheet(
                 f"QCheckBox {{ color: {_RCT}; font-size: 10px;"
@@ -2878,9 +2878,12 @@ class MainWindow(QMainWindow):
                 OFFSET_M = 0.05
                 ANG_DEG = 10.0
 
-                # Поза-вариации (угол/смещение) — общие для всех режимов.
+                # Вариации с разным временем суток генерируются всегда (в т.ч.
+                # при случайном фоне — там яркость фоновой картинки
+                # подгоняется под яркость рендера кузова, см. renderer_utils).
                 variants: list[tuple[str, dict]] = [
                     ("orig",          {}),
+                    ("light_alt",     {"time": alt_time}),
                     ("h_plus10",      {"dh":  +ANG_DEG}),
                     ("h_minus10",     {"dh":  -ANG_DEG}),
                     ("p_plus10",      {"dp":  +ANG_DEG}),
@@ -2890,23 +2893,18 @@ class MainWindow(QMainWindow):
                     ("vert_plus5cm",  {"vert": +OFFSET_M}),
                     ("vert_minus5cm", {"vert": -OFFSET_M}),
                 ]
-                # Вариация по освещению (другое время суток) добавляется
-                # ТОЛЬКО если фон не подменяется случайной картинкой: со
-                # случайным фоном время суток роли не играет (по ТЗ).
-                if not random_background:
-                    variants.insert(1, ("light_alt", {"time": alt_time}))
-                    for t in tod_list:
-                        variants.append((f"tod_{t:04d}m", {"time": t}))
-
-                random_combined_params = {
-                    "dh":   random.uniform(-ANG_DEG,  ANG_DEG),
-                    "dp":   random.uniform(-ANG_DEG,  ANG_DEG),
-                    "lat":  random.uniform(-OFFSET_M, OFFSET_M),
-                    "vert": random.uniform(-OFFSET_M, OFFSET_M),
-                }
-                if not random_background:
-                    random_combined_params["time"] = random.randint(0, 1439)
-                variants.append(("random_combined", random_combined_params))
+                for t in tod_list:
+                    variants.append((f"tod_{t:04d}m", {"time": t}))
+                variants.append((
+                    "random_combined",
+                    {
+                        "dh":   random.uniform(-ANG_DEG,  ANG_DEG),
+                        "dp":   random.uniform(-ANG_DEG,  ANG_DEG),
+                        "lat":  random.uniform(-OFFSET_M, OFFSET_M),
+                        "vert": random.uniform(-OFFSET_M, OFFSET_M),
+                        "time": random.randint(0, 1439),
+                    },
+                ))
 
                 for v_idx, (v_name, p) in enumerate(variants):
                     # 1) Восстанавливаем базовую позу
