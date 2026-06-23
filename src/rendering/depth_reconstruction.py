@@ -184,12 +184,16 @@ class DepthReconstructor:
     # are inside. This is the mask-free replacement for the old 2D fill
     # mask: the truck-body solid bounds the mesh in 3D instead.
     CLIP_TO_NAPOLNITEL = True
-    # Stage 3 — legacy extrapolation + sealed-solid Boolean DIFFERENCE с
-    # napolnitel'ом (MAZ_napolnitel.obj — TONAR_OBJ_REL_PATH ниже) и
-    # подсчёт объёма получившейся замкнутой геометрии.
-    # Extrapolation removed from the pipeline; the function and helpers
-    # below are no longer called.
-    ENABLE_EXTRAPOLATION = False
+    # Stage 3 — pattern-based extrapolation. After Stage 2 the relief is
+    # bounded to the truck body (point-in-mesh clip by napolnitel); Stage 3
+    # extends it outward into a fixed XY rectangle (TARGET_SIZE_M, centred on
+    # the napolnitel XY centre) by tile-based pattern synthesis on the
+    # high-frequency residual, with a smooth blend of the low-frequency trend
+    # toward floor_z over EXTRAP_BLEND_RADIUS_M. The result is a single
+    # contiguous heightfield mesh that preserves the visible relief's
+    # characteristic bumps / ridges on the extrapolated sides.
+    # See _pattern_extrapolate / _quilt_residual.
+    ENABLE_EXTRAPOLATION = True
     # Boolean DIFFERENCE (sealed-solid volume) DEACTIVATED but the code
     # — _clip_relief_to_target and friends — is preserved in this file
     # for future use.
@@ -280,10 +284,37 @@ class DepthReconstructor:
     # pattern outside the mask's XY bbox. The trend (plane fit) is added
     # back so the seam stays C0-continuous. Set to None to disable and
     # keep the original mask-only mesh.
-    # Unused while extrapolation is removed from the pipeline. Kept here
-    # because _clip_relief_to_target (boolean code) still references it.
-    TARGET_SIZE_M = (3.0, 6.0)  # XY-прямоугольник (м), покрывает MAZ ≈ 2.14×5.10
+    # XY-прямоугольник (метры) куда экстраполируется рельеф (Stage 3).
+    # Центрируется на XY-центре napolnitel (см. _napolnitel_xy_center);
+    # 4×7 м заведомо больше MAZ (≈ 2.14×5.10), так что мы видим
+    # «продолжение» рельефа во всех 4 направлениях вокруг кузова.
+    TARGET_SIZE_M = (4.0, 7.0)
     TARGET_RES_PER_M = 35
+    # ---- Pattern synthesis (image-quilting) -------------------------
+    # Синтез работает на ПОЛНОМ heightfield'е (без отделения trend/residual
+    # и без спуска к floor). Source-данные кладутся в цель «как есть», а
+    # пустые ячейки заполняются патчами source'а с подбором по SSD на
+    # перекрытии. Принцип Efros-Freeman: каждый новый патч склеивается с
+    # уже-расставленными ячейками минимальным швом → «характерные бугры
+    # / гребни» source'а статистически продолжаются наружу.
+    #
+    # PATTERN_PATCH_FRAC — размер патча в долях короткой стороны source'а.
+    #   Должен быть хотя бы с типичный бугор (иначе паттерн дробится в
+    #   шум). 0.40 ≈ 1-2 «бугра» на патч для source'а ~70×175 ячеек.
+    PATTERN_PATCH_FRAC = 0.40
+    # PATTERN_OVERLAP_FRAC — доля перекрытия между соседними патчами
+    #   (по этой полосе работает SSD и feather). Больше = чище швы,
+    #   меньше = больше разнообразия в укладке.
+    PATTERN_OVERLAP_FRAC = 0.30
+    # PATTERN_CANDIDATES — сколько случайных позиций source'а перебрать
+    #   на каждом тайле; больше = чище швы, дороже.
+    PATTERN_CANDIDATES = 24
+    # PATTERN_SEED — RNG seed. None = недетерминированно.
+    PATTERN_SEED = 0
+    # PATTERN_FINAL_SMOOTH — лёгкое сглаживание ТОЛЬКО синтезированных
+    #   ячеек (anchor-источник остаётся точным) на финальной стадии,
+    #   чтобы убить остатки видимых швов. 0 = выключено, 1-2 = аккуратно.
+    PATTERN_FINAL_SMOOTH = 1
     # Light smoothing of the target grid AFTER extrapolation (mask data is
     # preserved — only extrapolated cells are smoothed). 3 итерации —
     # компромисс: разрывы вдоль кромки закрываются, но рельеф не
@@ -1041,16 +1072,36 @@ class DepthReconstructor:
             self._finish(False, {})
             return False
 
-        # Stage 3 (extrapolation + Boolean DIFFERENCE volume) removed from
-        # the pipeline. `_clip_relief_to_target` and the rest of the
-        # boolean machinery are still defined below for future reuse but
-        # nothing calls them now.
+        # ---- Stage 3: pattern-based extrapolation. Source-меш (Stage 1+2)
+        #      идёт в результат БЕЗ ИЗМЕНЕНИЙ; снаружи его XY-bbox'а
+        #      достраивается «обрамление» (heightfield на регулярной
+        #      4×7 м-сетке), заполненное image-quilting'ом из реальных
+        #      патчей source'а — паттерн продолжается наружу без правки
+        #      основного рельефа. Если extrapolation сработал, он сам
+        #      применяет cleanup только к ext-части и просит пропустить
+        #      глобальный cleanup (skip_global_cleanup), чтобы source
+        #      не пострадал.
+        skip_global_cleanup = False
+        if self.ENABLE_EXTRAPOLATION and len(faces) > 0:
+            res = self._pattern_extrapolate(verts, faces)
+            if res is not None:
+                verts, faces, skip_global_cleanup = res
+            else:
+                self._log("Stage 3: pattern-экстраполяция не дала результата — "
+                          "оставляю меш по маске.")
+
+        if len(faces) == 0:
+            self._log("Нет ячеек для меша (Stage 3 вернул пустой меш).")
+            self._finish(False, {})
+            return False
 
         # ---- Final cleanup: strip near-vertical walls (with a metric removal
         #      radius) and tiny disconnected clusters from the displayed mesh.
-        #      Runs last so it catches vertical faces from any stage; the volume
-        #      number was already computed above and is kept.
-        if (self.STEEP_CUTOFF or self.MIN_CLUSTER_SIZE_M) and len(faces) > 0:
+        #      ВНИМАНИЕ: пропускаем, когда сработал pattern-extrapolation —
+        #      source-меш должен дойти до экрана нетронутым.
+        if (not skip_global_cleanup
+                and (self.STEEP_CUTOFF or self.MIN_CLUSTER_SIZE_M)
+                and len(faces) > 0):
             verts, faces = self._cleanup_relief(verts, faces)
 
         if len(faces) == 0:
@@ -2652,6 +2703,21 @@ class DepthReconstructor:
                       # point-in-mesh edge cases at the very bottom.
         return float(verts[:, 2].min()) + margin
 
+    def _napolnitel_xy_center(self):
+        """XY-центр AABB napolnitel'а в мировых координатах (после
+        TONAR_OBJ_TRANSFORM). Используется Stage 3 для размещения
+        TARGET_SIZE_M-прямоугольника по центру кузова. None при ошибке."""
+        loaded = self._load_tonar_obj()
+        if loaded is None:
+            return None
+        verts, _faces = loaded
+        if verts is None or len(verts) == 0:
+            return None
+        xy = np.asarray(verts, dtype=np.float64)[:, :2]
+        cx = float(0.5 * (xy[:, 0].min() + xy[:, 0].max()))
+        cy = float(0.5 * (xy[:, 1].min() + xy[:, 1].max()))
+        return cx, cy
+
     # ------------------------------------------------------------------
     # Local clipping (relief ∩ tonar_napolnitel) via point-in-mesh test
     # ------------------------------------------------------------------
@@ -2803,6 +2869,363 @@ class DepthReconstructor:
             f"{new_faces.shape[0]}/{rf.shape[0]} тр., "
             f"{new_verts.shape[0]} верш. — отсечена геометрия вне кузова.")
         return new_verts, new_faces
+
+    # ------------------------------------------------------------------
+    # Stage 3 — pattern-based extrapolation to TARGET_SIZE_M rectangle
+    # ------------------------------------------------------------------
+    def _pattern_extrapolate(self, src_verts, src_faces):
+        """Достраивает «обрамление» (extrapolation frame) вокруг source-меша
+        размером TARGET_SIZE_M, не трогая САМ source.
+
+        Главное правило: МЕШ source'а (verts, faces из Stage 1+2,
+        собранный по depth_map) идёт в результат БАЙТ-В-БАЙТ — без
+        растеризации, без сглаживания, без переиндексации, без cleanup'а.
+        Stage 3 строит ОТДЕЛЬНУЮ frame-геометрию (heightfield на
+        регулярной XY-сетке внутри прямоугольника TARGET_SIZE_M, с
+        вырезанной «дырой» под source) и просто приклеивает её сбоку.
+
+        Алгоритм:
+          1. Source rasterize (нужно ТОЛЬКО для подсказок quilt'у — само
+             rasterization-поле в результат не идёт).
+          2. Целевая сетка TARGET_SIZE_M, центрированная на napolnitel.
+          3. anchor = ячейки цели, чьи XY попадают в bbox source'а с
+             валидными данными — им присваиваются Z из source. Эти Z
+             квилтер использует ТОЛЬКО как «опору» для SSD-склейки.
+          4. _quilt_z заполняет остальные ячейки real-source-патчами в
+             порядке возрастания BFS-дистанции от anchor'а — паттерн
+             продолжается наружу с теми же буграми/гребнями.
+          5. Из target-сетки исключаются клетки, у которых ХОТЯ БЫ ОДИН
+             из 4 углов — anchor (т.е. ext-меш живёт строго СНАРУЖИ
+             source-области, с 1-клеточным «зазором», чтобы не было
+             z-fight'а с настоящим source-мешем).
+          6. STEEP/CLUSTER-cleanup применяется ТОЛЬКО к ext-фрагменту;
+             source при этом не трогается.
+          7. Конкатенация: source-меш + ext-меш → один общий (verts, faces).
+
+        Возвращает (verts, faces, skip_global_cleanup=True) или None.
+        Флаг skip_global_cleanup читает reconstruct() и пропускает
+        финальный _cleanup_relief, чтобы он не тронул source-часть."""
+        src_verts = np.asarray(src_verts, dtype=np.float64)
+        src_faces = np.asarray(src_faces, dtype=np.int64)
+        if src_verts.shape[0] == 0 or src_faces.shape[0] == 0:
+            return None
+
+        # --- 1. Source rasterization (служебная) ---------------------
+        used_idx = np.unique(src_faces.reshape(-1))
+        used_v = src_verts[used_idx]
+        xy = used_v[:, :2]
+        xmin_s = float(xy[:, 0].min())
+        xmax_s = float(xy[:, 0].max())
+        ymin_s = float(xy[:, 1].min())
+        ymax_s = float(xy[:, 1].max())
+        w_s = max(xmax_s - xmin_s, 1e-6)
+        h_s = max(ymax_s - ymin_s, 1e-6)
+        src_field, src_valid = self._rasterize_xyz(
+            used_v, xmin_s, ymin_s, w_s, h_s)
+        if not src_valid.any():
+            self._log("Pattern extrapolate: rasterize вернул пустоту — "
+                      "оставляю только source.")
+            return src_verts, src_faces, True
+
+        # --- 2. Target grid centred on napolnitel. -------------------
+        center = self._napolnitel_xy_center()
+        if center is None:
+            cx = 0.5 * (xmin_s + xmax_s)
+            cy = 0.5 * (ymin_s + ymax_s)
+            self._log("Pattern extrapolate: napolnitel недоступен — "
+                      "центр цели взят по bbox source'а.")
+        else:
+            cx, cy = center
+        Tx_m, Ty_m = float(self.TARGET_SIZE_M[0]), float(self.TARGET_SIZE_M[1])
+        tx_min = cx - 0.5 * Tx_m
+        ty_min = cy - 0.5 * Ty_m
+        tx_max = tx_min + Tx_m
+        ty_max = ty_min + Ty_m
+
+        res = float(self.TARGET_RES_PER_M)
+        tnx = max(2, int(round(Tx_m * res)) + 1)
+        tny = max(2, int(round(Ty_m * res)) + 1)
+
+        gx = np.linspace(tx_min, tx_max, tnx)
+        gy = np.linspace(ty_min, ty_max, tny)
+        GX, GY = np.meshgrid(gx, gy)            # (tny, tnx)
+
+        # --- 3. Anchor (нужен только для SSD-якоря quilt'а). ---------
+        Z_src_sample = self._bilinear_sample(
+            src_field, GX.ravel(), GY.ravel(),
+            xmin_s, xmax_s, ymin_s, ymax_s).reshape(tny, tnx)
+        valid_f = self._bilinear_sample(
+            src_valid.astype(np.float64), GX.ravel(), GY.ravel(),
+            xmin_s, xmax_s, ymin_s, ymax_s).reshape(tny, tnx)
+        in_bbox = ((GX >= xmin_s) & (GX <= xmax_s) &
+                   (GY >= ymin_s) & (GY <= ymax_s))
+        anchor = in_bbox & (valid_f > 0.5)
+        if not anchor.any():
+            # Bbox не пересекся с целью — нечего экстраполировать
+            # «вокруг»; возвращаем только source.
+            self._log("Pattern extrapolate: source bbox не пересекся с "
+                      "целью — extrapolation пропущен.")
+            return src_verts, src_faces, True
+
+        # --- 4. Quilt fill (anchor выступает только опорой). --------
+        Z_tgt = np.where(anchor, Z_src_sample, np.nan)
+        Z_filled = self._quilt_z(
+            src_field, src_valid, Z_tgt, anchor,
+            patch_frac=float(self.PATTERN_PATCH_FRAC),
+            overlap_frac=float(self.PATTERN_OVERLAP_FRAC),
+            candidates=int(self.PATTERN_CANDIDATES),
+            seed=self.PATTERN_SEED)
+        if self.PATTERN_FINAL_SMOOTH > 0:
+            Z_filled = self._smooth_preserve(
+                Z_filled, anchor, int(self.PATTERN_FINAL_SMOOTH))
+
+        # --- 5. Cell-keep mask: ext клетки строго СНАРУЖИ anchor'а. --
+        # Клетку (i, j) держим, ТОЛЬКО если ни один из 4 её углов
+        # не является anchor'ом. Это оставляет 1-клеточный зазор между
+        # source-мешем и ext-кадром, чтобы избежать z-fight'а на стыке.
+        a = anchor
+        cell_inside_anchor = (a[:-1, :-1] | a[:-1, 1:] |
+                              a[1:, :-1] | a[1:, 1:])
+        cell_keep = ~cell_inside_anchor
+        ext_faces = self._build_regular_grid_faces_masked(tnx, tny, cell_keep)
+
+        if ext_faces.shape[0] == 0:
+            self._log("Pattern extrapolate: ext-кадр пуст (source покрывает "
+                      "весь target) — отдаю только source.")
+            return src_verts, src_faces, True
+
+        # Из 4×7-сетки оставляем только реально-используемые вершины.
+        ext_verts_full = np.column_stack(
+            [GX.ravel(), GY.ravel(), Z_filled.ravel()])
+        used_ext = np.unique(ext_faces.reshape(-1))
+        ext_verts = ext_verts_full[used_ext]
+        remap = np.full(tnx * tny, -1, dtype=np.int64)
+        remap[used_ext] = np.arange(used_ext.shape[0])
+        ext_faces = remap[ext_faces]
+
+        # --- 6. Cleanup ТОЛЬКО на ext (source не трогаем). -----------
+        if (self.STEEP_CUTOFF or self.MIN_CLUSTER_SIZE_M) and len(ext_faces) > 0:
+            try:
+                ext_verts, ext_faces = self._cleanup_relief(
+                    ext_verts, ext_faces)
+            except Exception as exc:
+                self._log(f"Pattern extrapolate: cleanup ext упал: {exc} "
+                          f"— оставляю ext как есть.")
+
+        # --- 7. Конкатенация source + ext в один меш. ---------------
+        n_src = src_verts.shape[0]
+        all_verts = np.concatenate([src_verts, ext_verts], axis=0)
+        all_faces = np.concatenate(
+            [src_faces, ext_faces + n_src], axis=0)
+
+        zmin_s = float(src_field[src_valid].min())
+        zmax_s = float(src_field[src_valid].max())
+        self._log(
+            f"Pattern extrapolate: source {src_verts.shape[0]} верш / "
+            f"{src_faces.shape[0]} тр. сохранён без изменений; "
+            f"ext-кадр {ext_verts.shape[0]} верш / {ext_faces.shape[0]} тр. "
+            f"в TARGET {Tx_m:g}×{Ty_m:g} м ({tnx}×{tny} grid). "
+            f"anchor {int(anchor.sum())}, source Z∈[{zmin_s:.2f}, {zmax_s:.2f}].")
+        return all_verts, all_faces, True
+
+    @staticmethod
+    def _build_regular_grid_faces_masked(nx, ny, cell_keep):
+        """Триангуляция регулярной (nx×ny)-вершинной сетки, но включаются
+        только те ячейки, где cell_keep[i, j] (i — row, j — col) = True.
+        Возвращает (M, 3) int64 — индексы относительно расплющенной
+        nx*ny сетки."""
+        cx = nx - 1
+        cy = ny - 1
+        cell_keep = np.asarray(cell_keep, dtype=bool)
+        if cx <= 0 or cy <= 0 or not cell_keep.any():
+            return np.zeros((0, 3), np.int64)
+        ti = np.arange(cy)[:, None]
+        si = np.arange(cx)[None, :]
+        a = ti * nx + si
+        b = a + 1
+        c = a + nx
+        d = c + 1
+        k = cell_keep[:cy, :cx]
+        a = a[k]
+        b = b[k]
+        c = c[k]
+        d = d[k]
+        f1 = np.stack([a, b, d], axis=1)
+        f2 = np.stack([a, d, c], axis=1)
+        return np.concatenate([f1, f2], axis=0).astype(np.int64)
+
+    @staticmethod
+    def _smooth_preserve(Z, preserve, iters):
+        """3×3 box-smooth, который НЕ трогает preserve-ячейки (anchor),
+        но использует их как соседей. Применяется к синтезированным
+        ячейкам, чтобы загладить только швы между патчами, не размывая
+        ни источник, ни сами бугры."""
+        Zc = np.asarray(Z, dtype=np.float64).copy()
+        pres = np.asarray(preserve, dtype=bool)
+        Hh, Ww = Zc.shape
+        for _ in range(int(iters)):
+            acc = np.zeros_like(Zc)
+            wsum = np.zeros_like(Zc)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ys_d, ye_d = max(0, -dy), Hh - max(0, dy)
+                    xs_d, xe_d = max(0, -dx), Ww - max(0, dx)
+                    ys_s, ye_s = max(0, dy), Hh - max(0, -dy)
+                    xs_s, xe_s = max(0, dx), Ww - max(0, -dx)
+                    acc[ys_d:ye_d, xs_d:xe_d] += Zc[ys_s:ye_s, xs_s:xe_s]
+                    wsum[ys_d:ye_d, xs_d:xe_d] += 1.0
+            new = acc / np.maximum(wsum, 1e-12)
+            Zc = np.where(pres, Zc, new)
+        return Zc
+
+    def _quilt_z(self, Z_src, V_src, Z_tgt, V_tgt,
+                 patch_frac=0.40, overlap_frac=0.30,
+                 candidates=24, seed=0):
+        """Image-quilting (Efros & Freeman) на ПОЛНОЙ высотной карте.
+
+        V_tgt — anchor-ячейки (их Z уже выставлен в Z_tgt и не меняется).
+        Остальные ячейки заполняются source-патчами в порядке близости
+        к anchor'у (BFS), на каждой позиции выбирается патч из
+        `candidates` случайных кандидатов: побеждает тот, у которого
+        SSD по уже-расставленному перекрытию минимально. Шов между
+        патчами сглаживается линейным feather'ом шириной overlap.
+
+        Никакого приведения к floor_z, никакой собственной модификации
+        Z за пределами замен. Возвращает плотный Z (tny, tnx)."""
+        Z_src = np.asarray(Z_src, dtype=np.float64)
+        V_src = np.asarray(V_src, dtype=bool)
+        Z_tgt = np.asarray(Z_tgt, dtype=np.float64).copy()
+        V_tgt = np.asarray(V_tgt, dtype=bool)
+        sy, sx = Z_src.shape
+        Ty, Tx = Z_tgt.shape
+
+        # Patch / overlap size in cells.
+        P = max(8, int(round(min(sy, sx) * float(patch_frac))))
+        P = min(P, sy, sx)
+        O = max(2, int(round(P * float(overlap_frac))))
+        O = min(O, P - 1)
+        step = max(1, P - O)
+
+        rng = np.random.default_rng(seed)
+
+        # Pre-compute valid source patch top-left starts.
+        if sy < P or sx < P:
+            self._log("Quilt: источник мельче patch'а — пропуск.")
+            # Заполнить пустые ячейки средним по источнику, чтобы не
+            # оставлять NaN.
+            mean_z = float(Z_src[V_src].mean()) if V_src.any() else 0.0
+            return np.where(np.isnan(Z_tgt), mean_z, Z_tgt)
+
+        valid_starts = []
+        for sy0 in range(sy - P + 1):
+            for sx0 in range(sx - P + 1):
+                if V_src[sy0:sy0 + P, sx0:sx0 + P].all():
+                    valid_starts.append((sy0, sx0))
+        if not valid_starts:
+            self._log("Quilt: нет полностью-валидных source-патчей — пропуск.")
+            mean_z = float(Z_src[V_src].mean()) if V_src.any() else 0.0
+            return np.where(np.isnan(Z_tgt), mean_z, Z_tgt)
+        valid_starts = np.asarray(valid_starts, dtype=np.int64)
+
+        # Feather ramp: 1 в центре, плавно ↓ к 0 на ширине O по краям.
+        # При overlay'е этот ramp используется только на перекрывающихся
+        # ячейках; α≈0 на самом краю означает «держим старое», α≈1 в
+        # глубине плитки — «берём новое».
+        ramp = np.ones((P, P), dtype=np.float64)
+        for k in range(O):
+            w_k = (k + 1) / (O + 1)
+            ramp[k, :] = np.minimum(ramp[k, :], w_k)
+            ramp[P - 1 - k, :] = np.minimum(ramp[P - 1 - k, :], w_k)
+            ramp[:, k] = np.minimum(ramp[:, k], w_k)
+            ramp[:, P - 1 - k] = np.minimum(ramp[:, P - 1 - k], w_k)
+
+        # Tile top-left positions covering the target.
+        tile_ti = list(range(0, Ty, step))
+        if tile_ti[-1] + P < Ty:
+            tile_ti.append(Ty - P)        # ensure target edge is covered
+        tile_tj = list(range(0, Tx, step))
+        if tile_tj[-1] + P < Tx:
+            tile_tj.append(Tx - P)
+        tile_positions = [(ti, tj) for ti in tile_ti for tj in tile_tj]
+
+        # Order tiles by BFS-distance from anchor: process the most-
+        # anchored tiles first → каждый следующий патч уже имеет богатую
+        # «опору» из уже-расставленных соседей и хорошо склеивается.
+        _, _, dist_cells = self._bfs_seeds(V_tgt)
+
+        def tile_dist(pos):
+            ti, tj = pos
+            i1 = min(ti + P, Ty); j1 = min(tj + P, Tx)
+            d = dist_cells[ti:i1, tj:j1]
+            d = d[np.isfinite(d)]
+            return float(d.min()) if d.size else float("inf")
+
+        tile_positions.sort(key=tile_dist)
+
+        placed = V_tgt.copy()
+        out = Z_tgt.copy()
+        # На незаполненных ячейках Z_tgt — NaN; заменим временно 0,
+        # чтобы арифметика не отравлялась (anchor — настоящие Z).
+        out = np.where(np.isnan(out), 0.0, out)
+
+        n_tiles = 0
+        for (ti, tj) in tile_positions:
+            i0, j0 = ti, tj
+            i1 = min(i0 + P, Ty); j1 = min(j0 + P, Tx)
+            ph, pw = i1 - i0, j1 - j0
+            if ph < 2 or pw < 2:
+                continue
+            tile_placed = placed[i0:i1, j0:j1]
+            if tile_placed.all():
+                continue            # уже целиком заполнен — пропуск
+
+            cur_tile = out[i0:i1, j0:j1]
+            anchor_count = int(tile_placed.sum())
+
+            # Кандидаты-патчи. Если ничего ещё не расставлено в зоне
+            # плитки — берём случайный source-патч; иначе ищем минимум
+            # SSD на перекрытии.
+            n_cand = min(int(candidates), valid_starts.shape[0])
+            idxs = rng.integers(0, valid_starts.shape[0], size=n_cand)
+            best_score = np.inf
+            best_patch = None
+            for k in idxs:
+                sy0, sx0 = valid_starts[k]
+                sp = Z_src[sy0:sy0 + ph, sx0:sx0 + pw]
+                if anchor_count > 0:
+                    diff = sp[tile_placed] - cur_tile[tile_placed]
+                    score = float((diff * diff).mean())
+                else:
+                    score = float(rng.random())   # любой кандидат подойдёт
+                if score < best_score:
+                    best_score = score
+                    best_patch = sp
+            if best_patch is None:
+                continue
+
+            # 1) В «новых» (ещё-незаполненных) ячейках патч кладётся целиком.
+            new_mask = ~tile_placed
+            out[i0:i1, j0:j1][new_mask] = best_patch[new_mask]
+            # 2) В «перекрытии» — feather-blend: α = ramp.
+            if anchor_count > 0:
+                r = ramp[:ph, :pw]
+                a = r[tile_placed]
+                old = cur_tile[tile_placed]
+                new = best_patch[tile_placed]
+                out[i0:i1, j0:j1][tile_placed] = a * new + (1.0 - a) * old
+            placed[i0:i1, j0:j1] = True
+            n_tiles += 1
+
+        # На случай если что-то осталось NaN (теоретически не должно).
+        if not placed.all():
+            mean_z = float(Z_src[V_src].mean()) if V_src.any() else 0.0
+            out = np.where(placed, out, mean_z)
+
+        self._log(f"Quilt Z: положено {n_tiles} плиток размера "
+                  f"{P}×{P} (overlap {O}, step {step}) из "
+                  f"{valid_starts.shape[0]} допустимых позиций источника, "
+                  f"BFS-порядок от anchor'а.")
+        return out
 
     def _clip_relief_to_target(self, relief_verts, relief_faces, grid_dims):
         """Turn the open rectangular relief heightfield into the closed

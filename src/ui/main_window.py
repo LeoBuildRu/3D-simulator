@@ -523,7 +523,7 @@ class MainWindow(QMainWindow):
             )
 
             self.spn_render_count = _QSB()
-            self.spn_render_count.setRange(1, 50)
+            self.spn_render_count.setRange(1, 5000)
             self.spn_render_count.setValue(1)
             self.spn_render_count.setFixedHeight(22)
             self.spn_render_count.setFixedWidth(56)

@@ -20,3 +20,4 @@ config/graphics.json
 .env
 
 /renders
+config/tls_config.yaml
