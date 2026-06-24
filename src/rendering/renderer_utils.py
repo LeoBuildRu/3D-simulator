@@ -152,6 +152,13 @@ class RendererUtils:
 
         bg_arr, fg_arr — HxWx3 uint8 (RGB); ref_mask — HxW bool.
         Возвращает HxWx3 uint8.
+
+        В эталон берём ТОЛЬКО пиксели ref_mask (передний план) и при этом
+        отбрасываем почти-чёрные: barrel distortion заливает обрезанные
+        края чёрным, а из-за того что маска тянется ближайшим соседом, а
+        цветной кадр — билинейно, на стыке кузова и чёрной каймы появляется
+        тонкое кольцо тёмных пикселей, помеченных как кузов. Если их учесть,
+        яркость переднего плана занижается и фон выходит слишком тёмным.
         """
         import numpy as np
 
@@ -161,12 +168,15 @@ class RendererUtils:
         def to_linear(a):
             return np.power(a.astype(np.float32) / 255.0, 2.2)
 
-        ref_pixels = to_linear(fg_arr)[ref_mask]
+        # Только маскированный передний план (НЕ весь кадр).
+        ref_rgb = fg_arr[ref_mask]
+        # Выкидываем обрезанный фон / чёрную кайму (почти-чёрные пиксели).
+        ref_rgb = ref_rgb[ref_rgb.max(axis=1) > 12]
         # Слишком мало эталона — не из чего оценивать, фон не трогаем.
-        if ref_pixels.shape[0] < 64:
+        if ref_rgb.shape[0] < 64:
             return bg_arr
 
-        fg_lum = float((ref_pixels.reshape(-1, 3) @ coef).mean()) + eps
+        fg_lum = float((to_linear(ref_rgb) @ coef).mean()) + eps
         bg_lin = to_linear(bg_arr)
         bg_lum = float((bg_lin.reshape(-1, 3) @ coef).mean()) + eps
 
