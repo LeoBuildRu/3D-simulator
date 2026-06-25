@@ -47,6 +47,24 @@ try:
 except ImportError:                       # pragma: no cover
     trimesh = None
 
+# Stage 3 trend extraction & extrapolation: Gaussian-smooth для тренда
+# (через scipy.ndimage) и бигармоническая экстраполяция тренда наружу
+# (через skimage). Оба — мягкие зависимости: если их нет, мы откатываемся
+# к box-smooth + Jacobi-Laplace соответственно (см. _mask_aware_gaussian
+# и _biharmonic_extrapolate).
+try:
+    from scipy.ndimage import gaussian_filter as _scipy_gaussian_filter
+except ImportError:                       # pragma: no cover
+    _scipy_gaussian_filter = None
+try:
+    from skimage.restoration import inpaint_biharmonic as _skimage_biharmonic
+except ImportError:                       # pragma: no cover
+    _skimage_biharmonic = None
+try:
+    from scipy.spatial import Delaunay as _scipy_delaunay
+except ImportError:                       # pragma: no cover
+    _scipy_delaunay = None
+
 from panda3d.core import (
     CollisionTraverser, CollisionHandlerQueue, CollisionNode, CollisionRay,
     CollisionPolygon, GeomNode, GeomVertexReader, Point2, Point3, LPoint3,
@@ -290,30 +308,60 @@ class DepthReconstructor:
     # «продолжение» рельефа во всех 4 направлениях вокруг кузова.
     TARGET_SIZE_M = (4.0, 7.0)
     TARGET_RES_PER_M = 35
-    # ---- Pattern synthesis (image-quilting) -------------------------
-    # Синтез работает на ПОЛНОМ heightfield'е (без отделения trend/residual
-    # и без спуска к floor). Source-данные кладутся в цель «как есть», а
-    # пустые ячейки заполняются патчами source'а с подбором по SSD на
-    # перекрытии. Принцип Efros-Freeman: каждый новый патч склеивается с
-    # уже-расставленными ячейками минимальным швом → «характерные бугры
-    # / гребни» source'а статистически продолжаются наружу.
+    # ---- Trend + residual extrapolation -----------------------------
+    # Z раскладывается на ДВА слоя и каждый продолжается своим методом:
     #
-    # PATTERN_PATCH_FRAC — размер патча в долях короткой стороны source'а.
-    #   Должен быть хотя бы с типичный бугор (иначе паттерн дробится в
-    #   шум). 0.40 ≈ 1-2 «бугра» на патч для source'а ~70×175 ячеек.
+    #   Z(x, y)  =  TREND(x, y)  +  RESIDUAL(x, y)
+    #               глобальная       мелкие бугры,
+    #               форма насыпи     гранулярность
+    #
+    # TREND — Gaussian-сглаженный source с радиусом TREND_SMOOTH_SIGMA_M.
+    #   Снаружи source'а продолжается БИГАРМОНИЧЕСКИ (∇⁴Z = 0 с Dirichlet
+    #   BC на границе) — это формально-правильный способ «продолжать
+    #   рельеф по тем же наклонам». Для плоского source'а это даёт
+    #   плоскость; для насыпи — мягко спадающее продолжение насыпи.
+    #
+    # RESIDUAL — source minus trend. После вычитания тренда это
+    #   STATIONARY-поле (mean≈0, дисперсия одинакова), на нём
+    #   image-quilting (тот же _quilt_z) работает корректно — больше нет
+    #   «высоких» и «низких» патчей, есть только мелкие отклонения,
+    #   которые равномерно покрывают всю ext-область шероховатостью.
+    #
+    # TREND_SMOOTH_SIGMA_M — σ Гауссова сглаживания тренда в МЕТРАХ.
+    #   Должно быть больше типичного «бугра» (чтобы тот ушёл в residual)
+    #   и меньше масштаба самой насыпи (чтобы тренд её захватил).
+    #   0.5 м (= 17 ячеек при TARGET_RES_PER_M=35) — баланс для гравия.
+    TREND_SMOOTH_SIGMA_M = 0.5
+    # EXTRAP_BIHARMONIC — основной переключатель экстраполяции тренда.
+    #   True → бигармоник через skimage (если установлен); если skimage
+    #   нет, автоматически откатываемся в итеративный Laplace-solver
+    #   (∇²Z = 0). False → сразу Laplace (быстрее, но «плоский» rsult
+    #   снаружи — наклоны не продолжаются).
+    EXTRAP_BIHARMONIC = True
+    # EXTRAP_DECAY_SCALE_M — длина (в метрах), на которой тренд снаружи
+    #   anchor'а АДАПТИВНО опускается от Z_boundary к floor_eff
+    #   (= min(trend) на anchor). Это и есть «насыпь должна спадать на
+    #   другой стороне»:
+    #     • в anchor-ячейках высокий Z_b (граница на пике) → cap быстро
+    #       спускает наружу = насыпь опускается;
+    #     • Z_b близко к floor_eff (плоский кейс) → rate≈0, плоско
+    #       остаётся плоско.
+    #   ВАЖНО: cap применяется ТОЛЬКО как верхняя граница на тренд
+    #   снаружи anchor'а (внутри source НИЧЕГО не модифицируется). Если
+    #   биграмоник и так даёт меньше — он остаётся. Это «один из факторов»,
+    #   как просил пользователь, а не жёсткий тренд к плоскости.
+    EXTRAP_DECAY_SCALE_M = 1.5
+    # LAPLACE_MAX_ITER / LAPLACE_TOL — параметры фоллбэка-итерации.
+    LAPLACE_MAX_ITER = 4000
+    LAPLACE_TOL = 1e-4
+    # PATTERN_* — параметры image-quilting'а residual'а. См. _quilt_z.
     PATTERN_PATCH_FRAC = 0.40
-    # PATTERN_OVERLAP_FRAC — доля перекрытия между соседними патчами
-    #   (по этой полосе работает SSD и feather). Больше = чище швы,
-    #   меньше = больше разнообразия в укладке.
     PATTERN_OVERLAP_FRAC = 0.30
-    # PATTERN_CANDIDATES — сколько случайных позиций source'а перебрать
-    #   на каждом тайле; больше = чище швы, дороже.
     PATTERN_CANDIDATES = 24
-    # PATTERN_SEED — RNG seed. None = недетерминированно.
     PATTERN_SEED = 0
-    # PATTERN_FINAL_SMOOTH — лёгкое сглаживание ТОЛЬКО синтезированных
-    #   ячеек (anchor-источник остаётся точным) на финальной стадии,
-    #   чтобы убить остатки видимых швов. 0 = выключено, 1-2 = аккуратно.
+    # Финальное сглаживание ТОЛЬКО синтезированных ячеек (anchor
+    # сохраняется), чтобы убрать остатки видимых швов между патчами
+    # residual'а. На trend этот шаг не нужен (он и так гладкий).
     PATTERN_FINAL_SMOOTH = 1
     # Light smoothing of the target grid AFTER extrapolation (mask data is
     # preserved — only extrapolated cells are smoothed). 3 итерации —
@@ -341,6 +389,61 @@ class DepthReconstructor:
     # — floor_z плато. Большое значение = более растянутый плавный
     # спуск; малое = резкий обрыв. 0.6 м — комфортный дефолт.
     EXTRAP_BLEND_RADIUS_M = 0.6
+    # Inner-ring lift: после построения ext-heightfield'а каждый inner-ring
+    # узел (1-cell ring снаружи anchor'а) подтягивается через IDW по
+    # k=4 ближайшим src_bnd-вершинам к НАСТОЯЩЕМУ Z source-меша. Без этого
+    # bilinear-of-rasterized теряет high-freq на пиках (несколько source-
+    # вершин в одной растер-ячейке усредняются), и glue-треугольники
+    # между src-меш-вершиной (≈peak) и inner-ring (≈mean) растягиваются
+    # вертикально на ≈|residual| — это «зубцы» на back-of-hill швах.
+    # Коррекция δ распространяется внутрь ext'а с exp(-d/scale_m) feather'ом
+    # — без этого по линии inner-ring была бы 1-клеточная «стенка».
+    # 0.3 м (~10 ячеек) — баланс: шов гладкий, ext быстро возвращается к
+    # бигармонику+cap. Больше = плавнее, но коррекция тянется дальше внутрь.
+    EXTRAP_RIM_LIFT_SCALE_M = 0.3
+    # Glue-фильтр (_build_delaunay_glue): максимальная длина СТЫКОВОЧНОГО
+    # (src→inner) ребра bridge-треугольника в единицах cell_size_m.
+    # cell_size_m ≈ 1/TARGET_RES_PER_M ≈ 2.9 см; factor=10.0 → порог ≈ 29 см.
+    # Раньше было 2.5 и фильтр стоял на «max ребре в треугольнике» — этот
+    # старый вариант отбрасывал валидные bridge'ы с длинным src-src ребром
+    # (где source-граница редкая), оставляя «дырки в виде треугольников»
+    # вдоль шва. Новый фильтр игнорирует src-src/inner-inner длину
+    # (нерелевантно для шва) и режет только реально длинные стыковочные
+    # рёбра. После rim-lift'а ext-поверхность гладко переходит в source-Z,
+    # поэтому даже 29-сантиметровый мост ложится плашмя — артефакта тяги
+    # нет, лишь снижается «локальное разрешение». Если orphan-узлы всё
+    # равно остаются — поднимай ещё (20+), если, наоборот, появляются
+    # «паутинные» мосты через пустоту — снижай к 5.0.
+    EXTRAP_GLUE_MAX_EDGE_FACTOR = 10.0
+    # Densification source-границы перед Delaunay-glue: для каждого граничного
+    # ребра source-меша длиннее spacing вставляются промежуточные вершины
+    # с линейно-интерполированными XYZ. Это закрывает «провалы» там, где
+    # соседние src_bnd-вершины стоят в десятках сантиметров (typically около
+    # napolnitel-clip кромок) и без densification ~30-40% inner-ring узлов
+    # оставались без bridge'а. spacing = cell_size_m × factor:
+    #   1.0 → каждое ребро не длиннее одной ext-ячейки (~2.9 см) — самый плотный
+    #         вариант, гарантированно убирает orphan inner-ring;
+    #   2.0 → раз в две ячейки, экономнее (меньше extras), но на участках
+    #         длиной >5.8 см orphan'ы возможны;
+    #   0.5 → ультра-плотно, для тяжёлых случаев. Промежуточные вершины
+    #         ДОБАВЛЯЮТСЯ в combined mesh; source-меш всё равно сохраняется
+    #         байт-в-байт (extras лежат СТРОГО на исходных граничных рёбрах,
+    #         t-junction в 3D совпадает — без видимых щелей).
+    EXTRAP_DENSIFY_SPACING_FACTOR = 1.0
+    # Buffer-зона (seam hole stitching). После concat source+ext+glue
+    # combined-меш ещё может содержать остаточные ДЫРЫ вдоль шва:
+    # orphan inner-ring узлы без bridge'а (glue-фильтр отрезал слишком
+    # длинные стыковочные рёбра), несклеенные densify-extras и т.п. По
+    # логам _build_delaunay_glue это видно как «inner-ring без bridge'а:
+    # X/Y». Перепады высот вдоль шва уже задавлены rim-lift'ом — но
+    # дыры остаются топологическими (видны как треугольные «окна» в
+    # меше). Этот пост-pass находит ВСЕ замкнутые boundary-loop'ы в
+    # combined-меше, оставляет ОДИН внешний (= TARGET-прямоугольник,
+    # самый большой XY bbox) и каждый внутренний триангулирует buffer-
+    # треугольниками (constrained Delaunay + point-in-polygon filter
+    # для невыпуклых дыр; fallback на fan для деградации). Аддитивно:
+    # source/ext/glue не трогаются, дыры просто закрываются сверху.
+    SEAM_HOLE_STITCH = True
     # Unused — extrapolation is no longer in the pipeline.
     EXTRAP_FLOOR_FROM_MIN_M = 0.05
     # Optional absolute Z floor (metres). Takes effect when
@@ -1929,6 +2032,7 @@ class DepthReconstructor:
             m = out
         return m
 
+
     @staticmethod
     def _discontinuity_nodes(Z, inside, ratio, abs_m):
         """Flag grid nodes that touch a depth DISCONTINUITY — the same
@@ -2130,6 +2234,123 @@ class DepthReconstructor:
             new = np.where(wsum > 0, acc / np.maximum(wsum, 1e-12), Zc)
             Zc = np.where(valid, new, Zc)
         return Zc
+
+    @staticmethod
+    def _mask_aware_gaussian(field, valid, sigma_cells):
+        """Гауссово сглаживание heightfield'а, игнорирующее invalid-ячейки
+        (трюк «нормализованной свёртки»: свёртка значений / свёртка маски).
+        Используется для извлечения «тренда» source-рельефа: при σ≈0.5 м
+        низкочастотная форма (насыпь) сохраняется, а мелкие бугры
+        вычитаются → их потом квилтит residual-стадия.
+
+        sigma_cells — σ в единицах ячеек. Если scipy.ndimage недоступен,
+        откатываемся к box-smooth (3×3, ~σ²/0.5 итераций для эквивалента)."""
+        f = np.where(valid, field.astype(np.float64), 0.0)
+        w = valid.astype(np.float64)
+        if _scipy_gaussian_filter is not None:
+            f_s = _scipy_gaussian_filter(f, sigma=float(sigma_cells),
+                                         mode="nearest")
+            w_s = _scipy_gaussian_filter(w, sigma=float(sigma_cells),
+                                         mode="nearest")
+        else:
+            # Box-smooth fallback: эквивалент Гаусса σ через ~σ²/0.5 проходов
+            # (приблизительно — для качества лучше иметь scipy).
+            iters = max(1, int(round(float(sigma_cells) ** 2 / 0.5)))
+            f_s = DepthReconstructor._smooth_grid_z(
+                f, np.ones_like(w, dtype=bool), iters)
+            w_s = DepthReconstructor._smooth_grid_z(
+                w, np.ones_like(w, dtype=bool), iters)
+        out = np.where(w_s > 1e-6, f_s / np.maximum(w_s, 1e-12), 0.0)
+        return out
+
+    def _biharmonic_extrapolate(self, field, anchor):
+        """Продолжает поле наружу anchor'а решением ∇⁴Z = 0 с Dirichlet BC
+        (Z|anchor = field|anchor). На наклонной кромке (например, склон
+        насыпи) бигармоник сохраняет ГРАДИЕНТ — поле «вытекает» наружу
+        по тем же наклонам, без приведения к плоскости и без разрывов.
+
+        Реализация:
+          • skimage.restoration.inpaint_biharmonic — если установлено;
+          • иначе itertaive Jacobi-Laplace (∇²Z = 0, fallback): даёт
+            гладкую харм-интерполяцию граничных значений, но НЕ
+            продолжает наклоны — приемлемо для умеренно-плоских случаев.
+
+        field — (H, W) float64; anchor — (H, W) bool (где значения заданы).
+        Возвращает заполненный field."""
+        field = np.asarray(field, dtype=np.float64)
+        anchor = np.asarray(anchor, dtype=bool)
+        if not anchor.any():
+            self._log("Biharmonic: anchor пуст — заполняю нулями.")
+            return np.zeros_like(field)
+        if anchor.all():
+            return field.copy()
+        if self.EXTRAP_BIHARMONIC and _skimage_biharmonic is not None:
+            try:
+                mask = ~anchor
+                # skimage инпейнтит ячейки где mask=True, оставляя остальные.
+                out = _skimage_biharmonic(field, mask)
+                return np.asarray(out, dtype=np.float64)
+            except Exception as exc:
+                self._log(f"skimage biharmonic упал: {exc} — фоллбэк "
+                          f"в Jacobi-Laplace.")
+        # Fallback: итеративный Jacobi-Laplace (5-точечный stencil).
+        return self._laplace_extrapolate(
+            field, anchor,
+            max_iter=int(self.LAPLACE_MAX_ITER),
+            tol=float(self.LAPLACE_TOL))
+
+    @staticmethod
+    def _laplace_extrapolate(field, anchor, max_iter=4000, tol=1e-4):
+        """Заполняет non-anchor ячейки решением ∇²Z = 0 с Dirichlet BC,
+        итеративным Jacobi-усреднением 4 соседей. Сходится для любых
+        связных регионов; не продолжает наклоны (даёт «harmonic
+        interpolation» граничных значений) — fallback на случай отсутствия
+        skimage."""
+        Z = np.asarray(field, dtype=np.float64).copy()
+        a = np.asarray(anchor, dtype=bool)
+        if not a.any():
+            return Z
+        # Инициализация non-anchor средним по anchor — ускоряет сходимость.
+        mean_anchor = float(Z[a].mean())
+        Z = np.where(a, Z, mean_anchor)
+        Hh, Ww = Z.shape
+        # Padded buffer для удобного 5-pt stencil'а без if'ов по краям
+        # (Neumann BC «zero-gradient» через replicate-padding).
+        for it in range(int(max_iter)):
+            Zp = np.pad(Z, 1, mode="edge")
+            avg = 0.25 * (Zp[:-2, 1:-1] + Zp[2:, 1:-1]
+                          + Zp[1:-1, :-2] + Zp[1:-1, 2:])
+            Z_new = np.where(a, Z, avg)
+            d = float(np.abs(Z_new - Z).max())
+            Z = Z_new
+            if d < tol:
+                break
+        return Z
+
+    def _apply_descent_cap(self, trend, anchor, cell_size_m, scale_m,
+                           floor_eff=None):
+        """Адаптивный верхний cap на тренд СНАРУЖИ anchor'а:
+        spускает Z от граничного значения к динамическому floor'у на
+        длине ~scale_m. Внутри anchor — НИЧЕГО не трогает.
+
+        floor_eff = min(trend[anchor]) по умолчанию — это «динамический
+        пол», совпадающий с самой низкой точкой видимой части рельефа.
+
+        cap = Z_b * (1−t) + floor_eff * t, где t = clip(d/scale, 0, 1)."""
+        trend = np.asarray(trend, dtype=np.float64)
+        anchor = np.asarray(anchor, dtype=bool)
+        if not anchor.any() or anchor.all():
+            return trend
+        if floor_eff is None:
+            floor_eff = float(trend[anchor].min())
+        seed_y, seed_x, dist_cells = self._bfs_seeds(anchor)
+        sy = np.where(seed_y >= 0, seed_y, 0)
+        sx = np.where(seed_x >= 0, seed_x, 0)
+        Z_b = trend[sy, sx]
+        d_m = dist_cells * float(cell_size_m)
+        t = np.clip(d_m / max(float(scale_m), 1e-6), 0.0, 1.0)
+        cap = Z_b * (1.0 - t) + float(floor_eff) * t
+        return np.where(anchor, trend, np.minimum(trend, cap))
 
     @staticmethod
     def _erode_grid_z(Z, valid, iters):
@@ -2668,6 +2889,29 @@ class DepthReconstructor:
                 (1.0 - fu) * fv * z10 + fu * fv * z11)
 
     @staticmethod
+    def _bilinear_sample_masked(field, valid, xs, ys, xmin, xmax, ymin, ymax,
+                                fill=0.0):
+        """Mask-aware bilinear sampling: normalized convolution через bilinear.
+        В невалидных ячейках `field` (там, где `valid` = False) стоит ноль —
+        обычный bilinear в граничном 2×2 стенциле разбавляет ими настоящие
+        значения source'а и занижает Z. Это вычисляет
+            sample = bilinear(field*valid) / bilinear(valid)
+        что даёт ИСТИННОЕ локальное среднее по валидной части стенциля; на
+        крутом подъёме source'а к границе (back side of a hill) разница
+        важна — от неё прямо зависит, сидит ли ext-меш на одной высоте с
+        source-мешем или проваливается на ≈|residual|.
+
+        Возвращает sample там где bilinear(valid) > 0, fill — иначе."""
+        f = np.where(valid, field.astype(np.float64), 0.0)
+        w = np.asarray(valid, dtype=np.float64)
+        num = DepthReconstructor._bilinear_sample(
+            f, xs, ys, xmin, xmax, ymin, ymax)
+        den = DepthReconstructor._bilinear_sample(
+            w, xs, ys, xmin, xmax, ymin, ymax)
+        return np.where(den > 1e-6, num / np.maximum(den, 1e-12),
+                        float(fill))
+
+    @staticmethod
     def _build_regular_grid_faces(nx, ny):
         """Triangulate a regular (nx by ny)-vertex grid: 2 tris per cell."""
         cx = nx - 1
@@ -2874,37 +3118,28 @@ class DepthReconstructor:
     # Stage 3 — pattern-based extrapolation to TARGET_SIZE_M rectangle
     # ------------------------------------------------------------------
     def _pattern_extrapolate(self, src_verts, src_faces):
-        """Достраивает «обрамление» (extrapolation frame) вокруг source-меша
-        размером TARGET_SIZE_M, не трогая САМ source.
-
-        Главное правило: МЕШ source'а (verts, faces из Stage 1+2,
-        собранный по depth_map) идёт в результат БАЙТ-В-БАЙТ — без
-        растеризации, без сглаживания, без переиндексации, без cleanup'а.
-        Stage 3 строит ОТДЕЛЬНУЮ frame-геометрию (heightfield на
-        регулярной XY-сетке внутри прямоугольника TARGET_SIZE_M, с
-        вырезанной «дырой» под source) и просто приклеивает её сбоку.
+        """Two-mesh с Delaunay-glue стыковкой. Source-mesh идёт в результат
+        БАЙТ-В-БАЙТ. Снаружи source'а — ext-кадр на регулярной сетке
+        TARGET_SIZE_M (cells где НИ ОДИН угол не anchor → 1-cell gap),
+        между ними тонкая полоса glue-треугольников через 2D Delaunay,
+        отфильтрованных по длине ребра.
 
         Алгоритм:
-          1. Source rasterize (нужно ТОЛЬКО для подсказок quilt'у — само
-             rasterization-поле в результат не идёт).
-          2. Целевая сетка TARGET_SIZE_M, центрированная на napolnitel.
-          3. anchor = ячейки цели, чьи XY попадают в bbox source'а с
-             валидными данными — им присваиваются Z из source. Эти Z
-             квилтер использует ТОЛЬКО как «опору» для SSD-склейки.
-          4. _quilt_z заполняет остальные ячейки real-source-патчами в
-             порядке возрастания BFS-дистанции от anchor'а — паттерн
-             продолжается наружу с теми же буграми/гребнями.
-          5. Из target-сетки исключаются клетки, у которых ХОТЯ БЫ ОДИН
-             из 4 углов — anchor (т.е. ext-меш живёт строго СНАРУЖИ
-             source-области, с 1-клеточным «зазором», чтобы не было
-             z-fight'а с настоящим source-мешем).
-          6. STEEP/CLUSTER-cleanup применяется ТОЛЬКО к ext-фрагменту;
-             source при этом не трогается.
-          7. Конкатенация: source-меш + ext-меш → один общий (verts, faces).
+          1. Source rasterize → src_field, src_valid (для синтеза).
+          2. Target grid TARGET_SIZE_M, центр в napolnitel.
+          3. Trend/residual split на SOURCE.
+          4. Sample → target. anchor = target cells in src bbox & valid.
+          5. Тренд: ∇⁴Z = 0 outside anchor (skimage / Jacobi-Laplace).
+          6. Adaptive descent cap (EXTRAP_DECAY_SCALE_M).
+          7. Residual: image-quilting _quilt_z на stationary поле.
+          8. Z = trend_capped + residual_filled.
+          9. Two-mesh + glue:
+             • ext-faces: cells где no-anchor-corner;
+             • inner-ring: non-anchor узлы 8-смежные с anchor;
+             • glue: Delaunay (src-bnd ∪ inner-ring), filter max-edge.
+         10. Concat: source + ext + glue, общий remap.
 
-        Возвращает (verts, faces, skip_global_cleanup=True) или None.
-        Флаг skip_global_cleanup читает reconstruct() и пропускает
-        финальный _cleanup_relief, чтобы он не тронул source-часть."""
+        Возвращает (verts, faces, skip_global_cleanup=True)."""
         src_verts = np.asarray(src_verts, dtype=np.float64)
         src_faces = np.asarray(src_faces, dtype=np.int64)
         if src_verts.shape[0] == 0 or src_faces.shape[0] == 0:
@@ -2925,7 +3160,7 @@ class DepthReconstructor:
         if not src_valid.any():
             self._log("Pattern extrapolate: rasterize вернул пустоту — "
                       "оставляю только source.")
-            return src_verts, src_faces, True
+            return None
 
         # --- 2. Target grid centred on napolnitel. -------------------
         center = self._napolnitel_xy_center()
@@ -2950,90 +3185,296 @@ class DepthReconstructor:
         gy = np.linspace(ty_min, ty_max, tny)
         GX, GY = np.meshgrid(gx, gy)            # (tny, tnx)
 
-        # --- 3. Anchor (нужен только для SSD-якоря quilt'а). ---------
-        Z_src_sample = self._bilinear_sample(
-            src_field, GX.ravel(), GY.ravel(),
-            xmin_s, xmax_s, ymin_s, ymax_s).reshape(tny, tnx)
+        # --- 3. Trend + residual split на SOURCE. -------------------
+        # Тренд — Gaussian σ ≈ TREND_SMOOTH_SIGMA_M метра (с маской
+        # source'а — invalid-ячейки не загрязняют). Residual = source −
+        # trend (только там где source валиден); это уже stationary
+        # mean≈0 поле, на нём image-quilting корректно даёт «равномерную
+        # шероховатость» вместо «грядок».
+        sigma_cells = float(self.TREND_SMOOTH_SIGMA_M) * res
+        trend_src = self._mask_aware_gaussian(
+            src_field, src_valid, sigma_cells)
+        residual_src = np.where(src_valid, src_field - trend_src, 0.0)
+
+        # --- 4. Sample to target + anchor mask. ---------------------
+        # MASK-AWARE bilinear: невалидные ячейки src_field/residual_src = 0,
+        # обычный bilinear на границе разбавлял ими настоящие значения и
+        # занижал Z на границе anchor'а (≈|residual| / 2 в худшем случае).
+        # mask-aware версия делит на bilinear(valid), убирая разбавление.
         valid_f = self._bilinear_sample(
             src_valid.astype(np.float64), GX.ravel(), GY.ravel(),
+            xmin_s, xmax_s, ymin_s, ymax_s).reshape(tny, tnx)
+        # Полная карта source (НЕ только тренд) — это и будет Dirichlet BC
+        # биграмоника: ext-меш C0-сшивается с реальными Z source-меша.
+        src_tgt = self._bilinear_sample_masked(
+            src_field, src_valid, GX.ravel(), GY.ravel(),
+            xmin_s, xmax_s, ymin_s, ymax_s).reshape(tny, tnx)
+        # trend_tgt всё ещё нужен — он задаёт «гладкое» направление спуска
+        # cap'у (Z_b cap'а считается по trend'у, а не по полной карте, чтобы
+        # ext снаружи не уходил «зубцами» вслед за high-freq source'а).
+        trend_tgt = self._bilinear_sample(
+            trend_src, GX.ravel(), GY.ravel(),
             xmin_s, xmax_s, ymin_s, ymax_s).reshape(tny, tnx)
         in_bbox = ((GX >= xmin_s) & (GX <= xmax_s) &
                    (GY >= ymin_s) & (GY <= ymax_s))
         anchor = in_bbox & (valid_f > 0.5)
         if not anchor.any():
-            # Bbox не пересекся с целью — нечего экстраполировать
-            # «вокруг»; возвращаем только source.
             self._log("Pattern extrapolate: source bbox не пересекся с "
                       "целью — extrapolation пропущен.")
-            return src_verts, src_faces, True
+            return None
 
-        # --- 4. Quilt fill (anchor выступает только опорой). --------
-        Z_tgt = np.where(anchor, Z_src_sample, np.nan)
-        Z_filled = self._quilt_z(
-            src_field, src_valid, Z_tgt, anchor,
+        # --- 5. Биграмоник на ПОЛНОМ source'е (был на trend'е). ------
+        # Раньше Dirichlet = trend (Gauss σ≈0.5 м), и на крутом подъёме
+        # source'а к границе тренд занижал boundary Z на ≈|residual| (≈0.5 м
+        # по логам). Из-за этого ext-меш начинался ниже source'а и glue-
+        # треугольники тянулись вертикально (back-of-hill артефакт). С
+        # полной картой как BC ext-меш на границе сидит на тех же Z, что и
+        # source-меш — glue работает на плоской высоте.
+        base_filled = self._biharmonic_extrapolate(src_tgt, anchor)
+
+        # --- 6. Adaptive DESCENT CAP. ---------------------------------
+        # Cap считается ОТДЕЛЬНО через гладкий trend_filled: его Z_b на
+        # границе — это сглаженный source (без high-freq), поэтому спуск
+        # от него идёт плавно. Если бы Z_b брали из полной карты, ext
+        # снаружи получал бы «зубчатый» спуск от high-freq source'а.
+        cell_size_m = 1.0 / max(res, 1e-6)
+        floor_eff = float(trend_tgt[anchor].min())
+        trend_filled = self._biharmonic_extrapolate(trend_tgt, anchor)
+        cap_field = self._apply_descent_cap(
+            trend_filled, anchor,
+            cell_size_m=cell_size_m,
+            scale_m=float(self.EXTRAP_DECAY_SCALE_M),
+            floor_eff=floor_eff)
+        # Применяем cap к полной карте: внутри anchor оставляем base_filled
+        # (= src_tgt), снаружи — min(base_filled, cap_field). Так на границе
+        # ext держит source'овую высоту, а дальше плавно спускается к floor.
+        base_capped = np.where(
+            anchor, base_filled, np.minimum(base_filled, cap_field))
+
+        # --- 7. Residual: image-quilting НА НУЛЕ внутри anchor'а. -----
+        # Раньше residual_init на anchor'е = residual_tgt (ещё и diluted
+        # bilinear'ом — см. п.4), а base_filled на anchor'е был trend_tgt:
+        # сумма (trend+residual) ≈ source. Теперь base_filled на anchor'е
+        # уже несёт ПОЛНЫЙ source (= trend + residual внутри), поэтому
+        # residual на anchor'е должен быть 0, иначе мы добавили бы детали
+        # source'а дважды. Квилт всё ещё кидает source-патчи СНАРУЖИ
+        # anchor'а — feather overlap'а тянет их к нулю на самой границе,
+        # это даёт текстуру в ext'е без скачка на шве.
+        residual_init = np.where(anchor, 0.0, np.nan)
+        residual_filled = self._quilt_z(
+            residual_src, src_valid, residual_init, anchor,
             patch_frac=float(self.PATTERN_PATCH_FRAC),
             overlap_frac=float(self.PATTERN_OVERLAP_FRAC),
             candidates=int(self.PATTERN_CANDIDATES),
             seed=self.PATTERN_SEED)
         if self.PATTERN_FINAL_SMOOTH > 0:
-            Z_filled = self._smooth_preserve(
-                Z_filled, anchor, int(self.PATTERN_FINAL_SMOOTH))
+            residual_filled = self._smooth_preserve(
+                residual_filled, anchor, int(self.PATTERN_FINAL_SMOOTH))
 
-        # --- 5. Cell-keep mask: ext клетки строго СНАРУЖИ anchor'а. --
-        # Клетку (i, j) держим, ТОЛЬКО если ни один из 4 её углов
-        # не является anchor'ом. Это оставляет 1-клеточный зазор между
-        # source-мешем и ext-кадром, чтобы избежать z-fight'а на стыке.
-        a = anchor
-        cell_inside_anchor = (a[:-1, :-1] | a[:-1, 1:] |
-                              a[1:, :-1] | a[1:, 1:])
+        # --- 8. Z = base (capped, на anchor = полный source) + residual.
+        Z_filled = base_capped + residual_filled
+
+        # --- 8a. INNER-RING LIFT: подтягиваем inner-ring к НАСТОЯЩИМ Z
+        # source-меша (через KDTree-IDW по src_bnd-вершинам). Это
+        # закрывает фундаментальный разрыв: bilinear-of-rasterized field
+        # сглаживает пики source'а (несколько вершин усредняются в одной
+        # растер-ячейке), и glue-треугольник между src-меш-вершиной
+        # (настоящий Z) и inner-ring (растеризованный/сглаженный Z) на
+        # back-of-hill пиках вытягивается вертикально на ≈|residual|.
+        # Здесь δ = настоящий_Z(src) − Z_filled(inner_ring) распространяется
+        # внутрь ext'а с exp(-d/EXTRAP_RIM_LIFT_SCALE_M) feather'ом,
+        # чтобы не возникла 1-клеточная стена.
+        a_bool = anchor
+        # cell_inside_anchor — потребуется и для cell_keep ниже.
+        cell_inside_anchor = (a_bool[:-1, :-1] | a_bool[:-1, 1:] |
+                              a_bool[1:, :-1] | a_bool[1:, 1:])
         cell_keep = ~cell_inside_anchor
-        ext_faces = self._build_regular_grid_faces_masked(tnx, tny, cell_keep)
+        inner_ring = self._compute_inner_ring(anchor)
+        src_bnd_idx = self._find_boundary_vertices(src_faces)
+        Z_filled, n_lifted, max_delta = self._lift_inner_ring_to_source(
+            Z_filled, inner_ring, anchor,
+            src_verts, src_bnd_idx, GX, GY,
+            cell_size_m=cell_size_m,
+            feather_scale_m=float(
+                getattr(self, "EXTRAP_RIM_LIFT_SCALE_M", 0.3)))
 
-        if ext_faces.shape[0] == 0:
-            self._log("Pattern extrapolate: ext-кадр пуст (source покрывает "
-                      "весь target) — отдаю только source.")
+        try:
+            t_min = float(trend_src[src_valid].min())
+            t_max = float(trend_src[src_valid].max())
+            s_min_tgt = float(src_tgt[anchor].min())
+            s_max_tgt = float(src_tgt[anchor].max())
+            r_amp = float(np.abs(residual_src[src_valid]).max())
+            engine = ("skimage-biharmonic"
+                      if (self.EXTRAP_BIHARMONIC
+                          and _skimage_biharmonic is not None)
+                      else "jacobi-laplace")
+            n_capped = int(((base_capped < base_filled - 1e-6)
+                            & (~anchor)).sum())
+            self._log(
+                f"Trend σ={sigma_cells:.1f}cell (~"
+                f"{self.TREND_SMOOTH_SIGMA_M:g}м), trend Z∈"
+                f"[{t_min:.2f}, {t_max:.2f}], "
+                f"src_tgt[anchor] Z∈[{s_min_tgt:.2f}, {s_max_tgt:.2f}], "
+                f"|residual|max={r_amp:.2f}м; "
+                f"{engine} + descent cap (по trend'у) "
+                f"scale={self.EXTRAP_DECAY_SCALE_M}м "
+                f"(floor_eff={floor_eff:.2f}, cap сработал на "
+                f"{n_capped} ячейках); rim-lift: "
+                f"{n_lifted} inner-ring узлов подтянуто к src-меш-Z "
+                f"(|δ|max={max_delta:.2f}м, feather="
+                f"{float(getattr(self, 'EXTRAP_RIM_LIFT_SCALE_M', 0.3)):.2f}м).")
+        except Exception:
+            pass
+
+        # --- 9. TWO-MESH + GLUE: source preserved byte-by-byte, ext только
+        # СНАРУЖИ anchor'а (1-cell gap), Delaunay glue зашивает шов.
+        # cell_keep: ячейку держим если НИ ОДИН из 4 углов не anchor.
+        # (cell_keep и inner_ring уже посчитаны выше в п.8a — переиспользуем.)
+        ext_faces_grid = self._build_regular_grid_faces_masked(
+            tnx, tny, cell_keep)
+        if ext_faces_grid.shape[0] == 0:
+            self._log("Pattern extrapolate: ext пуст (source покрыл всю "
+                      "цель) — оставляю только source.")
             return src_verts, src_faces, True
 
-        # Из 4×7-сетки оставляем только реально-используемые вершины.
+        # inner_ring + src_bnd_idx уже получены в п.8a.
+        inner_flat = np.where(inner_ring.ravel())[0]
+
+        # ext_verts: все узлы, используемые ext_faces, PLUS все inner-ring
+        # узлы (нужны для glue, даже если ни одна ext-клетка их не юзает).
         ext_verts_full = np.column_stack(
             [GX.ravel(), GY.ravel(), Z_filled.ravel()])
-        used_ext = np.unique(ext_faces.reshape(-1))
-        ext_verts = ext_verts_full[used_ext]
-        remap = np.full(tnx * tny, -1, dtype=np.int64)
-        remap[used_ext] = np.arange(used_ext.shape[0])
-        ext_faces = remap[ext_faces]
+        used_set = np.unique(np.concatenate(
+            [ext_faces_grid.reshape(-1), inner_flat]))
+        ext_verts = ext_verts_full[used_set]
+        remap_grid_to_ext = np.full(tnx * tny, -1, dtype=np.int64)
+        remap_grid_to_ext[used_set] = np.arange(used_set.shape[0])
+        ext_faces_local = remap_grid_to_ext[ext_faces_grid]
 
-        # --- 6. Cleanup ТОЛЬКО на ext (source не трогаем). -----------
-        if (self.STEEP_CUTOFF or self.MIN_CLUSTER_SIZE_M) and len(ext_faces) > 0:
-            try:
-                ext_verts, ext_faces = self._cleanup_relief(
-                    ext_verts, ext_faces)
-            except Exception as exc:
-                self._log(f"Pattern extrapolate: cleanup ext упал: {exc} "
-                          f"— оставляю ext как есть.")
+        # Densification src-границы: вставляем промежуточные вершины вдоль
+        # длинных граничных рёбер source-меша (XYZ линейно), чтобы Delaunay
+        # имел плотный «гребень» для построения мостов к inner-ring'у. Без
+        # этого ~38% inner-ring узлов в логах оставались без bridge'а — там,
+        # где соседние src_bnd-вершины стояли в >10 см друг от друга
+        # (typically около napolnitel-clip кромок). Densified-вершины НЕ
+        # принадлежат source-мешу (его сохраняем байт-в-байт), а
+        # геометрически они лежат строго на исходном граничном ребре,
+        # поэтому t-junction между source-edge и densified-glue-edge
+        # совпадает в 3D и видимых щелей не должно создавать.
+        src_bnd_edges = self._find_boundary_edges(src_faces)
+        densify_factor = float(getattr(
+            self, "EXTRAP_DENSIFY_SPACING_FACTOR", 1.0))
+        densify_spacing_m = cell_size_m * densify_factor
+        extra_xyz, _edges_path = self._densify_boundary(
+            src_verts, src_bnd_edges, densify_spacing_m)
+        n_extras = int(extra_xyz.shape[0])
 
-        # --- 7. Конкатенация source + ext в один меш. ---------------
-        n_src = src_verts.shape[0]
-        all_verts = np.concatenate([src_verts, ext_verts], axis=0)
-        all_faces = np.concatenate(
-            [src_faces, ext_faces + n_src], axis=0)
+        # Glue: 2D Delaunay на (src_bnd ∪ densified-extras ∪ inner_ring).
+        # src_bnd_idx уже получен выше в п.8a.
+        n_orig_src_bnd = int(src_bnd_idx.shape[0])
+        n_src_v = int(src_verts.shape[0])
+        n_ext_v = int(ext_verts.shape[0])
+        if n_orig_src_bnd == 0 or inner_flat.shape[0] == 0:
+            glue_faces_final = np.zeros((0, 3), dtype=np.int64)
+            n_glue = 0
+            n_src_side = n_orig_src_bnd
+        else:
+            # «src-сторона» = оригинальные src_bnd + densified extras. Все
+            # они лежат на source-границе и для bridge-фильтра считаются src.
+            if n_extras > 0:
+                src_side_xy = np.concatenate([
+                    src_verts[src_bnd_idx, :2],
+                    extra_xyz[:, :2],
+                ], axis=0)
+                src_side_z = np.concatenate([
+                    src_verts[src_bnd_idx, 2],
+                    extra_xyz[:, 2],
+                ], axis=0)
+            else:
+                src_side_xy = src_verts[src_bnd_idx, :2]
+                src_side_z = src_verts[src_bnd_idx, 2]
+            inner_xy = np.column_stack(
+                [GX.ravel()[inner_flat], GY.ravel()[inner_flat]])
+            inner_z = Z_filled.ravel()[inner_flat]
+            # cell_size_m уже посчитан выше (для cap'а и rim-lift'а).
+            # max_edge_factor=None → берётся из EXTRAP_GLUE_MAX_EDGE_FACTOR.
+            glue_local, n_src_side, n_inner = self._build_delaunay_glue(
+                src_side_xy, src_side_z, inner_xy, inner_z,
+                cell_size_m=cell_size_m, max_edge_factor=None)
+            n_glue = int(glue_local.shape[0])
+            # Combined → final мэппинг:
+            #   [0, n_orig_src_bnd) → src_verts via src_bnd_idx
+            #   [n_orig_src_bnd, n_src_side) → extras (в конце combined mesh)
+            #   [n_src_side, end) → ext_verts via remap_grid_to_ext
+            combined_to_final = np.empty(
+                n_src_side + n_inner, dtype=np.int64)
+            combined_to_final[:n_orig_src_bnd] = src_bnd_idx
+            if n_extras > 0:
+                combined_to_final[n_orig_src_bnd:n_src_side] = (
+                    n_src_v + n_ext_v + np.arange(n_extras))
+            ext_idx_for_inner = remap_grid_to_ext[inner_flat]
+            combined_to_final[n_src_side:] = n_src_v + ext_idx_for_inner
+            glue_faces_final = combined_to_final[glue_local]
+            valid = (glue_faces_final >= 0).all(axis=1)
+            glue_faces_final = glue_faces_final[valid]
+
+        # Concat: source (UNTOUCHED) + ext + densified-extras + glue-faces.
+        if n_extras > 0:
+            all_verts = np.concatenate(
+                [src_verts, ext_verts, extra_xyz], axis=0)
+        else:
+            all_verts = np.concatenate([src_verts, ext_verts], axis=0)
+        all_faces = np.concatenate([
+            src_faces,
+            ext_faces_local + n_src_v,
+            glue_faces_final,
+        ], axis=0)
 
         zmin_s = float(src_field[src_valid].min())
         zmax_s = float(src_field[src_valid].max())
         self._log(
-            f"Pattern extrapolate: source {src_verts.shape[0]} верш / "
-            f"{src_faces.shape[0]} тр. сохранён без изменений; "
-            f"ext-кадр {ext_verts.shape[0]} верш / {ext_faces.shape[0]} тр. "
-            f"в TARGET {Tx_m:g}×{Ty_m:g} м ({tnx}×{tny} grid). "
-            f"anchor {int(anchor.sum())}, source Z∈[{zmin_s:.2f}, {zmax_s:.2f}].")
+            f"Pattern extrapolate (two-mesh): source {src_verts.shape[0]} верш / "
+            f"{src_faces.shape[0]} тр. сохранён байт-в-байт; "
+            f"ext {ext_verts.shape[0]} верш / {ext_faces_local.shape[0]} тр.; "
+            f"densify: +{n_extras} вершин на src-границе "
+            f"(spacing={densify_spacing_m*100:.1f} см); "
+            f"glue {n_glue} тр. ({n_orig_src_bnd}+{n_extras} src-side + "
+            f"{inner_flat.shape[0]} inner-ring узлов). "
+            f"source Z∈[{zmin_s:.2f}, {zmax_s:.2f}].")
+
+        # --- 10. SEAM BUFFER: затыкаем остаточные дыры вдоль шва.
+        # source+ext+glue может оставить orphan inner-ring узлы (glue-
+        # фильтр отрезал длинные стыковочные рёбра) — топологические
+        # дыры в виде маленьких треугольных «окон». Находим все
+        # boundary-loop'ы в combined-меше; единственный самый большой
+        # (TARGET-прямоугольник) — внешний контур, остальные — дыры,
+        # которые триангулируем buffer-треугольниками.
+        #
+        # is_fixed: вершины с этим флагом не двигаются Laplacian-relax'ом
+        # ВНУТРИ buffer-зоны:
+        #   • [0, n_src_v) — source-меш, сохраняется байт-в-байт;
+        #   • [n_src_v + n_ext_v, end) — densify-extras (лежат на src-edges
+        #     по построению; сдвинуть их по Z разорвёт согласованность с
+        #     source-кромкой).
+        # Всё остальное (= ext-grid вершины, включая orphan inner-ring) —
+        # moveable: relax сглаживает их Z по соседям в loop'е, чтобы убрать
+        # «треугольные гребни» между высоким Z source'а и низким Z ext'а.
+        if self.SEAM_HOLE_STITCH:
+            n_total = int(all_verts.shape[0])
+            is_fixed = np.zeros(n_total, dtype=bool)
+            is_fixed[:n_src_v] = True
+            if n_extras > 0:
+                is_fixed[n_src_v + n_ext_v:] = True
+            all_verts, all_faces = self._stitch_seam_holes(
+                all_verts, all_faces, is_fixed=is_fixed)
+
         return all_verts, all_faces, True
 
     @staticmethod
     def _build_regular_grid_faces_masked(nx, ny, cell_keep):
         """Триангуляция регулярной (nx×ny)-вершинной сетки, но включаются
-        только те ячейки, где cell_keep[i, j] (i — row, j — col) = True.
-        Возвращает (M, 3) int64 — индексы относительно расплющенной
-        nx*ny сетки."""
+        только те ячейки, где cell_keep[i, j] = True. Возвращает (M, 3)
+        int64 — индексы в расплющенной nx*ny сетке."""
         cx = nx - 1
         cy = ny - 1
         cell_keep = np.asarray(cell_keep, dtype=bool)
@@ -3046,13 +3487,728 @@ class DepthReconstructor:
         c = a + nx
         d = c + 1
         k = cell_keep[:cy, :cx]
-        a = a[k]
-        b = b[k]
-        c = c[k]
-        d = d[k]
+        a = a[k]; b = b[k]; c = c[k]; d = d[k]
         f1 = np.stack([a, b, d], axis=1)
         f2 = np.stack([a, d, c], axis=1)
         return np.concatenate([f1, f2], axis=0).astype(np.int64)
+
+    @staticmethod
+    def _find_boundary_vertices(faces):
+        """Индексы вершин на «голой» грани меша (used by ровно 1 face) —
+        внешний контур + кромки внутренних дыр."""
+        f = np.asarray(faces, dtype=np.int64)
+        if f.shape[0] == 0:
+            return np.zeros((0,), dtype=np.int64)
+        edges = np.concatenate(
+            [f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], axis=0)
+        edges_sorted = np.sort(edges, axis=1)
+        _, inv, cnt = np.unique(
+            edges_sorted, axis=0, return_inverse=True, return_counts=True)
+        is_bnd = (cnt[inv] == 1)
+        bnd_flat = edges[is_bnd].reshape(-1)
+        return np.unique(bnd_flat)
+
+    @staticmethod
+    def _find_boundary_edges(faces):
+        """Граничные РЁБРА меша (используются ровно одной гранью). Возвращает
+        (E, 2) int64 — пары индексов вершин в исходном vertex-наборе. В отличие
+        от _find_boundary_vertices это сохраняет связность кромки — нужно для
+        densification вдоль длинных граничных сегментов."""
+        f = np.asarray(faces, dtype=np.int64)
+        if f.shape[0] == 0:
+            return np.zeros((0, 2), dtype=np.int64)
+        edges = np.concatenate(
+            [f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], axis=0)
+        edges_sorted = np.sort(edges, axis=1)
+        _, inv, cnt = np.unique(
+            edges_sorted, axis=0, return_inverse=True, return_counts=True)
+        is_bnd = (cnt[inv] == 1)
+        return edges[is_bnd]
+
+    @staticmethod
+    def _densify_boundary(src_verts, src_bnd_edges, target_spacing_m):
+        """Вставить промежуточные вершины вдоль граничных рёбер source-меша:
+        для каждого ребра длиной L > target_spacing разбить на ceil(L/spacing)
+        равных частей, XY и Z интерполируются линейно. Возвращает:
+          extra_xyz — (M, 3) новые вершины (НЕ принадлежат source-мешу,
+                      используются только в glue);
+          edges_path — список (start_idx, mid_idxs..., end_idx) где start/end
+                       индексируют src_verts, mid_idxs индексируют extra_xyz
+                       со смещением n_src_v. Сохраняет порядок «по ребру».
+
+        Промежуточные вершины строго лежат на исходном граничном ребре
+        source-меша (линейная интерполяция), поэтому t-junction между
+        source-edge и densified-glue-edge геометрически совпадает в 3D —
+        видимых щелей не должно быть."""
+        src_verts = np.asarray(src_verts, dtype=np.float64)
+        edges = np.asarray(src_bnd_edges, dtype=np.int64)
+        if edges.shape[0] == 0 or target_spacing_m <= 0:
+            return (np.zeros((0, 3), dtype=np.float64), [])
+        extra_xyz = []
+        edges_path = []
+        n_src_v = int(src_verts.shape[0])
+        next_extra_local = 0
+        for (i, j) in edges:
+            pa = src_verts[i]
+            pb = src_verts[j]
+            L = float(np.linalg.norm(pb[:2] - pa[:2]))  # XY-длина
+            if L <= target_spacing_m or not np.isfinite(L):
+                edges_path.append([int(i), int(j)])
+                continue
+            n_seg = int(np.ceil(L / target_spacing_m))
+            mid_local = []
+            for k in range(1, n_seg):
+                t = k / n_seg
+                p = pa * (1.0 - t) + pb * t
+                extra_xyz.append(p)
+                mid_local.append(next_extra_local)
+                next_extra_local += 1
+            # path: src i → extras (со смещением n_src_v) → src j
+            path = [int(i)] + [int(n_src_v + m) for m in mid_local] + [int(j)]
+            edges_path.append(path)
+        return (np.asarray(extra_xyz, dtype=np.float64) if extra_xyz
+                else np.zeros((0, 3), dtype=np.float64),
+                edges_path)
+
+    @staticmethod
+    def _compute_inner_ring(anchor):
+        """Bool-маска target-grid'а: non-anchor узлы, 8-смежные с anchor'ом.
+        «Внутреннее кольцо» ext'а — узлы, граничащие с source'ом, через
+        которые пройдёт glue."""
+        a = np.asarray(anchor, dtype=bool)
+        dil = a.copy()
+        dil[:-1, :] |= a[1:, :]
+        dil[1:, :] |= a[:-1, :]
+        dil[:, :-1] |= a[:, 1:]
+        dil[:, 1:] |= a[:, :-1]
+        dil[:-1, :-1] |= a[1:, 1:]
+        dil[1:, 1:] |= a[:-1, :-1]
+        dil[:-1, 1:] |= a[1:, :-1]
+        dil[1:, :-1] |= a[:-1, 1:]
+        return dil & ~a
+
+    def _lift_inner_ring_to_source(self, Z_filled, inner_ring, anchor,
+                                    src_verts, src_bnd_idx, GX, GY,
+                                    cell_size_m, feather_scale_m):
+        """Подтянуть inner-ring ext'а к НАСТОЯЩИМ Z source-меша и распространить
+        коррекцию внутрь ext'а с экспоненциальным feather'ом.
+
+        Зачем: bilinear-of-rasterized field теряет high-freq на пиках source'а
+        (несколько вершин усредняются в одной растер-ячейке `_rasterize_xyz`).
+        Glue-треугольник между src_bnd-вершиной (настоящий Z из меша) и
+        inner-ring-узлом (растеризованный/сглаженный Z) из-за этого тянется
+        вертикально на ≈|residual|. Здесь для каждого inner-ring узла берём
+        IDW по k=4 ближайшим src_bnd-вершинам и сдвигаем Z_filled на
+        δ = target_z − Z_filled. Дальше внутрь ext'а δ затухает по
+        exp(-d/feather_scale_m), чтобы не возникла 1-клеточная «стена».
+
+        Возвращает (Z_corrected, n_inner_ring_nodes, |δ|max)."""
+        if src_bnd_idx is None or src_bnd_idx.shape[0] == 0:
+            return Z_filled, 0, 0.0
+        inner_yy, inner_xx = np.where(inner_ring)
+        if inner_yy.size == 0:
+            return Z_filled, 0, 0.0
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            self._log("Inner-ring lift: scipy.spatial.cKDTree недоступен — "
+                      "пропуск.")
+            return Z_filled, int(inner_yy.size), 0.0
+
+        src_bnd_xy = np.asarray(src_verts[src_bnd_idx, :2], dtype=np.float64)
+        src_bnd_z = np.asarray(src_verts[src_bnd_idx, 2], dtype=np.float64)
+        if src_bnd_xy.shape[0] < 1:
+            return Z_filled, int(inner_yy.size), 0.0
+
+        tree = cKDTree(src_bnd_xy)
+        inner_pts = np.column_stack(
+            [GX[inner_yy, inner_xx], GY[inner_yy, inner_xx]])
+        k = int(min(4, src_bnd_xy.shape[0]))
+        distances, indices = tree.query(inner_pts, k=k)
+        if k == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+        # IDW p=2; eps защищает от деления на ноль если inner совпал с src_bnd.
+        eps = 1e-6
+        w = 1.0 / np.maximum(distances, eps) ** 2
+        w = w / w.sum(axis=1, keepdims=True)
+        target_z = (src_bnd_z[indices] * w).sum(axis=1)
+
+        old_inner_z = Z_filled[inner_yy, inner_xx]
+        delta_inner = target_z - old_inner_z
+        max_delta = float(np.abs(delta_inner).max())
+
+        # BFS от inner-ring: для каждой клетки сетки даёт ближайшую
+        # inner-ring клетку и расстояние в шагах.
+        seed_y, seed_x, dist_cells = self._bfs_seeds(inner_ring)
+
+        # δ-карта на inner-ring узлах, в остальных — 0.
+        delta_at_inner = np.zeros(Z_filled.shape, dtype=np.float64)
+        delta_at_inner[inner_yy, inner_xx] = delta_inner
+        # δ_seed[cell] = δ ближайшего inner-ring узла.
+        sy = np.where(seed_y >= 0, seed_y, 0)
+        sx = np.where(seed_x >= 0, seed_x, 0)
+        delta_seed = delta_at_inner[sy, sx]
+        # exp(-d/feather) — на inner-ring d=0 → decay=1 (полная коррекция),
+        # дальше внутрь ext'а плавно сходит к 0.
+        d_m = dist_cells * float(cell_size_m)
+        finite = np.isfinite(d_m)
+        scale = max(float(feather_scale_m), 1e-6)
+        decay = np.where(finite, np.exp(-d_m / scale), 0.0)
+        correction = delta_seed * decay
+
+        # Anchor не трогаем — там Z уже на src_tgt, поднимать его «к самому
+        # себе» через src_bnd-IDW не нужно и может создать ringing.
+        Z_corrected = np.where(~anchor, Z_filled + correction, Z_filled)
+        return Z_corrected, int(inner_yy.size), max_delta
+
+    def _build_delaunay_glue(self, src_bnd_xy, src_bnd_z,
+                              inner_xy, inner_z, cell_size_m,
+                              max_edge_factor=None):
+        """2D Delaunay на (src-boundary ∪ inner-ring), фильтр по длине
+        СТЫКОВОЧНЫХ (src→inner) рёбер ≤ max_edge_factor × cell_size,
+        оставляем только «мост»-треугольники (с src-вершиной И inner-).
+
+        Почему фильтр именно по src→inner, а не «max из 3 рёбер»: bridge-
+        треугольник вида (src_a, src_b, inner_c) имеет 1 ребро src-src и
+        2 ребра src-inner. src-src может быть длинным, если граница
+        source'а редкая в этом месте (например, у napolnitel-clip кромки)
+        — это совершенно валидный bridge, который заполняет gap. Старый
+        фильтр выкидывал такие треугольники, оставляя «дырки в виде
+        треугольников» вдоль шва.
+
+        max_edge_factor=None → EXTRAP_GLUE_MAX_EDGE_FACTOR из настроек.
+        Возвращает (glue_faces в combined-индексах, n_src_bnd, n_inner)."""
+        if max_edge_factor is None:
+            max_edge_factor = float(getattr(
+                self, "EXTRAP_GLUE_MAX_EDGE_FACTOR", 3.0))
+        if _scipy_delaunay is None:
+            self._log("Glue: scipy.spatial.Delaunay недоступен — "
+                      "стыковочные треугольники не построены (будет gap).")
+            return (np.zeros((0, 3), dtype=np.int64),
+                    int(src_bnd_xy.shape[0]), int(inner_xy.shape[0]))
+        all_xy = np.concatenate([src_bnd_xy, inner_xy], axis=0)
+        if all_xy.shape[0] < 3:
+            return (np.zeros((0, 3), dtype=np.int64),
+                    int(src_bnd_xy.shape[0]), int(inner_xy.shape[0]))
+        try:
+            tri = _scipy_delaunay(all_xy)
+        except Exception as exc:
+            self._log(f"Glue: Delaunay упал ({exc}).")
+            return (np.zeros((0, 3), dtype=np.int64),
+                    int(src_bnd_xy.shape[0]), int(inner_xy.shape[0]))
+        s = tri.simplices.astype(np.int64)
+        n_src_bnd = int(src_bnd_xy.shape[0])
+        # is_src[t, c] — True если c-я вершина t-го треугольника лежит в src.
+        is_src = s < n_src_bnd
+        # bridge-треугольник: и src, и inner есть.
+        n_src_per_tri = is_src.sum(axis=1)
+        bridge = (n_src_per_tri >= 1) & (n_src_per_tri <= 2)
+        # Фильтр по длине src→inner-рёбер: если любое из них > thr, выкидываем.
+        # src-src и inner-inner рёбра не проверяем (длинное src-src — норма
+        # для bridge, inner-inner и так короткое — регулярная сетка).
+        p = all_xy[s]
+        thr = float(cell_size_m) * float(max_edge_factor)
+        keep = bridge.copy()
+        # Накапливаем длины ВСЕХ src→inner рёбер bridge-треугольников
+        # (до фильтра) — для диагностики «почему остаются разрывы».
+        bridge_edge_lens_all = []
+        for (a, b) in ((0, 1), (1, 2), (2, 0)):
+            is_bridge_edge = is_src[:, a] != is_src[:, b]
+            elen = np.linalg.norm(p[:, a] - p[:, b], axis=1)
+            keep &= ~(is_bridge_edge & (elen > thr))
+            mask_be = is_bridge_edge & bridge
+            if mask_be.any():
+                bridge_edge_lens_all.append(elen[mask_be])
+        # Диагностика: статистика длин стыковочных рёбер и сколько отсечено.
+        try:
+            n_bridge_total = int(bridge.sum())
+            n_kept = int(keep.sum())
+            n_cut = n_bridge_total - n_kept
+            if bridge_edge_lens_all:
+                lens = np.concatenate(bridge_edge_lens_all)
+                med = float(np.median(lens))
+                mx = float(lens.max())
+                q90 = float(np.quantile(lens, 0.9))
+                over = int((lens > thr).sum())
+            else:
+                med = mx = q90 = 0.0
+                over = 0
+            # Сколько inner-ring узлов остались без хотя бы одного bridge'а.
+            inner_used = np.unique(s[keep][s[keep] >= n_src_bnd]) - n_src_bnd
+            n_inner_total = int(inner_xy.shape[0])
+            n_inner_orphan = n_inner_total - int(inner_used.shape[0])
+            self._log(
+                f"Glue diag: bridges {n_bridge_total} (kept {n_kept}, "
+                f"cut {n_cut} по порогу {thr*100:.1f} см); src→inner edge "
+                f"медиана {med*100:.1f} см, q90 {q90*100:.1f} см, "
+                f"max {mx*100:.1f} см, > порога {over}; inner-ring "
+                f"без bridge'а: {n_inner_orphan}/{n_inner_total}.")
+            # Глубокий диагноз orphan'ов: где они в XY и насколько далеко
+            # от ближайшей src-side точки. По этим цифрам видно, нужно
+            # densify (orphan'ы у src-границы) или другая стратегия
+            # (orphan'ы вообще не рядом с source-мешем).
+            if n_inner_orphan > 0:
+                orphan_mask = np.ones(n_inner_total, dtype=bool)
+                orphan_mask[inner_used] = False
+                orphan_xy = inner_xy[orphan_mask]
+                try:
+                    from scipy.spatial import cKDTree
+                    tree = cKDTree(all_xy[:n_src_bnd])
+                    d_orphan, _ = tree.query(orphan_xy, k=1)
+                    om_med = float(np.median(d_orphan))
+                    om_q50 = om_med
+                    om_q90 = float(np.quantile(d_orphan, 0.9))
+                    om_q99 = float(np.quantile(d_orphan, 0.99))
+                    om_max = float(d_orphan.max())
+                    om_min = float(d_orphan.min())
+                    # XY bbox of orphan cluster.
+                    bx0, by0 = orphan_xy[:, 0].min(), orphan_xy[:, 1].min()
+                    bx1, by1 = orphan_xy[:, 0].max(), orphan_xy[:, 1].max()
+                    self._log(
+                        f"Glue orphan диагностика: расстояние до ближайшей "
+                        f"src-side точки — min={om_min*100:.1f} см, "
+                        f"med={om_med*100:.1f} см, q90={om_q90*100:.1f} см, "
+                        f"q99={om_q99*100:.1f} см, max={om_max*100:.1f} см; "
+                        f"orphan XY bbox=({bx0:.2f},{by0:.2f})..({bx1:.2f},"
+                        f"{by1:.2f}) м.")
+                except ImportError:
+                    pass
+        except Exception as exc:
+            self._log(f"Glue diag упал: {exc}")
+        return s[keep], n_src_bnd, int(inner_xy.shape[0])
+
+    # Buffer-зона: число итераций Laplacian-relax'а Z movable-вершин loop'а
+    # ПЕРЕД триангуляцией. Z fixed-вершин (source-меш + densify-extras)
+    # держится неизменным, movable (= ext-сетка, в т.ч. rim-lift'нутые
+    # orphan inner-ring) сглаживаются по соседям loop'а — это убирает
+    # «треугольные гребни» между высоким Z source'а (~2.9 м) и низким Z
+    # ext'а после descent cap'а (~1.9 м), которые иначе торчат вертикально
+    # на дистанции ~30 см. Чем больше итераций, тем плавнее переход (но
+    # тем сильнее loop вне «иголки» проседает). 5 — мягкий баланс. Эффект
+    # виден только когда loop содержит и fixed, и movable вершины (mixed
+    # seam); для чисто-src / чисто-ext дыр relax = no-op.
+    SEAM_RELAX_ITERS = 5
+    # Center-vertex fan: Z новой центральной вершины =
+    #   min(loop_z) + SEAM_CENTER_LIFT_FRAC × (max(loop_z) − min(loop_z))
+    # 0.0 → центр строго на минимуме → buffer-треугольники гарантированно
+    #       «вдавлены», без «купольных мостов» которые fan-from-vertex-0
+    #       клал поверх впадин на вершинах холмов.
+    # 0.5 → середина (нейтрально, может слегка выпирать).
+    # 1.0 → на максимуме (= old fan, явный купол).
+    # Дыры на вершинах холма выглядят как лёгкая «ямочка» — заметно
+    # меньше визуально, чем «козырёк». Дыры в плоских областях (range≈0)
+    # фильтр не задевает (центр совпадает с уровнем loop'а).
+    SEAM_CENTER_LIFT_FRAC = 0.0
+
+    def _stitch_seam_holes(self, verts, faces, is_fixed=None):
+        """Buffer-зона: найти ВСЕ замкнутые boundary-loop'ы в combined-меше
+        (source + ext + glue), оставить один внешний (= TARGET-прямоугольник,
+        самый большой по XY bbox), и каждую внутреннюю дыру триангулировать
+        buffer-треугольниками.
+
+        is_fixed: (N,) bool. Если задан, перед триангуляцией каждой дыры
+            Z movable-вершин loop'а сглаживается Laplacian-relax'ом
+            (SEAM_RELAX_ITERS итераций) — fixed-вершины служат якорями.
+            Это убирает «треугольные гребни» возникающие, когда rim-lift
+            «поднял» orphan узлы к высокому Z source'а, а glue не построил
+            bridge — orphan остался иголкой посреди низкого ext'а.
+
+        Зачем: даже после rim-lift'а и densify-glue может остаться маленькое
+        число orphan inner-ring узлов (длинное стыковочное ребро отфильтровано
+        порогом cell_size×EXTRAP_GLUE_MAX_EDGE_FACTOR) — они формируют
+        треугольные «окна» в меше. Этот шаг ПОЛНОСТЬЮ аддитивен по топологии:
+        ни одна старая грань не удаляется, дыры закрываются сверху. Z
+        movable-вершин может слегка сдвинуться вниз (см. Laplacian-relax).
+
+        Алгоритм:
+          1. Naked-рёбра (cnt==1) → undirected adjacency-граф.
+          2. Walk loop'ов: для каждого непосещённого naked-ребра идём по
+             соседям, пока не вернёмся в старт. При degree>2 (T-junction)
+             выбираем «левый поворот» — это правильный face-tracing для
+             planar graph и закрывает loop'ы, которые наивный first-unvisited
+             walk пропустит.
+          3. Второй проход: если после walk'а остались непосещённые naked-
+             рёбра, запускаем walk ещё раз с пустым visited-set'ом (на тех
+             же рёбрах). Подбирает loop'ы, на которых первый проход
+             свернул не туда.
+          4. Внешний loop = с самой большой XY-bbox площадью
+             (TARGET-прямоугольник всегда крупнее любого orphan-окна).
+          5. Laplacian-relax Z movable-вершин каждой внутренней дыры.
+          6. Триангуляция → _triangulate_loop_xy.
+          7. Ориентируем добавленные треугольники с +Z-нормалью.
+
+        Возвращает (verts_maybe_relaxed, faces_with_buffer). Старые faces
+        сохраняются байт-в-байт; verts может содержать обновлённые Z
+        movable-вершин."""
+        verts = np.asarray(verts, dtype=np.float64).copy()
+        faces = np.asarray(faces, dtype=np.int64)
+        if faces.shape[0] == 0:
+            return verts, faces
+
+        # 1. Naked-рёбра: ровно одна грань на каждой стороне меша.
+        edges = np.concatenate(
+            [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0)
+        edges_sorted = np.sort(edges, axis=1)
+        uniq, _, cnt = np.unique(
+            edges_sorted, axis=0, return_inverse=True, return_counts=True)
+        naked = uniq[cnt == 1]
+        if naked.shape[0] < 3:
+            self._log("Buffer-зона: меш уже замкнут (<3 голых рёбер).")
+            return verts, faces
+
+        # 2. Undirected adjacency с сохранением XY-координат — для
+        # «left-turn»-walk'а в degree>2 ситуациях нужна геометрия.
+        adj: dict[int, list[int]] = {}
+        for ab in naked:
+            a, b = int(ab[0]), int(ab[1])
+            adj.setdefault(a, []).append(b)
+            adj.setdefault(b, []).append(a)
+
+        # 3. Walk loop'ов — два прохода. Первый покрывает большинство;
+        # второй пытается закрыть дыры, пропущенные из-за неправильного
+        # выбора в T-junction'ах.
+        def _walk_loops(naked_edges, ignore_visited=False):
+            visited_local: set = set()
+            loops_local: list[list[int]] = []
+            for ab in naked_edges:
+                a0, b0 = int(ab[0]), int(ab[1])
+                key0 = frozenset((a0, b0))
+                if key0 in visited_local:
+                    continue
+                loop = [a0, b0]
+                visited_local.add(key0)
+                prev, cur = a0, b0
+                closed = False
+                for _ in range(naked_edges.shape[0] * 2 + 4):
+                    nxt = self._pick_left_turn(
+                        verts, prev, cur, adj.get(cur, ()), visited_local)
+                    if nxt is None:
+                        break
+                    visited_local.add(frozenset((cur, nxt)))
+                    if nxt == a0:
+                        closed = True
+                        break
+                    loop.append(nxt)
+                    prev, cur = cur, nxt
+                if closed and len(loop) >= 3:
+                    loops_local.append(loop)
+            return loops_local, visited_local
+
+        loops, visited = _walk_loops(naked)
+        n_pass1 = len(loops)
+
+        # Второй проход на оставшихся naked-рёбрах (не вошли ни в один
+        # закрытый loop первого прохода).
+        n_pass2 = 0
+        remaining_edges = np.asarray(
+            [e for e in naked if frozenset((int(e[0]), int(e[1])))
+             not in visited],
+            dtype=np.int64)
+        if remaining_edges.shape[0] >= 3:
+            loops2, _ = _walk_loops(remaining_edges)
+            loops.extend(loops2)
+            n_pass2 = len(loops2)
+
+        if not loops:
+            self._log(
+                f"Buffer-зона: walk не закрыл ни одного loop'а из "
+                f"{naked.shape[0]} голых рёбер — пропуск.")
+            return verts, faces
+
+        # 4. Внешний контур = самый большой по XY bbox площади. TARGET-
+        # прямоугольник (4×7 м, центр в napolnitel) заведомо крупнее
+        # любого orphan-окна вдоль шва (которое порядка cell_size_m).
+        def _bbox_area(loop_idx):
+            pts = verts[np.asarray(loop_idx, dtype=np.int64)]
+            dx = float(pts[:, 0].max() - pts[:, 0].min())
+            dy = float(pts[:, 1].max() - pts[:, 1].min())
+            return dx * dy
+        bboxes = [_bbox_area(l) for l in loops]
+        outer_idx = int(np.argmax(bboxes))
+        interior = [l for i, l in enumerate(loops) if i != outer_idx]
+
+        if not interior:
+            self._log(
+                f"Buffer-зона: дыр нет ({len(loops)} loop, только внешний "
+                f"контур площадью {bboxes[outer_idx]:.2f} м²).")
+            return verts, faces
+
+        # 4b. Диагностика типа loop'ов (mixed/pure-src/pure-ext) — для
+        # понимания распределения, не для фильтрации. Фильтр по типу
+        # оказался неработоспособным: walk loop'ов через T-junction'ы
+        # систематически разделяет шов на pure-src и pure-ext куски, и
+        # mixed-loop'ов почти никогда не образуется (см. логи: 117 src +
+        # 56 ext + 0 mixed). Поэтому закрываем ВСЕ interior loop'ы, но
+        # триангуляцией center-vertex fan с Z = min(loop_z), чтобы buffer
+        # гарантированно «вдавлялся», а не выпирал «куполом» поверх дыры.
+        is_fixed_arr = (np.asarray(is_fixed, dtype=bool)
+                        if is_fixed is not None else None)
+        n_pure_src = n_pure_ext = n_mixed = 0
+        if is_fixed_arr is not None:
+            for loop in interior:
+                la = np.asarray(loop, dtype=np.int64)
+                any_fixed = bool(is_fixed_arr[la].any())
+                any_mov = bool((~is_fixed_arr[la]).any())
+                if any_fixed and any_mov:
+                    n_mixed += 1
+                elif any_fixed:
+                    n_pure_src += 1
+                else:
+                    n_pure_ext += 1
+
+        # 5. Laplacian-relax Z movable-вершин mixed-дыр. Применяется
+        # ПЕРЕД триангуляцией, чтобы buffer-треугольники получили уже
+        # плавный Z вдоль loop'а вместо «иголок» от rim-lift'нутых
+        # orphan'ов. Для pure-src / pure-ext loop'ов relax = no-op.
+        relax_iters = int(self.SEAM_RELAX_ITERS)
+        max_delta = 0.0
+        n_moved = 0
+        if is_fixed_arr is not None and relax_iters > 0:
+            for loop in interior:
+                d, m = self._relax_loop_z(
+                    verts, np.asarray(loop, dtype=np.int64),
+                    is_fixed_arr, relax_iters)
+                max_delta = max(max_delta, d)
+                n_moved += m
+
+        # 6. Триангулируем каждую дыру center-vertex fan'ом. Возвращает
+        # extra-вершины (по одной центральной на каждую дыру с n>3) и
+        # faces в local-индексах: [0, n_loop) → loop_arr, [n_loop, end)
+        # → новые вершины. Делаем global remap, ориентируем +Z, собираем.
+        extra_verts_chunks: list[np.ndarray] = []
+        new_tris_list: list[np.ndarray] = []
+        n_done = 0
+        n_failed = 0
+        sizes: list[int] = []
+        for loop in interior:
+            extra, faces_local = self._triangulate_loop_xy(verts, loop)
+            if faces_local.shape[0] == 0:
+                n_failed += 1
+                continue
+            n_loop = len(loop)
+            loop_arr = np.asarray(loop, dtype=np.int64)
+            # Global base index for these new extra vertices = current
+            # verts size + size of extras уже накопленных.
+            base_new = (int(verts.shape[0])
+                        + sum(int(e.shape[0]) for e in extra_verts_chunks))
+            # Remap: local idx < n_loop → loop_arr[idx],
+            #        local idx >= n_loop → base_new + (idx - n_loop).
+            fl = faces_local.astype(np.int64)
+            mapped = np.where(
+                fl < n_loop,
+                loop_arr[np.clip(fl, 0, n_loop - 1)],
+                base_new + (fl - n_loop))
+            if extra.shape[0] > 0:
+                extra_verts_chunks.append(extra)
+            new_tris_list.append(mapped)
+            n_done += 1
+            sizes.append(n_loop)
+
+        if not new_tris_list:
+            self._log(
+                f"Buffer-зона: {len(interior)} дыр найдено, ни одна не "
+                f"зашита (triangulate упал на всех).")
+            return verts, faces
+
+        # 7. Concat extra-вершин В verts, затем ориентируем + concat faces.
+        if extra_verts_chunks:
+            verts = np.concatenate(
+                [verts, np.concatenate(extra_verts_chunks, axis=0)], axis=0)
+        new_tris = np.concatenate(new_tris_list, axis=0).astype(np.int64)
+        # +Z orientation: cross((v1-v0), (v2-v0)).z > 0 — если меньше,
+        # переставляем v1↔v2. Источник/ext уже имеют +Z нормали.
+        v0 = verts[new_tris[:, 0]]
+        v1 = verts[new_tris[:, 1]]
+        v2 = verts[new_tris[:, 2]]
+        nrm = np.cross(v1 - v0, v2 - v0)
+        flip = nrm[:, 2] < 0.0
+        if flip.any():
+            new_tris[flip] = new_tris[flip][:, [0, 2, 1]]
+        all_faces = np.concatenate([faces, new_tris], axis=0)
+
+        sz_min = min(sizes) if sizes else 0
+        sz_max = max(sizes) if sizes else 0
+        sz_med = int(np.median(sizes)) if sizes else 0
+        n_extra_v = sum(int(e.shape[0]) for e in extra_verts_chunks)
+        relax_log = (
+            f" relax: {n_moved} верш. сдвинуто (|δ|max={max_delta*100:.1f} см)"
+            if is_fixed_arr is not None and relax_iters > 0 else "")
+        type_log = (
+            f" типы: {n_mixed} mixed + {n_pure_src} pure-src + "
+            f"{n_pure_ext} pure-ext;"
+            if is_fixed_arr is not None else "")
+        self._log(
+            f"Buffer-зона: {len(loops)} boundary-loop'ов "
+            f"(walk pass1={n_pass1} + pass2={n_pass2}; "
+            f"1 внешний {bboxes[outer_idx]:.2f} м², "
+            f"{len(interior)} внутренних дыр {sz_min}…{sz_max} верш., "
+            f"медиана {sz_med});{type_log} "
+            f"зашито {n_done} center-vertex fan'ом "
+            f"(+{n_extra_v} центр-вершин, "
+            f"+{int(new_tris.shape[0])} треугольников; "
+            f"Z центров = min(loop_z) + "
+            f"{self.SEAM_CENTER_LIFT_FRAC:.2f}×range — "
+            f"вдавлено, без купольных мостов).{relax_log}")
+        return verts, all_faces
+
+    @staticmethod
+    def _pick_left_turn(verts, prev, cur, neighbors, visited):
+        """В face-tracing planar graph: при degree>2 в вершине `cur`,
+        пришедшей из `prev`, выбираем соседа с МАКСИМАЛЬНЫМ поворотом
+        налево (CCW) от направления prev→cur. Это правильный «следующий»
+        в обходе грани (по аналогии с алгоритмом face-tracing через
+        rotational order вокруг вершины).
+
+        Игнорируем уже посещённые рёбра и сам `prev`. Возвращает int|None.
+        Если соседей-кандидатов нет — None (loop оборвался)."""
+        cands = []
+        for n in neighbors:
+            if n == prev:
+                continue
+            if frozenset((int(cur), int(n))) in visited:
+                continue
+            cands.append(int(n))
+        if not cands:
+            return None
+        if len(cands) == 1:
+            return cands[0]
+        # Несколько кандидатов: вычисляем signed angle turn (prev→cur→n)
+        # в XY-плоскости, берём кандидата с самым большим положительным
+        # углом (наибольший поворот налево = CCW).
+        p_prev = verts[int(prev), :2]
+        p_cur = verts[int(cur), :2]
+        v_in = p_cur - p_prev
+        in_len = float(np.linalg.norm(v_in))
+        if in_len < 1e-12:
+            return cands[0]    # degenerate — пусть будет первый
+        best_ang = -math.inf
+        best_n = cands[0]
+        for n in cands:
+            p_n = verts[n, :2]
+            v_out = p_n - p_cur
+            out_len = float(np.linalg.norm(v_out))
+            if out_len < 1e-12:
+                continue
+            cross = float(v_in[0] * v_out[1] - v_in[1] * v_out[0])
+            dot = float(v_in[0] * v_out[0] + v_in[1] * v_out[1])
+            ang = math.atan2(cross, dot)   # ∈ (-π, π]; >0 = CCW (left)
+            if ang > best_ang:
+                best_ang = ang
+                best_n = n
+        return best_n
+
+    @staticmethod
+    def _relax_loop_z(verts, loop_arr, is_fixed, iters):
+        """Laplacian-relax по Z вершин loop'а: на каждой итерации каждый
+        movable-узел получает Z = среднее двух соседей по loop'у; fixed-
+        узлы держатся неизменными как Dirichlet BC. Сходится за O(n)
+        итераций к линейной интерполяции между fixed-якорями.
+
+        Мутирует verts[loop_arr, 2] in-place для movable-узлов.
+        Возвращает (max_|δZ|, n_moved). Loop без fixed-узлов или без
+        movable-узлов — no-op."""
+        n = int(loop_arr.shape[0])
+        if n < 3 or iters <= 0:
+            return 0.0, 0
+        mov = ~is_fixed[loop_arr]
+        if not mov.any() or mov.all():
+            return 0.0, 0
+        z = verts[loop_arr, 2].copy()
+        z0 = z.copy()
+        for _ in range(int(iters)):
+            z_left = np.roll(z, 1)
+            z_right = np.roll(z, -1)
+            z_avg = 0.5 * (z_left + z_right)
+            z = np.where(mov, z_avg, z0)
+        delta = z - z0
+        if mov.any():
+            verts[loop_arr[mov], 2] = z[mov]
+            return float(np.abs(delta[mov]).max()), int(mov.sum())
+        return 0.0, 0
+
+    def _triangulate_loop_xy(self, verts, loop):
+        """Center-vertex fan triangulation замкнутого полигона. Возвращает:
+          • extra_verts: (M, 3) float64 — новые вершины, M ∈ {0, 1}
+              (1 центральная для n>=4; ноль для n==3).
+          • faces_local: (T, 3) int64 — индексы:
+              [0, n_loop)     → loop_arr[idx]    (исходные вершины loop'а)
+              [n_loop, n_loop+M) → extra_verts[idx − n_loop]  (новые)
+
+        Почему center-vertex, а не fan-from-vertex-0:
+          • fan-from-0 создаёт длинные «мостовые» треугольники между
+            vertex 0 и удалёнными vertex'ами (diameter loop'а). Если loop
+            окружает впадину/гребень с переменным Z, такой треугольник
+            выпирает над/под настоящей поверхностью «куполом» — visible
+            artifact на вершинах холмов.
+          • center-vertex fan даёт n коротких треугольников через центр,
+            каждое ребро длиной ~radius (вдвое короче). Z центральной
+            вершины = min(loop_z) + SEAM_CENTER_LIFT_FRAC × range. С
+            SEAM_CENTER_LIFT_FRAC = 0.0 центр строго на минимуме — buffer
+            гарантированно вдавлен, без купольных мостов.
+
+        Для невыпуклых loop'ов center-vertex fan может дать треугольники
+        с edge'ами через outside; для типичных seam-дыр (3-30 верш.)
+        они почти выпуклые и это не критично."""
+        loop_arr = np.asarray(loop, dtype=np.int64)
+        n = int(loop_arr.shape[0])
+        if n < 3:
+            return (np.zeros((0, 3), dtype=np.float64),
+                    np.zeros((0, 3), dtype=np.int64))
+        # Тривиальный случай: один треугольник, без новой вершины.
+        if n == 3:
+            return (np.zeros((0, 3), dtype=np.float64),
+                    np.array([[0, 1, 2]], dtype=np.int64))
+
+        loop_xyz = verts[loop_arr]
+        # Защита от вырожденности (collinear loop) — fan-tri будут нулевой
+        # площади, пропускаем дыру.
+        if (float(np.ptp(loop_xyz[:, 0])) < 1e-9 or
+                float(np.ptp(loop_xyz[:, 1])) < 1e-9):
+            return (np.zeros((0, 3), dtype=np.float64),
+                    np.zeros((0, 3), dtype=np.int64))
+
+        cx = float(loop_xyz[:, 0].mean())
+        cy = float(loop_xyz[:, 1].mean())
+        z_min = float(loop_xyz[:, 2].min())
+        z_max = float(loop_xyz[:, 2].max())
+        cz = z_min + float(self.SEAM_CENTER_LIFT_FRAC) * (z_max - z_min)
+        extra_verts = np.array([[cx, cy, cz]], dtype=np.float64)
+
+        # Fan: triangle i = (loop_arr[i], loop_arr[(i+1)%n], center).
+        # В local-индексах: (i, (i+1)%n, n) — центр стоит на позиции n
+        # после loop'а.
+        idx_a = np.arange(n, dtype=np.int64)
+        idx_b = np.mod(np.arange(1, n + 1, dtype=np.int64), n)
+        idx_c = np.full(n, n, dtype=np.int64)
+        faces_local = np.stack([idx_a, idx_b, idx_c], axis=1)
+        return extra_verts, faces_local
+
+    @staticmethod
+    def _points_in_polygon_xy(pts, poly):
+        """Ray-casting point-in-polygon, векторизовано по pts. `poly` —
+        (M, 2) вершины полигона в порядке обхода (CW или CCW не важно).
+        Возвращает (N,) bool. Точки строго на ребре дают неопределённый
+        результат — для наших centroid'ов это не критично."""
+        pts = np.asarray(pts, dtype=np.float64)
+        poly = np.asarray(poly, dtype=np.float64)
+        m = poly.shape[0]
+        if m < 3 or pts.shape[0] == 0:
+            return np.zeros(pts.shape[0], dtype=bool)
+        px = pts[:, 0]
+        py = pts[:, 1]
+        inside = np.zeros(pts.shape[0], dtype=bool)
+        for i in range(m):
+            j = (i - 1) % m
+            xi, yi = float(poly[i, 0]), float(poly[i, 1])
+            xj, yj = float(poly[j, 0]), float(poly[j, 1])
+            cond1 = (yi > py) != (yj > py)
+            dy = yj - yi
+            safe = dy if abs(dy) > 1e-12 else 1e-12
+            x_int = xi + (py - yi) * (xj - xi) / safe
+            cond2 = px < x_int
+            inside ^= (cond1 & cond2)
+        return inside
 
     @staticmethod
     def _smooth_preserve(Z, preserve, iters):
