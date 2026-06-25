@@ -217,6 +217,30 @@ class DepthReconstructor:
     # for future use.
     ENABLE_VOLUME = False
     # ==================================================================
+    # Финальный пересэмплинг в РЕГУЛЯРНЫЙ heightfield над плоскостью XY.
+    # Превращает «рваный» рельеф (дыры от long-poly/steep-cutoff + нависания
+    # сложившихся в мире экранных сэмплов) в однозначную поверхность
+    # z = f(x, y) без дыр и без нависаний — ту же плоскую проекцию, из которой
+    # уже берутся UV (x*scale, y*scale), так что текстура/материал/UV
+    # сохраняются, а нормали пересчитываются из чистого грида.
+    #
+    # Реализация — ортографический z-буфер: все «лучи сверху» параллельны, так
+    # что вместо рейкаста на ячейку треугольники растеризуются в XY-грид за один
+    # проход (O(площадь в пикселях), без BVH). В каждой ячейке держим ВЕРХНИЙ z
+    # (поверхность видна сверху) — это и снимает нависания.
+    FLATTEN_HEIGHTFIELD = True
+    # Шаг ячейки грида, м. None = авто: медиана длины ребра исходных
+    # треугольников в XY (сохраняет исходную детализацию, не плодит полигоны).
+    FLATTEN_CELL_M = None
+    # Жёсткий потолок на размер грида (в вершинах по стороне) — страховка от
+    # вырожденно мелкого авто-шага на огромном bbox.
+    FLATTEN_MAX_GRID = 600
+    # Барицентрический допуск (в долях ячейки), чтобы кромочные пиксели между
+    # соседними треугольниками не выпадали в дыру.
+    FLATTEN_EDGE_EPS = 1e-4
+    # Сглаживающих проходов по заполненному heightfield перед сборкой меша.
+    FLATTEN_SMOOTH_ITERS = 1
+    # ==================================================================
     # Per-snapshot fill mask. The masked depth is a sibling of the full depth:
     #   <name>_depth.png       — full depth map (load + body + background),
     #                            used for anchor-point calibration.
@@ -1211,6 +1235,18 @@ class DepthReconstructor:
             self._log("Нет ячеек для меша (регион вырожден / всё отсечено).")
             self._finish(False, {})
             return False
+
+        # ---- Финальное выравнивание в регулярный heightfield над XY:
+        #      убирает дыры и нависания, даёт однозначную поверхность
+        #      z = f(x, y). UV (x*scale, y*scale) и материал сохраняются,
+        #      нормали пересчитываются ниже из чистого грида.
+        if self.FLATTEN_HEIGHTFIELD and len(faces) > 0:
+            flat = self._flatten_to_heightfield(verts, faces)
+            if flat is not None:
+                verts, faces = flat
+            else:
+                self._log("Heightfield-выравнивание пропущено "
+                          "(вырожденный вход) — оставляю исходный меш.")
 
         # Z extent of the vertices actually used by the surviving faces.
         used = np.unique(np.asarray(faces).reshape(-1))
@@ -2927,6 +2963,122 @@ class DepthReconstructor:
         f1 = np.stack([a, b, d], axis=1)
         f2 = np.stack([a, d, c], axis=1)
         return np.concatenate([f1, f2], axis=0).astype(np.int64)
+
+    def _flatten_to_heightfield(self, verts, faces):
+        """Пересэмплирует рваный рельеф в РЕГУЛЯРНЫЙ heightfield над плоскостью
+        XY: однозначная поверхность z = f(x, y) без дыр и без нависаний.
+
+        Метод — ортографический z-буфер (параллельные «лучи сверху»):
+          1. Выбираем шаг ячейки (FLATTEN_CELL_M или авто = медиана ребра в XY).
+          2. Растеризуем каждый треугольник в XY-грид; в каждой ячейке держим
+             ВЕРХНИЙ z (барицентрическая интерполяция) — снимает нависания.
+          3. Незакрытые ячейки (дыры) заполняем _biharmonic_extrapolate
+             (сохраняет наклоны на кромках; Laplace-фоллбэк без skimage).
+          4. Лёгкое сглаживание (_smooth_grid_z).
+          5. Собираем регулярный грид через _build_regular_grid_faces.
+
+        UV вниз по пайплайну строятся из (x*scale, y*scale) — та же планарная
+        XY-проекция, что и здесь, поэтому текстура/материал/UV сохраняются;
+        нормали пересчитываются _compute_normals из чистого грида.
+
+        Возвращает (verts (M,3) float64, faces (T,3) int64) либо None при
+        вырожденном входе (тогда вызывающий оставляет исходный меш)."""
+        V = np.asarray(verts, dtype=np.float64)
+        F = np.asarray(faces, dtype=np.int64)
+        if V.shape[0] < 3 or F.shape[0] == 0:
+            return None
+
+        xy = V[:, :2]
+        z = V[:, 2]
+        used = np.unique(F.reshape(-1))
+        xmin, ymin = xy[used].min(axis=0)
+        xmax, ymax = xy[used].max(axis=0)
+        if not (xmax > xmin and ymax > ymin):
+            return None
+
+        # --- шаг ячейки ---
+        cell = self.FLATTEN_CELL_M
+        if cell is None or float(cell) <= 0.0:
+            e0 = np.linalg.norm(xy[F[:, 0]] - xy[F[:, 1]], axis=1)
+            e1 = np.linalg.norm(xy[F[:, 1]] - xy[F[:, 2]], axis=1)
+            e2 = np.linalg.norm(xy[F[:, 2]] - xy[F[:, 0]], axis=1)
+            med = float(np.median(np.concatenate([e0, e1, e2])))
+            cell = med if med > 1e-6 else max(xmax - xmin, ymax - ymin) / 200.0
+        cell = float(cell)
+        nx = int(math.ceil((xmax - xmin) / cell)) + 1
+        ny = int(math.ceil((ymax - ymin) / cell)) + 1
+        cap = int(self.FLATTEN_MAX_GRID)
+        if max(nx, ny) > cap:                      # держим грид в разумных рамках
+            cell *= max(nx, ny) / float(cap)
+            nx = int(math.ceil((xmax - xmin) / cell)) + 1
+            ny = int(math.ceil((ymax - ymin) / cell)) + 1
+        nx = max(nx, 2)
+        ny = max(ny, 2)
+
+        # --- ортографический z-буфер: верхняя грань на каждый узел грида ---
+        zbuf = np.full((ny, nx), -np.inf, dtype=np.float64)
+        # координаты вершин треугольников в пиксельной системе грида
+        px = (xy[:, 0] - xmin) / cell
+        py = (xy[:, 1] - ymin) / cell
+        PX = px[F]                                  # (T,3)
+        PY = py[F]
+        ZT = z[F]
+        ix0 = np.clip(np.floor(PX.min(axis=1)).astype(np.int64), 0, nx - 1)
+        ix1 = np.clip(np.ceil(PX.max(axis=1)).astype(np.int64), 0, nx - 1)
+        iy0 = np.clip(np.floor(PY.min(axis=1)).astype(np.int64), 0, ny - 1)
+        iy1 = np.clip(np.ceil(PY.max(axis=1)).astype(np.int64), 0, ny - 1)
+        eps = float(self.FLATTEN_EDGE_EPS)
+        for t in range(F.shape[0]):
+            x0, x1, y0, y1 = ix0[t], ix1[t], iy0[t], iy1[t]
+            if x1 < x0 or y1 < y0:
+                continue
+            ax, ay, az = PX[t, 0], PY[t, 0], ZT[t, 0]
+            bx, by, bz = PX[t, 1], PY[t, 1], ZT[t, 1]
+            cx2, cy2, cz = PX[t, 2], PY[t, 2], ZT[t, 2]
+            det = (by - cy2) * (ax - cx2) + (cx2 - bx) * (ay - cy2)
+            if abs(det) < 1e-12:                    # вырожденный в XY треугольник
+                continue
+            gx, gy = np.meshgrid(np.arange(x0, x1 + 1),
+                                 np.arange(y0, y1 + 1))
+            l1 = ((by - cy2) * (gx - cx2) + (cx2 - bx) * (gy - cy2)) / det
+            l2 = ((cy2 - ay) * (gx - cx2) + (ax - cx2) * (gy - cy2)) / det
+            l3 = 1.0 - l1 - l2
+            inside = (l1 >= -eps) & (l2 >= -eps) & (l3 >= -eps)
+            if not inside.any():
+                continue
+            zz = l1 * az + l2 * bz + l3 * cz
+            sy = gy[inside]
+            sx = gx[inside]
+            sz = zz[inside]
+            cur = zbuf[sy, sx]
+            better = sz > cur                       # держим ВЕРХНЮЮ грань
+            if better.any():
+                zbuf[sy[better], sx[better]] = sz[better]
+
+        covered = np.isfinite(zbuf)
+        if not covered.any():
+            return None
+
+        # --- дыры: бигармоническая интерполяция/экстраполяция по узлам грида ---
+        Z = np.where(covered, zbuf, 0.0)
+        if not covered.all():
+            Z = self._biharmonic_extrapolate(Z, covered)
+
+        # --- лёгкое сглаживание (все узлы валидны — поверхность сплошная) ---
+        iters = int(self.FLATTEN_SMOOTH_ITERS)
+        if iters > 0:
+            Z = self._smooth_grid_z(Z, np.ones_like(covered), iters)
+
+        # --- сборка регулярного грида: X,Y из меша, Z из heightfield ---
+        gxw = xmin + np.arange(nx, dtype=np.float64) * cell
+        gyw = ymin + np.arange(ny, dtype=np.float64) * cell
+        GX, GY = np.meshgrid(gxw, gyw)             # (ny,nx)
+        out_verts = np.column_stack([GX.ravel(), GY.ravel(), Z.ravel()])
+        out_faces = self._build_regular_grid_faces(nx, ny)
+        self._log(f"Heightfield-выравнивание: грид {nx}x{ny} (шаг {cell:.3f} м), "
+                  f"{out_faces.shape[0]} треугольников, дыр заполнено "
+                  f"{int((~covered).sum())}.")
+        return out_verts, out_faces
 
     def _napolnitel_floor_z(self):
         """World Z of the napolnitel solid's bottom — used by the extrapolation
