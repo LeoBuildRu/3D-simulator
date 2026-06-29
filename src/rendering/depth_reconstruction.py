@@ -81,7 +81,7 @@ class DepthReconstructor:
     # region is defined by the mask (or the whole frame). Picking is finished
     # by the user (RMB / Esc).
     MIN_POINTS = 2
-    GRID = 200          # mesh resolution across the region (GRID x GRID quads)
+    GRID = 500          # mesh resolution across the region (GRID x GRID quads)
     # Texture tiling for the reconstructed surface: UV units per world metre.
     # UVs are a top-down planar projection of global XY, so the texture keeps
     # a real-world scale regardless of mesh size. Bump >1 to tile tighter.
@@ -241,12 +241,12 @@ class DepthReconstructor:
     FLATTEN_CELL_M = None
     # Жёсткий потолок на размер грида (в вершинах по стороне) — страховка от
     # вырожденно мелкого авто-шага на огромном bbox.
-    FLATTEN_MAX_GRID = 600
+    FLATTEN_MAX_GRID = 1000
     # Барицентрический допуск (в долях ячейки), чтобы кромочные пиксели между
     # соседними треугольниками не выпадали в дыру.
     FLATTEN_EDGE_EPS = 1e-4
     # Сглаживающих проходов по заполненному heightfield перед сборкой меша.
-    FLATTEN_SMOOTH_ITERS = 1
+    FLATTEN_SMOOTH_ITERS = 10
     # ==================================================================
     # Per-snapshot fill mask. The masked depth is a sibling of the full depth:
     #   <name>_depth.png       — full depth map (load + body + background),
