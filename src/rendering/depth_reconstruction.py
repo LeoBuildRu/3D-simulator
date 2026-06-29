@@ -93,11 +93,18 @@ class DepthReconstructor:
     # higher = each point's influence stays tighter to its own area.
     IDW_POWER = 2.0
     IDW_EPS = 1e-6
-    # Light surface smoothing: number of 3x3 mask-aware averaging passes over
-    # the grid depths before unprojection. Evens out the terracing caused by
-    # 8-bit depth quantization. 0 = off; 1-3 = gentle. Only averages valid
-    # (kept) neighbours, so it doesn't bleed across the mask boundary.
+    # Light surface smoothing: number of 3x3 mask-aware passes over the grid
+    # depths before unprojection. Evens out the terracing caused by 8-bit
+    # depth quantization. 0 = off; 1-3 = gentle.
     SMOOTH_ITERS = 2
+    # SMOOTH_MODE — как именно сглаживать:
+    #   "median" — 3×3 mask-aware МЕДИАНА (edge-preserving): убивает одиночные
+    #              шумовые выбросы, но НЕ размывает линейные структуры
+    #              (борозды от экскаватора и т.п.). Дефолт.
+    #   "box"    — старое 3×3 mask-aware УСРЕДНЕНИЕ: гасит шум сильнее,
+    #              но размазывает тонкий линейный рельеф.
+    # Применяется и к Stage 1 (depth-грид), и к Stage Flatten (heightfield).
+    SMOOTH_MODE = "median"
     # ==================================================================
     # PIPELINE (mask-free). The reconstruction now runs as:
     #   Stage 1  build the relief over the WHOLE frame, cutting off
@@ -215,7 +222,7 @@ class DepthReconstructor:
     # Boolean DIFFERENCE (sealed-solid volume) DEACTIVATED but the code
     # — _clip_relief_to_target and friends — is preserved in this file
     # for future use.
-    ENABLE_VOLUME = False
+    ENABLE_VOLUME = True
     # ==================================================================
     # Финальный пересэмплинг в РЕГУЛЯРНЫЙ heightfield над плоскостью XY.
     # Превращает «рваный» рельеф (дыры от long-poly/steep-cutoff + нависания
@@ -234,7 +241,7 @@ class DepthReconstructor:
     FLATTEN_CELL_M = None
     # Жёсткий потолок на размер грида (в вершинах по стороне) — страховка от
     # вырожденно мелкого авто-шага на огромном bbox.
-    FLATTEN_MAX_GRID = 1024
+    FLATTEN_MAX_GRID = 600
     # Барицентрический допуск (в долях ячейки), чтобы кромочные пиксели между
     # соседними треугольниками не выпадали в дыру.
     FLATTEN_EDGE_EPS = 1e-4
@@ -514,6 +521,14 @@ class DepthReconstructor:
     # set TONAR_OBJ_TRANSFORM to a 4×4 numpy matrix that maps OBJ-local
     # coords into world coords before sending. None = identity.
     TONAR_OBJ_REL_PATH = "assets/height_examples/stand/MAZ_napolnitel.obj"
+    # Per-model overrides: meta["model"] (из серверного meta.json, см.
+    # set_source) → относительный путь к OBJ-наполнителю. Если ключа нет,
+    # используется TONAR_OBJ_REL_PATH (дефолт = MAZ).
+    TONAR_OBJ_REL_PATHS_BY_MODEL = {
+        "MAZ":       "assets/height_examples/stand/MAZ_napolnitel.obj",
+        "SCANIA":    "assets/height_examples/stand/SCANIA-P8X400-P380CB8X4EHZ-Napolnitel.obj",
+        "SCANIA-v2": "assets/height_examples/stand/SCANIA-P8X400-P380CB8X4EHZ-Napolnitel.obj",
+    }
     # tonar_napolnitel.obj is exported Y-up (Blender convention); Panda is
     # Z-up. Composed transform: Y↔Z swap (Y-up → Z-up), then R_z(180°) to
     # flip the truck's front/back. Net mapping: (x, y, z) → (−x, −z, y).
@@ -1144,12 +1159,14 @@ class DepthReconstructor:
                 f"внутренней области.")
 
         # Gentle smoothing of the (kept) grid depths to kill the 8-bit
-        # quantization terracing before the surface is built.
+        # quantization terracing before the surface is built. Mode = median по
+        # умолчанию — гасит одиночные шумовые пики, не размывая борозды.
         if self.SMOOTH_ITERS > 0:
-            Z_grid = self._smooth_grid_z(
+            Z_grid = self._smooth_or_median_grid_z(
                 Z_grid.reshape(stride, stride),
                 inside.reshape(stride, stride),
-                self.SMOOTH_ITERS).ravel()
+                self.SMOOTH_ITERS,
+                self.SMOOTH_MODE).ravel()
 
         # Unproject the in-region samples through the live lens.
         verts = np.zeros((FX.shape[0], 3), dtype=np.float64)
@@ -1240,13 +1257,32 @@ class DepthReconstructor:
         #      убирает дыры и нависания, даёт однозначную поверхность
         #      z = f(x, y). UV (x*scale, y*scale) и материал сохраняются,
         #      нормали пересчитываются ниже из чистого грида.
+        flat_grid_dims = None
         if self.FLATTEN_HEIGHTFIELD and len(faces) > 0:
             flat = self._flatten_to_heightfield(verts, faces)
             if flat is not None:
-                verts, faces = flat
+                verts, faces, flat_grid_dims = flat
             else:
                 self._log("Heightfield-выравнивание пропущено "
                           "(вырожденный вход) — оставляю исходный меш.")
+
+        # ---- Stage 4 (опционально): Boolean DIFFERENCE с napolnitel'ом.
+        #      Берём ИТОГОВЫЙ heightfield (после Stage 1-3 + cleanup +
+        #      flatten), герметизируем его в sealed_solid и вычитаем из
+        #      tonar_napolnitel → закрытый меш «наполнитель кузова», с
+        #      измеримым объёмом. Требует регулярного грида от flatten —
+        #      без него Boolean пропускается.
+        if (self.ENABLE_VOLUME and len(faces) > 0
+                and flat_grid_dims is not None):
+            res = self._clip_relief_to_target(verts, faces, flat_grid_dims)
+            if res is not None:
+                verts, faces, clip_volume = res
+            else:
+                self._log("Boolean DIFFERENCE не дал результата — "
+                          "оставляю heightfield без вычитания.")
+        elif self.ENABLE_VOLUME and flat_grid_dims is None:
+            self._log("Boolean DIFFERENCE пропущен: нет регулярного грида "
+                      "(FLATTEN_HEIGHTFIELD выключен или провалился).")
 
         # Z extent of the vertices actually used by the surviving faces.
         used = np.unique(np.asarray(faces).reshape(-1))
@@ -2245,6 +2281,45 @@ class DepthReconstructor:
         return new, n_done
 
     @staticmethod
+    def _median_grid_z(Z, valid, iters):
+        """Mask-aware 3×3 МЕДИАННОЕ сглаживание depth-грида, `iters` проходов.
+        Edge-preserving: убивает одиночные шумовые пики, но не размывает
+        линейные структуры (борозды). invalid-ячейки в окно не входят.
+
+        Реализация: окружаем NaN'ом invalid-ячейки и края, набираем 9
+        смещённых копий и берём nanmedian вдоль оси шифтов — полностью
+        векторно, без scipy."""
+        Zc = Z.astype(np.float64).copy()
+        valid_b = valid.astype(bool)
+        Hh, Ww = Zc.shape
+        if Hh < 3 or Ww < 3:
+            return Zc
+        for _ in range(int(iters)):
+            Zp = np.where(valid_b, Zc, np.nan)
+            # pad NaN'ом, чтобы окно у края давало валидную медиану
+            # из доступных соседей, не привязываясь к фиктивным значениям
+            Zpad = np.pad(Zp, 1, mode="constant", constant_values=np.nan)
+            stack = np.stack([
+                Zpad[dy:dy + Hh, dx:dx + Ww]
+                for dy in (0, 1, 2) for dx in (0, 1, 2)
+            ], axis=0)
+            with np.errstate(all="ignore"):
+                new = np.nanmedian(stack, axis=0)
+            # если ВСЕ соседи NaN — оставляем оригинал
+            new = np.where(np.isnan(new), Zc, new)
+            Zc = np.where(valid_b, new, Zc)
+        return Zc
+
+    @classmethod
+    def _smooth_or_median_grid_z(cls, Z, valid, iters, mode):
+        """Диспетчер: median или box в зависимости от SMOOTH_MODE."""
+        if iters <= 0:
+            return Z
+        if str(mode).lower() == "median":
+            return cls._median_grid_z(Z, valid, iters)
+        return cls._smooth_grid_z(Z, valid, iters)
+
+    @staticmethod
     def _smooth_grid_z(Z, valid, iters):
         """Mask-aware 3x3 box smoothing of a (stride,stride) depth grid,
         repeated `iters` times. Each valid cell is replaced by the average of
@@ -3065,9 +3140,12 @@ class DepthReconstructor:
             Z = self._biharmonic_extrapolate(Z, covered)
 
         # --- лёгкое сглаживание (все узлы валидны — поверхность сплошная) ---
+        # Mode = median по умолчанию: убирает «ступеньки» ресемплинга и редкие
+        # выбросы, но не размывает борозды.
         iters = int(self.FLATTEN_SMOOTH_ITERS)
         if iters > 0:
-            Z = self._smooth_grid_z(Z, np.ones_like(covered), iters)
+            Z = self._smooth_or_median_grid_z(
+                Z, np.ones_like(covered), iters, self.SMOOTH_MODE)
 
         # --- сборка регулярного грида: X,Y из меша, Z из heightfield ---
         gxw = xmin + np.arange(nx, dtype=np.float64) * cell
@@ -3078,7 +3156,7 @@ class DepthReconstructor:
         self._log(f"Heightfield-выравнивание: грид {nx}x{ny} (шаг {cell:.3f} м), "
                   f"{out_faces.shape[0]} треугольников, дыр заполнено "
                   f"{int((~covered).sum())}.")
-        return out_verts, out_faces
+        return out_verts, out_faces, (nx, ny)
 
     def _napolnitel_floor_z(self):
         """World Z of the napolnitel solid's bottom — used by the extrapolation
@@ -3119,8 +3197,28 @@ class DepthReconstructor:
     # ------------------------------------------------------------------
     def _tonar_obj_path(self) -> str:
         """Absolute path to tonar_napolnitel.obj, resolved relative to the
-        project root (two levels above this module file)."""
+        project root (two levels above this module file).
+
+        Выбор файла зависит от meta["model"] (см. set_source): для
+        известных моделей используется TONAR_OBJ_REL_PATHS_BY_MODEL,
+        иначе — общий дефолт TONAR_OBJ_REL_PATH."""
         rel = self.TONAR_OBJ_REL_PATH
+        meta = getattr(self, "_meta", None) or {}
+        model_name = meta.get("model")
+        chosen_by = "default (TONAR_OBJ_REL_PATH)"
+        if isinstance(model_name, str) and model_name:
+            override = self.TONAR_OBJ_REL_PATHS_BY_MODEL.get(model_name)
+            if override:
+                rel = override
+                chosen_by = f"meta['model']={model_name!r}"
+            else:
+                chosen_by = (f"meta['model']={model_name!r} НЕ в маппинге, "
+                             f"fallback на дефолт")
+        else:
+            chosen_by = (f"meta нет/без 'model' (meta keys: "
+                         f"{sorted(meta.keys()) if isinstance(meta, dict) else type(meta).__name__}), "
+                         f"fallback на дефолт")
+        self._log(f"[tonar] выбран napolnitel: {rel} — {chosen_by}")
         if not rel:
             return ""
         here = os.path.dirname(os.path.abspath(__file__))
