@@ -127,8 +127,16 @@ class PerlinMeshGenerator:
         tv = float(getattr(self.panda_app, "Target_Volume", 0.0) or 0.0)
 
         mv = None
+        # Приоритет — эффективный max_volume, сохранённый load_model_set (у
+        # локальной модели он унаследован от донора).
+        stored_mv = getattr(self.panda_app, "current_max_volume", None)
+        if stored_mv:
+            try:
+                mv = float(stored_mv)
+            except (TypeError, ValueError):
+                mv = None
         cur_set = getattr(self.panda_app, "current_model_set", None)
-        if cur_set:
+        if (not mv or mv <= 0) and cur_set:
             try:
                 from src.ui.panel_data import get_model_set_config as _gmsc
                 _cfg = _gmsc(str(cur_set))
@@ -394,6 +402,13 @@ class PerlinMeshGenerator:
     # поле target_model), который сервер сам резолвит под models_dir.
     # ------------------------------------------------------------------
     def _get_target_model_path(self):
+        # Приоритет — путь, сохранённый load_model_set (в т.ч. унаследованный
+        # локальной моделью от донора). panel_data-конфиг локальной модели
+        # поля target_model не содержит.
+        stored = getattr(self.panda_app, "current_target_model_path", None)
+        if stored:
+            return str(stored)
+
         cur_set = getattr(self.panda_app, "current_model_set", None)
         if not cur_set:
             return None

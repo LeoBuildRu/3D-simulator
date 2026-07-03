@@ -205,8 +205,16 @@ class MyApp(ShowBase):
         
         self.last_target_model_trimesh = None
         self.last_best_z = None
-        self.test_perlin_mesh = None  
-        self.last_grid_size = 48  
+        self.test_perlin_mesh = None
+        self.last_grid_size = 48
+
+        # Данные последней НЕ-локальной (серверной) модели, используемые как
+        # донор для генерации наполнителя у локальных моделей, в конфиге
+        # которых нет napolnitel/target_model/max_volume/ground_plane.
+        self._generation_donor = None
+        # Путь к OBJ-наполнителю (target_model) текущего набора для серверной
+        # булевой разности. Ставится в load_model_set (в т.ч. из донора).
+        self.current_target_model_path = None
 
         self.loaded_models = []
         self.model_paths = {}
@@ -2431,18 +2439,43 @@ class MyApp(ShowBase):
 
     def load_model_set(self, config, model_set_name):
         self.clear_scene()
-        
+
         if not hasattr(self, 'perlin_model') or self.perlin_model is None:
             self.create_perlin_noise_mesh()
-        
+
         models_loaded = []
-        
+
+        # Локальные модели (assets/models/trucks) в своём конфиге несут только
+        # cuzov — без napolnitel/other/target_model/max_volume/ground_plane.
+        # Без наполнителя генерация груза падает («меш наполнителя не найден»).
+        # Подставляем недостающие поля из донора — данных последней выбранной
+        # серверной модели (её napolnitel уже скачан в кэш).
+        is_local = bool(config.get('local'))
+        config = dict(config)
+        if is_local and isinstance(self._generation_donor, dict):
+            # Наследуем только то, что нужно для генерации наполнителя, — без
+            # 'other' (окружение), чтобы не тащить чужой меш на локальный кузов.
+            for k in ('napolnitel', 'target_model',
+                      'max_volume', 'ground_plane'):
+                if not config.get(k) and self._generation_donor.get(k):
+                    config[k] = self._generation_donor[k]
+            print("[ModelSet] локальная модель: наполнитель/параметры взяты "
+                  f"из донора '{self._generation_donor.get('set_name')}'.")
+        elif is_local:
+            print("[ModelSet] локальная модель без донора: сначала выберите "
+                  "любую серверную модель, иначе груз не сгенерируется.")
+
+        # target_model — серверный путь к OBJ-наполнителю для булевой разности.
+        # Держим отдельно, чтобы _get_target_model_path нашёл его и у локальной
+        # модели (в panel_data-конфиге его нет).
+        self.current_target_model_path = config.get('target_model')
+
         # Используем PROJECT_ROOT для построения абсолютных путей
         def get_absolute_path(relative_path):
             if os.path.isabs(relative_path):
                 return relative_path
             return os.path.join(PROJECT_ROOT, relative_path)
-        
+
         if 'other' in config and config['other']:
             other_path = get_absolute_path(config['other'])
             if os.path.exists(other_path):
@@ -2473,17 +2506,33 @@ class MyApp(ShowBase):
         
         if 'max_volume' in config:
             self.Target_Volume = config['max_volume']
-        
+
+        # Эффективный max_volume (в т.ч. унаследованный от донора) — его читает
+        # perlin_mesh_generator для ratio ландшафта.
+        self.current_max_volume = config.get('max_volume')
+
         if 'ground_plane' in config:
             self.current_ground_plane_z = config['ground_plane']
         
         self.current_model_set = model_set_name
         self.update_overlay_info(model=model_set_name)
-        
+
+        # Запоминаем донора: серверная модель с реально загруженным
+        # наполнителем. Её данные потом наследуют локальные модели.
+        if not is_local and 'napolnitel' in models_loaded:
+            self._generation_donor = {
+                "set_name":     model_set_name,
+                "napolnitel":   self.current_napolnitel_path,
+                "other":        getattr(self, 'current_other_path', None),
+                "target_model": config.get('target_model'),
+                "max_volume":   config.get('max_volume'),
+                "ground_plane": config.get('ground_plane'),
+            }
+
         if hasattr(self, 'perlin_model') and self.perlin_model:
             if self.perlin_model.isHidden():
                 self.perlin_model.show()
-        
+
         return True
 
     def clear_scene(self):
@@ -2630,6 +2679,9 @@ class MyApp(ShowBase):
             "other":        cached.get("other"),
             "max_volume":   cached.get("max_volume"),
             "ground_plane": cached.get("ground_plane"),
+            # Серверный путь к OBJ-наполнителю для булевой разности — не
+            # скачивается, но нужен load_model_set для донора локальных моделей.
+            "target_model": set_config.get("target_model"),
         }
         try:
             return bool(self.load_model_set(model_config, set_name))
