@@ -1087,6 +1087,26 @@ class RendererUtils:
         for _ in range(max(1, int(ticks))):
             self.panda_app.graphicsEngine.renderFrame()
 
+    def settle_render(self, frames=30):
+        """Прокрутить РЕАЛЬНЫЕ кадры пайплайна через taskMgr.step().
+
+        В отличие от wait_panda_render (голый graphicsEngine.renderFrame,
+        который НЕ выполняет per-frame апдейты плагинов RenderPipeline),
+        taskMgr.step() гоняет on_pre_render_update — в т.ч. переобновление
+        камерного рига PSSM под новое положение камеры/солнца. Без этого
+        после сдвига камеры каскадные тени не успевают перестроиться и на
+        кадр вылезает огромная «ложная» тень на полкадра. Тот же приём уже
+        используется в save_dataset_render. Кадры реальные, поэтому обычный
+        time.sleep тут не нужен (он лишь блокирует QTimer, который и так
+        делает taskMgr.step, т.е. паузы «между кадрами» ничего не сглаживали).
+        """
+        tm = getattr(self.panda_app, "taskMgr", None)
+        if tm is None:
+            self.wait_panda_render(ticks=frames)
+            return
+        for _ in range(max(1, int(frames))):
+            tm.step()
+
     def _get_gemini_processor(self):
         """Ленивое создание процессора постобработки (провайдер из config).
         None, если недоступен (нет ключа/токена, отключён и т.п.)."""
@@ -1130,14 +1150,12 @@ class RendererUtils:
         else:
             camera_fov_x = camera_fov_y = None
 
-        # Скрываем depth overlay, ждём пока кадр устаканится, делаем
-        # цветной скриншот. Увеличенный wait_panda_render + sleep здесь
-        # нужны, чтобы убрать моушн-блюр от только что выполненных
-        # движений камеры / смены освещения.
+        # Скрываем depth overlay и даём пайплайну устаканиться РЕАЛЬНЫМИ
+        # кадрами (taskMgr.step), чтобы PSSM перестроил каскадные тени под
+        # новую позу камеры/солнца, а motion blur / TAA сошлись. Иначе на
+        # кадр иногда вылезает огромная ложная тень на полкадра.
         self.panda_app.depth_renderer.set_overlay_visibility(False)
-        self.wait_panda_render(ticks=14)
-        time.sleep(1.0)
-        self.wait_panda_render(ticks=6)
+        self.settle_render(frames=30)
 
         img = PNMImage()
         if not self.panda_app.win.getScreenshot(img):
@@ -1179,9 +1197,7 @@ class RendererUtils:
                 return False
         else:
             self.panda_app.depth_renderer.set_overlay_visibility(True)
-            self.wait_panda_render(ticks=10)
-            time.sleep(1.0)
-            self.wait_panda_render(ticks=6)
+            self.settle_render(frames=16)
 
             depthImg = PNMImage()
             if not self.panda_app.win.getScreenshot(depthImg):
