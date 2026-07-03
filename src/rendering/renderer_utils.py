@@ -93,6 +93,332 @@ class RendererUtils:
             print(f"[Render] ошибка замены фона: {exc}")
             return None
 
+    def _pnm_to_pil(self, pnm):
+        """PNMImage -> PIL.Image (RGB)."""
+        import io
+        from PIL import Image
+        stream = StringStream()
+        pnm.write(stream, "png")
+        return Image.open(io.BytesIO(stream.getData())).convert("RGB")
+
+    def _pil_to_pnm(self, pil):
+        """PIL.Image -> PNMImage."""
+        import io
+        out_buf = io.BytesIO()
+        pil.convert("RGB").save(out_buf, format="PNG")
+        out_buf.seek(0)
+        new_pnm = PNMImage()
+        new_pnm.read(StringStream(out_buf.read()), "png")
+        return new_pnm
+
+    def _keep_mask_from_array(self, mask_arr, tol=40):
+        """bool-маска переднего плана (cargo+cuzov) из RGB-маски сегментации."""
+        import numpy as np
+        from src.rendering.segmentation_renderer import SEG_COLORS
+        mask_i = mask_arr.astype(np.int16)
+
+        def _close(color):
+            d = np.abs(mask_i - np.array(color, dtype=np.int16))
+            return (d[..., 0] <= tol) & (d[..., 1] <= tol) & (d[..., 2] <= tol)
+
+        cuzov = _close(SEG_COLORS["cuzov"])
+        keep = _close(SEG_COLORS["cargo"]) | cuzov
+        return keep, cuzov
+
+    def _apply_openai(self, img_final, processor, shadow_band=False):
+        """OpenAI GPT Image: правка всего кадра одним запросом.
+
+        Чтобы обработанный кадр совпадал с сегментацией, устраняем искажение
+        соотношения сторон: OpenAI отдаёт только форматы вроде 1536x1024
+        (3:2), а кадр 16:9. Поэтому кадр вписывается в холст нужного формата
+        с сохранением пропорций (letterbox, серые поля), а из результата
+        вырезается та же область и равномерно масштабируется обратно к
+        1920x1080 — без горизонтального растяжения. PIL здесь используется
+        ТОЛЬКО для геометрии (масштаб/паддинг/кроп); сам контент целиком
+        генерирует OpenAI. shadow_band=True — тень «пополам» через промпт.
+
+        Возвращает (PNMImage | None, meta | None).
+        """
+        try:
+            import io as _io
+            from PIL import Image
+        except Exception as exc:
+            print(f"[OpenAI] PIL недоступен: {exc}")
+            return None, None
+        try:
+            color_pil = self._pnm_to_pil(img_final)
+        except Exception as exc:
+            print(f"[OpenAI] кодирование кадра не удалось: {exc}")
+            return None, None
+
+        W, H = color_pil.size
+        cw, ch = 1536, 1024
+        try:
+            cw, ch = (int(v) for v in str(
+                processor.config.get("openai_size", "1536x1024")).lower().split("x"))
+        except Exception:
+            pass
+
+        # Вписать кадр в холст cw×ch с сохранением пропорций.
+        s = min(cw / W, ch / H)
+        nw, nh = max(1, round(W * s)), max(1, round(H * s))
+        ox, oy = (cw - nw) // 2, (ch - nh) // 2
+        canvas = Image.new("RGB", (cw, ch), (110, 110, 110))
+        canvas.paste(color_pil.resize((nw, nh), Image.LANCZOS), (ox, oy))
+
+        buf = _io.BytesIO()
+        canvas.save(buf, format="PNG")
+        out_bytes = processor.edit_whole(buf.getvalue(), shadow=shadow_band)
+        meta = processor.last_prompts()
+        if out_bytes is None:
+            return None, meta
+        try:
+            out_pil = Image.open(_io.BytesIO(out_bytes)).convert("RGB")
+            if out_pil.size != (cw, ch):
+                out_pil = out_pil.resize((cw, ch), Image.LANCZOS)
+            # Вырезаем контентную область (без полей) и возвращаем к кадру.
+            crop = out_pil.crop((ox, oy, ox + nw, oy + nh))
+            final = crop.resize((W, H), Image.LANCZOS)
+            return self._pil_to_pnm(final), meta
+        except Exception as exc:
+            print(f"[OpenAI] разбор результата не удался: {exc}")
+            return None, meta
+
+    def _apply_gemini(self, img_final, mask_final, processor):
+        """Gemini-постобработка цветного кадра.
+
+        1) генерируем новый фон;
+        2) выветриваем передний план (ржавчина/цвет/вмятины/кабели/фракции);
+        3) собираем итог жёстким матированием по маске: силуэт переднего плана
+           = mask_final (⇒ depth/seg GT остаётся точным), внутри — выветренный
+           передний план, снаружи — новый фон.
+
+        Возвращает (PNMImage | None, meta_dict | None).
+        """
+        try:
+            import numpy as np
+            from PIL import Image
+        except Exception as exc:
+            print(f"[Gemini] PIL/numpy недоступны: {exc}")
+            return None, None
+
+        try:
+            color_pil = self._pnm_to_pil(img_final)
+            mask_pil = self._pnm_to_pil(mask_final)
+            size = color_pil.size
+            img_arr = np.asarray(color_pil)
+            mask_arr = np.asarray(mask_pil)
+            keep, cuzov_mask = self._keep_mask_from_array(mask_arr)
+
+            fg_mode = str(processor.config.get("foreground_mode", "procedural"))
+
+            # Режим single_call: фон + AI-выветривание за один запрос (только
+            # для fg_mode="ai"; силуэт держится на промпте, без матирования).
+            if fg_mode == "ai" and processor.config.get("single_call"):
+                full = processor.weather_full_scene(color_pil, mask_pil)
+                meta = processor.last_prompts()
+                meta["single_call"] = True
+                meta["scene_generated"] = full is not None
+                if full is None:
+                    return None, meta
+                return self._pil_to_pnm(full), meta
+
+            # 1) Новый фон (через провайдера, если доступен).
+            bg_pil = processor.generate_background(size[0], size[1])
+
+            # 2) Передний план: ai (провайдер img2img) / procedural (оффлайн) /
+            #    off (не трогать).
+            fg_pil = None
+            if fg_mode == "ai":
+                fg_pil = processor.weather_foreground(color_pil, mask_pil)
+
+            meta = processor.last_prompts()
+            meta["foreground_mode"] = fg_mode
+            meta["background_generated"] = bg_pil is not None
+            meta["foreground_weathered"] = (
+                fg_pil is not None or fg_mode == "procedural")
+
+            fg_arr = (np.asarray(fg_pil.convert("RGB"))
+                      if fg_pil is not None else img_arr)
+            if fg_mode == "procedural":
+                fg_arr = self._procedural_weathering(fg_arr, mask_arr)
+
+            if bg_pil is None and fg_mode == "off":
+                # Ни фона, ни выветривания — откат на исходный кадр.
+                return None, meta
+
+            if bg_pil is None:
+                # Фон не сменился — оставляем исходный задний план.
+                bg_arr = img_arr
+            else:
+                # Провайдер мог вернуть иной размер (FLUX округляет к кратному
+                # 16) — приводим к размеру кадра, иначе матирование упадёт.
+                if bg_pil.size != size:
+                    bg_pil = bg_pil.resize(size, Image.LANCZOS)
+                bg_arr = np.asarray(bg_pil.convert("RGB"))
+                # Гармонизация (как в _composite_random_background):
+                # температуру переднего плана тянем к фону, яркость фона — к
+                # рендеру кузова.
+                fg_arr = self._match_color_temperature(fg_arr, keep, bg_arr)
+                ref_mask = (cuzov_mask if int(cuzov_mask.sum()) >= 64
+                            else keep)
+                bg_arr = self._match_brightness(bg_arr, img_arr, ref_mask)
+
+            out = np.where(keep[..., None], fg_arr, bg_arr).astype(np.uint8)
+            return self._pil_to_pnm(Image.fromarray(out)), meta
+        except Exception as exc:
+            print(f"[Gemini] ошибка постобработки: {exc}")
+            return None, None
+
+    def _procedural_weathering(self, img_arr, mask_arr):
+        """Бесплатное оффлайн-выветривание переднего плана (numpy/PIL).
+
+        Внутри масок кузова/груза: сдвиг цвета/выцветание кузова, потёки
+        ржавчины, грязь/пыль, разнофракционные цветные вкрапления на грузе.
+        Уровень (clean/light/heavy) случайный — часть кадров простые.
+        img_arr, mask_arr — HxWx3 uint8 (RGB). Возвращает HxWx3 uint8.
+        """
+        import numpy as np
+        from PIL import Image, ImageDraw
+        from src.rendering.segmentation_renderer import SEG_COLORS
+
+        h, w = img_arr.shape[:2]
+        out = img_arr.astype(np.float32)
+        mi = mask_arr.astype(np.int16)
+
+        def close(color, tol=40):
+            d = np.abs(mi - np.array(color, dtype=np.int16))
+            return (d[..., 0] <= tol) & (d[..., 1] <= tol) & (d[..., 2] <= tol)
+
+        cuzov = close(SEG_COLORS["cuzov"])
+        cargo = close(SEG_COLORS["cargo"])
+        tier = random.choices(
+            ["clean", "light", "heavy"], weights=[0.2, 0.4, 0.4])[0]
+
+        # 1) Цветовой сдвиг / выцветание кузова (разные цвета).
+        if cuzov.any() and (tier != "clean" or random.random() < 0.5):
+            gains = np.array([random.uniform(0.75, 1.25),
+                              random.uniform(0.80, 1.15),
+                              random.uniform(0.75, 1.25)], np.float32)
+            gains *= random.uniform(0.8, 1.1)      # общая яркость
+            out[cuzov] = np.clip(out[cuzov] * gains, 0, 255)
+
+        # 2) Потёки ржавчины на кузове (вертикальные, сверху вниз).
+        if cuzov.any() and tier in ("light", "heavy"):
+            ys, xs = np.where(cuzov)
+            ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(ov)
+            n = random.randint(3, 10) if tier == "heavy" else random.randint(1, 4)
+            cols = np.unique(xs)
+            for _ in range(n):
+                x = int(random.choice(cols))
+                colys = ys[xs == x]
+                if colys.size == 0:
+                    continue
+                y0 = int(colys.min())
+                length = int(random.uniform(0.2, 0.7) * h)
+                wdt = random.randint(1, 4)
+                base_c = (random.randint(110, 160),
+                          random.randint(55, 90),
+                          random.randint(25, 50))
+                steps = 24
+                for s in range(steps):
+                    yy = y0 + int(length * s / steps)
+                    a = int(150 * (1 - s / steps) * random.uniform(0.6, 1.0))
+                    d.line([(x, yy),
+                            (x + random.randint(-1, 1), yy + length // steps + 1)],
+                           fill=base_c + (a,), width=wdt)
+            rust = np.asarray(ov).astype(np.float32)
+            a = (rust[..., 3] / 255.0) * cuzov
+            for c in range(3):
+                out[..., c] = out[..., c] * (1 - a) + rust[..., c] * a
+
+        # 3) Грязь/пыль: низкочастотный шум затемнения на кузове+грузе.
+        if tier in ("light", "heavy"):
+            rs = np.random.RandomState(random.randint(0, 1 << 30))
+            small = rs.rand(max(1, h // 24), max(1, w // 24)).astype(np.float32)
+            dirt = np.asarray(
+                Image.fromarray((small * 255).astype(np.uint8)).resize(
+                    (w, h), Image.BILINEAR)).astype(np.float32) / 255.0
+            strength = (random.uniform(0.10, 0.30) if tier == "heavy"
+                        else random.uniform(0.05, 0.15))
+            fac = 1.0 - strength * dirt
+            m = cuzov | cargo
+            out[m] = out[m] * fac[m][..., None]
+
+        # 4) Разнофракционный груз: цветные вкрапления (бетон/металл/цветные).
+        if cargo.any():
+            ys, xs = np.where(cargo)
+            ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(ov)
+            n = random.randint(20, 80) if tier == "heavy" else random.randint(8, 30)
+            palette = [(150, 150, 145), (120, 120, 125), (80, 80, 85),
+                       (60, 60, 60),                       # бетон/металл
+                       (170, 120, 80), (200, 80, 60),
+                       (90, 140, 90), (70, 90, 150)]        # цветные обломки
+            for _ in range(n):
+                i = random.randrange(xs.size)
+                cx, cy = int(xs[i]), int(ys[i])
+                r = random.randint(2, 7)
+                col = random.choice(palette)
+                a = random.randint(90, 200)
+                d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col + (a,))
+            sp = np.asarray(ov).astype(np.float32)
+            a = (sp[..., 3] / 255.0) * cargo
+            for c in range(3):
+                out[..., c] = out[..., c] * (1 - a) + sp[..., c] * a
+
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def _apply_shadow_band(self, img_final, mask_final):
+        """Затемнить диагональную полосу, рассекающую передний план ~пополам.
+
+        Только цветной кадр (linear-light умножение), GT не трогается. Полоса
+        центрируется по bbox переднего плана; угол/ширина/мягкость/сила —
+        случайные, чтобы кадры были разными.
+        """
+        try:
+            import numpy as np
+            from PIL import Image
+        except Exception:
+            return None
+        try:
+            img_arr = np.asarray(self._pnm_to_pil(img_final)).astype(np.float32)
+            mask_arr = np.asarray(self._pnm_to_pil(mask_final))
+            keep, _ = self._keep_mask_from_array(mask_arr)
+            ys, xs = np.where(keep)
+            if xs.size < 64:
+                return None  # переднего плана почти нет — тень некуда класть
+
+            cx = float(xs.mean())
+            cy = float(ys.mean())
+            h, w = img_arr.shape[:2]
+
+            # Направление нормали к полосе (угол полосы — случайный).
+            ang = random.uniform(0.0, math.pi)
+            nx, ny = math.cos(ang), math.sin(ang)
+
+            # Расстояние каждого пикселя от линии через (cx, cy).
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            dist = (xx - cx) * nx + (yy - cy) * ny
+
+            # Мягкий переход тень/свет. half — половина ширины перехода.
+            fg_extent = max(xs.ptp(), ys.ptp(), 1)
+            half = fg_extent * random.uniform(0.06, 0.18)
+            darkness = random.uniform(0.35, 0.6)   # во сколько раз темнее
+            # Полоса тени с одной стороны линии; плавный край через tanh.
+            t = np.tanh(dist / max(half, 1.0))      # -1..1
+            shade = 1.0 - (1.0 - darkness) * (0.5 * (1.0 + t))  # затемн. сторона
+
+            lin = np.power(img_arr / 255.0, 2.2)
+            lin *= shade[..., None]
+            out = np.power(np.clip(lin, 0.0, 1.0), 1.0 / 2.2) * 255.0
+            return self._pil_to_pnm(
+                Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)))
+        except Exception as exc:
+            print(f"[Render] ошибка теневой полосы: {exc}")
+            return None
+
     def _match_color_temperature(self, img_arr, keep, bg_arr,
                                  strength=0.85, gain_min=0.6, gain_max=1.7):
         """Подогнать цветовую температуру переднего плана под фон.
@@ -324,7 +650,8 @@ class RendererUtils:
     
     def _process_render_image(self, img, depthImg=None, camera_fov_x=None, camera_fov_y=None, output_dir="renders",
                          filename_prefix="render", metadata=None, dataset_type="depth",
-                         seg_mask=None, bg_path=None):
+                         seg_mask=None, bg_path=None, gemini_processor=None,
+                         shadow_band=False):
         # dataset_type: "depth" — depthImg это карта глубины (суффикс _depth);
         #               "segmentation" — depthImg это маска сегментации
         #               (суффикс _seg, масштабирование ближайшим соседом,
@@ -435,22 +762,55 @@ class RendererUtils:
         img_cropped = self.crop_image(img_distorted, left=crop_left, top=crop_top, right=crop_right, bottom=crop_bottom)
         img_final = self.stretch_to_1920x1080(img_cropped)
 
-        # Замена фона случайной картинкой — ТОЛЬКО на цветном кадре и уже
-        # после дисторсии. Маску гоним через те же дисторсию/кроп/растяжение,
-        # затем оставляем кузов+груз, остальное заливаем картинкой.
-        background_name = None
-        if bg_path is not None and seg_mask is not None:
+        # Маску сегментации (если передана) прогоняем через те же
+        # дисторсию/кроп/растяжение — она нужна для: (а) замены фона случайной
+        # картинкой, (б) Gemini-постобработки (матирование силуэта), (в)
+        # теневой полосы. mask_final попиксельно совпадает с img_final.
+        mask_final = None
+        if seg_mask is not None:
             mask_distorted = self.barrel_distortion(seg_mask, k1=k1, k2=k2)
             mask_cropped = self.crop_image(
                 mask_distorted, left=crop_left, top=crop_top,
                 right=crop_right, bottom=crop_bottom,
             )
             mask_final = self.stretch_to_1920x1080(mask_cropped, nearest=True)
+
+        # Замена фона случайной картинкой — ТОЛЬКО на цветном кадре и уже
+        # после дисторсии. Оставляем кузов+груз, остальное заливаем картинкой.
+        background_name = None
+        gemini_meta = None
+        openai_active = (gemini_processor is not None
+                         and hasattr(gemini_processor, "edit_whole"))
+        if openai_active:
+            # OpenAI: редактируем ВЕСЬ кадр одним запросом (без маски и без
+            # матирования — силуэт может слегка сместиться, GT не строгий).
+            # Тень «пополам» (shadow_band) добавляется через промпт.
+            edited, gemini_meta = self._apply_openai(
+                img_final, gemini_processor, shadow_band=shadow_band)
+            if edited is not None:
+                img_final = edited
+                background_name = "openai"
+        elif gemini_processor is not None and mask_final is not None:
+            # Gemini-постобработка: новый фон + выветривание переднего плана.
+            # Силуэт GT сохраняется жёстким матированием по mask_final.
+            composited, gemini_meta = self._apply_gemini(
+                img_final, mask_final, gemini_processor)
+            if composited is not None:
+                img_final = composited
+                background_name = "gemini"
+        elif bg_path is not None and mask_final is not None:
             composited = self._composite_random_background(
                 img_final, mask_final, bg_path)
             if composited is not None:
                 img_final = composited
                 background_name = os.path.basename(bg_path)
+
+        # Теневая полоса «рассекает пополам» кузов+груз (только цветной кадр,
+        # GT не трогается). Для OpenAI тень уже в промпте — локальную не даём.
+        if shadow_band and mask_final is not None and not openai_active:
+            shadowed = self._apply_shadow_band(img_final, mask_final)
+            if shadowed is not None:
+                img_final = shadowed
 
         # Те же самые искажения применяем ко второму кадру (карта глубины
         # ИЛИ маска сегментации), чтобы он попиксельно совпадал с цветным.
@@ -593,6 +953,9 @@ class RendererUtils:
         # Тип датасета (depth / segmentation) + легенда цветов для масок.
         render_metadata["dataset_type"] = dataset_type
         render_metadata["random_background"] = background_name
+        render_metadata["shadow_band"] = bool(shadow_band)
+        if gemini_meta:
+            render_metadata["gemini"] = gemini_meta
         render_metadata["second_image"] = (
             os.path.basename(output_path_depth) if depth_final is not None else None
         )
@@ -724,11 +1087,30 @@ class RendererUtils:
         for _ in range(max(1, int(ticks))):
             self.panda_app.graphicsEngine.renderFrame()
 
+    def _get_gemini_processor(self):
+        """Ленивое создание процессора постобработки (провайдер из config).
+        None, если недоступен (нет ключа/токена, отключён и т.п.)."""
+        proc = getattr(self, "_gemini_processor", None)
+        if proc is None:
+            try:
+                from src.rendering.gemini_postprocess import get_image_processor
+                proc = get_image_processor()
+                self._gemini_processor = proc
+            except Exception as exc:
+                print(f"[Postprocess] инициализация не удалась: {exc}")
+                self._gemini_processor = False   # помечаем, чтобы не пытаться
+                return None
+        if proc is False:
+            return None
+        return proc if proc.available() else None
+
     def save_single_render(self, output_dir="renders/single",
                            filename_prefix="single_render",
                            extra_metadata=None,
                            dataset_type="depth",
-                           random_background=False):
+                           random_background=False,
+                           gemini=False,
+                           shadow_band=False):
         # dataset_type: "depth" (снимок + карта глубины, как раньше) или
         # "segmentation" (снимок + маска сегментации). Цветной кадр снимается
         # одинаково; меняется только второй кадр.
@@ -762,14 +1144,28 @@ class RendererUtils:
             self.panda_app.depth_renderer.set_overlay_visibility(False)
             return False
 
-        # Маска сегментации для вырезания переднего плана (только при замене
-        # фона). Снимается всегда отдельно — это один дешёвый GPU-кадр.
+        # Gemini доступен? (нужно знать заранее — от этого зависит, снимать ли
+        # маску сегментации). Недоступность => тихий откат.
+        gemini_processor = self._get_gemini_processor() if gemini else None
+
+        # Маска сегментации для вырезания переднего плана. Нужна при замене
+        # фона, Gemini-постобработке и теневой полосе. Снимается отдельно —
+        # это один дешёвый GPU-кадр.
+        # OpenAI редактирует весь кадр и маску не использует (тень тоже через
+        # промпт) — снимаем маску только для замены фона / матирования /
+        # локальной теневой полосы у НЕ-OpenAI провайдеров.
+        openai_active = (
+            gemini_processor is not None
+            and hasattr(gemini_processor, "edit_whole"))
+        gemini_needs_mask = gemini_processor is not None and not openai_active
+        need_mask = random_background or gemini_needs_mask or (
+            shadow_band and not openai_active)
         seg_mask_raw = None
-        if random_background:
+        if need_mask:
             seg_mask_raw = self.panda_app.segmentation_renderer.capture()
             if seg_mask_raw is None:
-                print("[Render] seg mask for background replace failed; "
-                      "сохраняю без замены фона.")
+                print("[Render] seg mask capture failed; "
+                      "сохраняю без замены фона/Gemini/тени.")
 
         if is_segmentation:
             # Маска сегментации рендерится в отдельный offscreen-буфер
@@ -804,10 +1200,14 @@ class RendererUtils:
         bg_path = None
         if seg_mask_raw is not None:
             seg_mask_1080 = self.stretch_to_1920x1080(seg_mask_raw, nearest=True)
-            bg_path = self._pick_random_background()
-            if bg_path is None:
-                print("[Render] assets/backgrounds пуста — замена фона пропущена.")
-                seg_mask_1080 = None
+            # bg_path нужен только для «случайного фона из файлов». При Gemini
+            # фон генерируется процессором, файл не нужен. Маска остаётся
+            # (её используют Gemini-матирование и теневая полоса).
+            if random_background and gemini_processor is None:
+                bg_path = self._pick_random_background()
+                if bg_path is None:
+                    print("[Render] assets/backgrounds пуста — "
+                          "замена фона пропущена.")
 
         # Клиентский пересчёт объёма реально сгенерированного меша
         # наполнения (в старой версии писался как actual_volume).
@@ -855,6 +1255,8 @@ class RendererUtils:
             dataset_type=dataset_type,
             seg_mask=seg_mask_1080,
             bg_path=bg_path,
+            gemini_processor=gemini_processor,
+            shadow_band=shadow_band,
         )
 
         return True

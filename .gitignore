@@ -19,5 +19,11 @@ config/graphics.json
 # Переменные окружения (секреты, ключи API)
 .env
 
+# Ключ Google Gemini (постобработка датасета). Пример — config/gemini.example.json
+config/gemini.json
+
+# Кэш сгенерированных Gemini фонов
+assets/backgrounds/_gemini_cache/
+
 /renders
 config/tls_config.yaml

@@ -544,6 +544,8 @@ class MainWindow(QMainWindow):
             self.cmb_dataset_type = _QCB2()
             self.cmb_dataset_type.addItem("Глубина", "depth")
             self.cmb_dataset_type.addItem("Сегментация", "segmentation")
+            self.cmb_dataset_type.addItem(
+                "Сегментация (случайная)", "segmentation_random")
             self.cmb_dataset_type.setCurrentIndex(0)
             self.cmb_dataset_type.setFixedHeight(22)
             self.cmb_dataset_type.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -589,6 +591,32 @@ class MainWindow(QMainWindow):
                 "  background: #00FF88; }"
             )
 
+            # Gemini-постобработка: новый фон + выветривание кузова/груза
+            # (ржавчина, вмятины, кабели, разнофракционный груз). Силуэт
+            # переднего плана сохраняется (GT совпадает). Требует ключ в
+            # config/gemini.json.
+            self.chk_gemini = _QCk2("ИИ-обработка")
+            self.chk_gemini.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.chk_gemini.setToolTip(
+                "Постобработка кадра через Google Gemini: генерируется новый "
+                "фон и выветривается поверхность кузова и груза (ржавчина, "
+                "вмятины, кабели, разнофракционный груз). Силуэт переднего "
+                "плана строго сохраняется, поэтому карта глубины/маска "
+                "(ground truth) остаются точными.\n"
+                "Нужен API-ключ в config/gemini.json (или env GEMINI_API_KEY)."
+            )
+            self.chk_gemini.setStyleSheet(
+                f"QCheckBox {{ color: {_RCT}; font-size: 10px;"
+                f" letter-spacing: 0.3px; background: transparent; }}"
+                "QCheckBox::indicator { width: 12px; height: 12px; }"
+                "QCheckBox::indicator:unchecked {"
+                f"  border: 1px solid {_RCH}; border-radius: 3px;"
+                "  background: rgba(255,255,255,4); }"
+                "QCheckBox::indicator:checked {"
+                "  border: 1px solid #00FF88; border-radius: 3px;"
+                "  background: #00FF88; }"
+            )
+
             self.btn_save_render = _QPB2("Сохранить")
             self.btn_save_render.setCursor(Qt.CursorShape.PointingHandCursor)
             self.btn_save_render.setFixedHeight(22)
@@ -622,8 +650,9 @@ class MainWindow(QMainWindow):
             sh_row1.addWidget(self.spn_render_count, 0, Qt.AlignmentFlag.AlignVCenter)
             sh_row1.addWidget(self.cmb_dataset_type, 1, Qt.AlignmentFlag.AlignVCenter)
 
-            # Строка 2: случайный фон + кнопка сохранения.
+            # Строка 2: случайный фон + Gemini + кнопка сохранения.
             sh_row2.addWidget(self.chk_random_bg, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_row2.addWidget(self.chk_gemini, 0, Qt.AlignmentFlag.AlignVCenter)
             sh_row2.addStretch(1)
             sh_row2.addWidget(self.btn_save_render, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -2751,7 +2780,8 @@ class MainWindow(QMainWindow):
             count = 1
         count = max(1, count)
 
-        # Тип датасета из выпадающего списка: "depth" или "segmentation".
+        # Тип датасета из выпадающего списка: "depth", "segmentation" или
+        # "segmentation_random".
         dataset_type = "depth"
         cmb = getattr(self, "cmb_dataset_type", None)
         if cmb is not None:
@@ -2759,10 +2789,20 @@ class MainWindow(QMainWindow):
             if data:
                 dataset_type = str(data)
 
-        # Замена фона случайной картинкой (assets/backgrounds). В этом режиме
-        # НЕ генерируем вариации с разным временем суток.
+        # "segmentation_random" — это сегментационный датасет, но каждый кадр —
+        # полностью новая сцена: новое случайное наполнение случайного объёма
+        # (0..max), случайная поза камеры (в текущих рамках) и всегда полдень
+        # (солнце вертикально сверху). Для сохранения это обычная сегментация.
+        is_random_seg = (dataset_type == "segmentation_random")
+        render_dataset_type = "segmentation" if is_random_seg else dataset_type
+
+        # Замена фона случайной картинкой (assets/backgrounds).
         chk_bg = getattr(self, "chk_random_bg", None)
         random_background = bool(chk_bg.isChecked()) if chk_bg is not None else False
+
+        # Gemini-постобработка (новый фон + выветривание кузова/груза).
+        chk_gem = getattr(self, "chk_gemini", None)
+        gemini = bool(chk_gem.isChecked()) if chk_gem is not None else False
 
         # Resolve current model + texture from the right panel and pull
         # max_volume from the model's YAML config.
@@ -2819,7 +2859,35 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 print(f"[SaveRender] daytime set failed: {exc}")
 
+        # Три типа освещения (по ТЗ): день, сумерки, «тень рассекает пополам».
+        # Внутри day/dusk время слегка рандомится для разнообразия. shadow
+        # использует дневной свет + постобработочную теневую полосу (флаг
+        # shadow_band в renderer_utils, ставится по маске переднего плана).
+        def _daytime_for(mode: str) -> int:
+            if mode == "dusk":
+                # сумерки: утренние либо вечерние
+                return random.choice([
+                    random.randint(300, 375),      # 05:00–06:15
+                    random.randint(1170, 1275),     # 19:30–21:15
+                ])
+            # day и shadow — дневной свет
+            return random.randint(600, 960)         # 10:00–16:00
+
         try:
+            if is_random_seg:
+                self._run_random_seg_dataset(
+                    count=count,
+                    max_volume=max_volume,
+                    model_key=model_key,
+                    texture_key=texture_key,
+                    random_background=random_background,
+                    gemini=gemini,
+                    base_daytime_mins=base_daytime_mins,
+                    set_daytime=_set_daytime,
+                    render_dataset_type=render_dataset_type,
+                    ru=ru,
+                )
+                return
             for i in range(count):
                 # Target ramp: step = max_volume/N, target = step*(i+1).
                 # Чем больше N (текущий индекс), тем больше объём
@@ -2862,28 +2930,26 @@ class MainWindow(QMainWindow):
                               float(base_hpr.y),
                               float(base_hpr.z))
 
-                # 10 равномерно распределённых временных меток
-                # (0:00, 2:24, ... 21:36).
-                tod_list = [int(round(k * 1440.0 / 10.0)) for k in range(10)]
-
-                # Один "альтернативный" момент времени, гарантированно
-                # отличающийся от базового хотя бы на 2 часа.
-                far_choices = [
-                    t for t in range(0, 1440, 30)
-                    if abs(t - base_daytime_mins) >= 120
-                ]
-                alt_time = random.choice(far_choices) if far_choices else 0
-
                 # 5 см → 0.05 единицы Panda (проект работает в метрах).
                 OFFSET_M = 0.05
                 ANG_DEG = 10.0
 
-                # Вариации с разным временем суток генерируются всегда (в т.ч.
-                # при случайном фоне — там яркость фоновой картинки
-                # подгоняется под яркость рендера кузова, см. renderer_utils).
+                # Три типа освещения по ТЗ. "light" в params задаёт режим;
+                # renderer получает shadow_band=True для режима "shadow".
+                LIGHTS = ("day", "dusk", "shadow")
+
+                # Три «эталонных» кадра при базовой позе — по одному на каждый
+                # тип освещения, чтобы все три были представлены.
                 variants: list[tuple[str, dict]] = [
-                    ("orig",          {}),
-                    ("light_alt",     {"time": alt_time}),
+                    ("day_orig",    {"light": "day"}),
+                    ("dusk_orig",   {"light": "dusk"}),
+                    ("shadow_orig", {"light": "shadow"}),
+                ]
+
+                # Позные вариации (геометрия — ценна для обучения). Каждой
+                # присваиваем один из 3 типов освещения по кругу, чтобы не
+                # раздувать число кадров (важно для квоты Gemini).
+                pose_defs = [
                     ("h_plus10",      {"dh":  +ANG_DEG}),
                     ("h_minus10",     {"dh":  -ANG_DEG}),
                     ("p_plus10",      {"dp":  +ANG_DEG}),
@@ -2892,19 +2958,17 @@ class MainWindow(QMainWindow):
                     ("lat_minus5cm",  {"lat": -OFFSET_M}),
                     ("vert_plus5cm",  {"vert": +OFFSET_M}),
                     ("vert_minus5cm", {"vert": -OFFSET_M}),
-                ]
-                for t in tod_list:
-                    variants.append((f"tod_{t:04d}m", {"time": t}))
-                variants.append((
-                    "random_combined",
-                    {
+                    ("random_combined", {
                         "dh":   random.uniform(-ANG_DEG,  ANG_DEG),
                         "dp":   random.uniform(-ANG_DEG,  ANG_DEG),
                         "lat":  random.uniform(-OFFSET_M, OFFSET_M),
                         "vert": random.uniform(-OFFSET_M, OFFSET_M),
-                        "time": random.randint(0, 1439),
-                    },
-                ))
+                    }),
+                ]
+                for k, (pname, pp) in enumerate(pose_defs):
+                    pp = dict(pp)
+                    pp["light"] = LIGHTS[k % len(LIGHTS)]
+                    variants.append((pname, pp))
 
                 for v_idx, (v_name, p) in enumerate(variants):
                     # 1) Восстанавливаем базовую позу
@@ -2929,12 +2993,11 @@ class MainWindow(QMainWindow):
                     if lat or vert:
                         cam.setPos(cam, lat, 0.0, vert)
 
-                    # 4) Время суток
-                    t_val = p.get("time", None)
-                    if t_val is None:
-                        _set_daytime(base_daytime_mins)
-                    else:
-                        _set_daytime(int(t_val))
+                    # 4) Освещение: один из 3 типов (day/dusk/shadow).
+                    light_mode = str(p.get("light", "day"))
+                    shadow_band = (light_mode == "shadow")
+                    applied_time = _daytime_for(light_mode)
+                    _set_daytime(applied_time)
 
                     # Дать UI/Panda обработать setPos/setHpr и обновлённое
                     # освещение перед тем как звать save_single_render
@@ -2949,14 +3012,13 @@ class MainWindow(QMainWindow):
                     )
                     QApplication.processEvents()
 
-                    applied_time = (
-                        int(t_val) if t_val is not None
-                        else int(base_daytime_mins)
-                    )
                     extra_meta = {
                         "render_type": "dataset",
                         "dataset_type": dataset_type,
                         "random_background": random_background,
+                        "gemini": gemini,
+                        "light_mode": light_mode,
+                        "shadow_band": shadow_band,
                         "iteration": i,
                         "iteration_total": count,
                         "variant": v_name,
@@ -2997,6 +3059,8 @@ class MainWindow(QMainWindow):
                             extra_metadata=extra_meta,
                             dataset_type=dataset_type,
                             random_background=random_background,
+                            gemini=gemini,
+                            shadow_band=shadow_band,
                         )
                         if ok:
                             ok_count += 1
@@ -3027,6 +3091,147 @@ class MainWindow(QMainWindow):
             self.btn_save_render.setEnabled(True)
         print(f"[SaveRender] saved {ok_count} render(s) across "
               f"{count} iteration(s); max_volume={max_volume}")
+
+    def _run_random_seg_dataset(self, *, count, max_volume, model_key,
+                                texture_key, random_background, gemini,
+                                base_daytime_mins, set_daytime,
+                                render_dataset_type, ru) -> None:
+        """Датасет сегментации со случайными кадрами.
+
+        Каждый снимок — полностью новая сцена: новое случайное наполнение
+        случайного объёма (0..max_volume), случайная поза камеры в текущих
+        рамках (± ANG_DEG по heading/pitch, ± OFFSET_M по горизонтали/
+        вертикали) и всегда полдень — солнце вертикально сверху (никаких
+        ночных/сумеречных кадров, никакой теневой полосы). Маска сегментации
+        и json сохраняются как в обычном сегментационном датасете.
+        """
+        from PyQt6.QtWidgets import QApplication
+
+        # Полдень: солнце в зените (вертикально сверху).
+        NOON = 12 * 60
+        # Те же рамки, что и у обычного датасета.
+        OFFSET_M = 0.05
+        ANG_DEG = 10.0
+
+        rp = getattr(self, "right_panel", None)
+        ok_count = 0
+
+        for i in range(count):
+            # Случайный объём наполнения от нуля до максимума.
+            if max_volume is not None:
+                target = random.uniform(0.0, float(max_volume))
+            else:
+                target = float(rp.current_target_volume()) if rp else 0.0
+
+            self.btn_save_render.setText(f"{i+1}/{count}")
+            QApplication.processEvents()
+
+            # Новое наполнение для этой итерации.
+            try:
+                self._on_run_simulation({
+                    "model_key":     model_key,
+                    "texture_key":   texture_key,
+                    "target_volume": float(target),
+                })
+            except Exception as exc:
+                print(f"[SaveRender/rand] pipeline {i+1} failed: {exc}")
+                QApplication.processEvents()
+                continue
+
+            # Дать финальным кадрам пайплайна отрисоваться.
+            for _ in range(4):
+                QApplication.processEvents()
+                time.sleep(0.05)
+
+            cam = self.panda_app.camera
+            base_pos = cam.getPos()
+            base_hpr = cam.getHpr()
+            base_pos_t = (float(base_pos.x), float(base_pos.y),
+                          float(base_pos.z))
+            base_hpr_t = (float(base_hpr.x), float(base_hpr.y),
+                          float(base_hpr.z))
+
+            # Случайная поза камеры в текущих рамках.
+            dh = random.uniform(-ANG_DEG, ANG_DEG)
+            dp = random.uniform(-ANG_DEG, ANG_DEG)
+            lat = random.uniform(-OFFSET_M, OFFSET_M)
+            vert = random.uniform(-OFFSET_M, OFFSET_M)
+
+            cam.setPos(*base_pos_t)
+            cam.setHpr(base_hpr_t[0] + dh, base_hpr_t[1] + dp, base_hpr_t[2])
+            cam.setPos(cam, lat, 0.0, vert)
+
+            # Всегда полдень — солнце вертикально сверху.
+            set_daytime(NOON)
+
+            # Дать Panda обработать позу/освещение перед снимком.
+            for _ in range(3):
+                QApplication.processEvents()
+                time.sleep(0.05)
+
+            self.btn_save_render.setText(f"{i+1}/{count}")
+            QApplication.processEvents()
+
+            variant_params = {
+                "dh": dh, "dp": dp, "lat": lat, "vert": vert,
+                "light": "day",
+            }
+            extra_meta = {
+                "render_type": "dataset",
+                "dataset_type": render_dataset_type,
+                "dataset_mode": "segmentation_random",
+                "random_background": random_background,
+                "gemini": gemini,
+                "light_mode": "day",
+                "shadow_band": False,
+                "iteration": i,
+                "iteration_total": count,
+                "variant": "random",
+                "variant_index": 0,
+                "variant_params": variant_params,
+                "camera_mode": getattr(self, "_camera_mode", None),
+                "base_camera_position": {
+                    "x": base_pos_t[0], "y": base_pos_t[1], "z": base_pos_t[2],
+                },
+                "base_camera_rotation": {
+                    "h": base_hpr_t[0], "p": base_hpr_t[1], "r": base_hpr_t[2],
+                },
+                "base_daytime_minutes": int(base_daytime_mins),
+                "applied_daytime_minutes": NOON,
+                "target_volume": float(target),
+                "model_key":   model_key,
+                "texture_key": texture_key,
+            }
+
+            prefix = f"r{i:04d}_vol{target:07.2f}_random"
+            out_dir = "renders/dataset_segmentation_random"
+            try:
+                ok = ru.save_single_render(
+                    output_dir=out_dir,
+                    filename_prefix=prefix,
+                    extra_metadata=extra_meta,
+                    dataset_type=render_dataset_type,
+                    random_background=random_background,
+                    gemini=gemini,
+                    shadow_band=False,
+                )
+                if ok:
+                    ok_count += 1
+                    print(f"[SaveRender/rand] {i+1}/{count} "
+                          f"target={target:.2f} saved")
+                else:
+                    print(f"[SaveRender/rand] {i+1}/{count} returned False")
+            except Exception as exc:
+                print(f"[SaveRender/rand] {i+1}/{count} save failed: {exc}")
+
+            # Вернуть базовую позу для следующей итерации.
+            cam.setPos(*base_pos_t)
+            cam.setHpr(*base_hpr_t)
+            QApplication.processEvents()
+
+        set_daytime(base_daytime_mins)
+        print(f"[SaveRender/rand] saved {ok_count} random-seg render(s) "
+              f"across {count} iteration(s); max_volume={max_volume}")
 
     def _update_telemetry(self) -> None:
         if self.panda_app is None:
