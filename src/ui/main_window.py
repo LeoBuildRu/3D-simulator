@@ -2859,6 +2859,25 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 print(f"[SaveRender] daytime set failed: {exc}")
 
+        # На время съёмки датасета ОСТАНАВЛИВАЕМ Qt-таймеры, которые сами
+        # крутят taskMgr.step()/рендер. Иначе наши ручные settle/step внутри
+        # цикла пересекаются с тиком _panda_timer (через QApplication.
+        # processEvents) — Panda ругается «Ignoring recursive poll() within
+        # another task», часть шагов ИГНОРИРУЕТСЯ, счётчик кадров сбивается, и
+        # цветной снимок рассинхронизируется с маской (лаг на целую итерацию:
+        # «маска 1 = цвет 2», «4 наполнения на 3 кадра»). Дальше весь рендер
+        # гоним вручную (settle_render / _settle_wait), таймеры возвращаем в
+        # finally.
+        _paused_timers = []
+        for _tname in ("_panda_timer", "_depth_timer", "_telemetry_timer"):
+            _t = getattr(self, _tname, None)
+            try:
+                if _t is not None and _t.isActive():
+                    _t.stop()
+                    _paused_timers.append(_t)
+            except Exception:
+                pass
+
         # Три типа освещения (по ТЗ): день, сумерки, «тень рассекает пополам».
         # Внутри day/dusk время слегка рандомится для разнообразия. shadow
         # использует дневной свет + постобработочную теневую полосу (флаг
@@ -3081,6 +3100,13 @@ class MainWindow(QMainWindow):
                 cam.setHpr(*base_hpr_t)
                 _set_daytime(base_daytime_mins)
         finally:
+            # Вернуть Qt-таймеры (taskMgr.step/рендер/телеметрия) — .start()
+            # без аргумента повторно использует прежний интервал.
+            for _t in _paused_timers:
+                try:
+                    _t.start()
+                except Exception:
+                    pass
             # Вернуть fly_cam в его прежнее состояние.
             if fc is not None and hasattr(fc, "set_frozen") and prev_frozen is not None:
                 try:
@@ -3112,6 +3138,29 @@ class MainWindow(QMainWindow):
         # Те же рамки, что и у обычного датасета.
         OFFSET_M = 0.05
         ANG_DEG = 10.0
+        # Ожидание после генерации ландшафта и перед снятием рендера: ждём
+        # по ОБОИМ условиям — не меньше WAIT_FRAMES реальных кадров пайплайна
+        # И не меньше WAIT_SECONDS секунд. Свежий меш наполнения + его 8K-
+        # текстуры доезжают до GPU лениво; голый time.sleep НЕ гонит кадры
+        # (он лишь блокирует QTimer, который и делает taskMgr.step), поэтому
+        # ждём именно кадрами, а секунды — запас для медленной загрузки.
+        WAIT_FRAMES = 60
+        WAIT_SECONDS = 1.0
+
+        def _settle_wait(frames=WAIT_FRAMES, seconds=WAIT_SECONDS):
+            tm = getattr(self.panda_app, "taskMgr", None)
+            start = time.perf_counter()
+            n = 0
+            while True:
+                if tm is not None:
+                    tm.step()                       # реальный кадр пайплайна
+                else:
+                    self.panda_app.graphicsEngine.renderFrame()
+                n += 1
+                QApplication.processEvents()
+                if n >= frames and (time.perf_counter() - start) >= seconds:
+                    break
+                time.sleep(0.005)                   # мягкая пауза, без простоя
 
         rp = getattr(self, "right_panel", None)
         ok_count = 0
@@ -3138,10 +3187,9 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
                 continue
 
-            # Дать финальным кадрам пайплайна отрисоваться.
-            for _ in range(4):
-                QApplication.processEvents()
-                time.sleep(0.05)
+            # Дать финальным кадрам пайплайна отрисоваться (свежий меш +
+            # текстуры доезжают до GPU): ждём 60 кадров И ≥1 c.
+            _settle_wait()
 
             cam = self.panda_app.camera
             base_pos = cam.getPos()
@@ -3164,10 +3212,9 @@ class MainWindow(QMainWindow):
             # Всегда полдень — солнце вертикально сверху.
             set_daytime(NOON)
 
-            # Дать Panda обработать позу/освещение перед снимком.
-            for _ in range(3):
-                QApplication.processEvents()
-                time.sleep(0.05)
+            # Дать Panda обработать новую позу/освещение перед снимком:
+            # снова ждём 60 кадров И ≥1 c (PSSM/TAA сходятся, ресурсы на GPU).
+            _settle_wait()
 
             self.btn_save_render.setText(f"{i+1}/{count}")
             QApplication.processEvents()

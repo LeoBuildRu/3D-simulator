@@ -1,0 +1,12 @@
+{
+  "_comment": "Скопируйте в config/higgsfield.json (он в .gitignore — реальные ключи только туда). Ключи: cloud.higgsfield.ai -> раздел API -> Create key (пара key + secret). endpoint = id img2img-модели: проверено, что работают reve/edit и higgsfield-ai/soul/reference. Seedream через публичный API НЕ доступен (только в веб-приложении). image_param — имя поля с входной картинкой (у Higgsfield это image_url). resolution/aspect_ratio — необязательны; reve/edit их игнорирует, задавать не обязательно.",
+
+  "api_key": "",
+  "api_secret": "",
+
+  "endpoint": "reve/edit",
+  "image_param": "image_url",
+  "prompt": "photorealistic industrial photo, keep composition and objects, add realistic weathering, dirt, rust, natural daylight, high detail",
+
+  "timeout": 180
+}

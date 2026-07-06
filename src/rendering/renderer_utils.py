@@ -1150,6 +1150,28 @@ class RendererUtils:
         else:
             camera_fov_x = camera_fov_y = None
 
+        # Свежесгенерированный меш наполнения (final_model) и его 8K-текстуры
+        # грузятся на GPU ЛЕНИВО — RenderPipeline подгружает их в течение
+        # нескольких кадров draw'а. Если цветной снимок снять раньше, чем
+        # ресурсы доехали до GPU, пайплайн рисует ПУСТОЙ кузов (без груза).
+        # Камера сегментации к этому иммунна: у неё свой заранее собранный
+        # плоский шейдер и НЕТ текстур — поэтому маска всегда корректна, а
+        # цветной кадр иногда пустой (и потом обрезается по правильной маске).
+        # Форсируем подготовку ресурсов геометрии на GSG ДО снятия кадра —
+        # prepare_scene ставит в очередь ВСЕ текстуры/шейдеры/вершины разом
+        # (без пофреймового троттлинга), так что последующие settle-кадры
+        # гарантированно их дозагружают. Идемпотентно и дёшево, если ресурс
+        # уже на GPU.
+        try:
+            win = getattr(self.panda_app, "win", None)
+            gsg = win.get_gsg() if win is not None else None
+            final_model = getattr(self.panda_app, "final_model", None)
+            if (gsg is not None and final_model is not None
+                    and not final_model.is_empty()):
+                final_model.prepare_scene(gsg)
+        except Exception as exc:
+            print(f"[Render] prepare_scene(final_model) failed: {exc}")
+
         # Скрываем depth overlay и даём пайплайну устаканиться РЕАЛЬНЫМИ
         # кадрами (taskMgr.step), чтобы PSSM перестроил каскадные тени под
         # новую позу камеры/солнца, а motion blur / TAA сошлись. Иначе на
@@ -1157,10 +1179,43 @@ class RendererUtils:
         self.panda_app.depth_renderer.set_overlay_visibility(False)
         self.settle_render(frames=30)
 
+        # ЯВНО прогоняем graphicsEngine.render_frame() прямо перед чтением —
+        # тот же приём, что делает SegmentationRenderer.capture() (и почему
+        # маска всегда корректна). Через taskMgr.step() главное окно рисуется
+        # в двойной буфер, и win.getScreenshot() иногда читает НЕ тот буфер —
+        # возвращается «замороженный» кадр (пустой кузов, дефолтная поза),
+        # хотя камера уже сдвинута. Пара явных кадров гарантирует, что в
+        # читаемом буфере лежит ТЕКУЩАЯ поза. render_frame() рисует и делает
+        # flip обоих буферов, поэтому двух вызовов достаточно и для
+        # double-buffered окна.
+        self.panda_app.graphicsEngine.render_frame()
+        self.panda_app.graphicsEngine.render_frame()
+
         img = PNMImage()
         if not self.panda_app.win.getScreenshot(img):
             self.panda_app.depth_renderer.set_overlay_visibility(False)
             return False
+
+        # --- ДИАГНОСТИКА (временно): подтверждаем гипотезу «замороженного»
+        # цветного кадра. Печатаем позу камеры + пару пикселей снятого кадра.
+        # Если поза камеры МЕНЯЕТСЯ от кадра к кадру, а пиксели/сумма НЕ
+        # меняются — значит win.getScreenshot() читает застывший буфер, и
+        # проблема в чтении онскрин-окна, а не в рендере/ожидании.
+        try:
+            cam = self.panda_app.camera
+            w, h = img.get_x_size(), img.get_y_size()
+            xs = [w // 4, w // 2, (3 * w) // 4]
+            ys = [h // 4, h // 2, (3 * h) // 4]
+            checksum = 0.0
+            for yy in ys:
+                for xx in xs:
+                    c = img.get_xel(xx, yy)
+                    checksum += c[0] + c[1] + c[2]
+            print(f"[Render/DIAG] cam pos=({cam.getX():.2f},{cam.getY():.2f},"
+                  f"{cam.getZ():.2f}) hpr=({cam.getH():.1f},{cam.getP():.1f},"
+                  f"{cam.getR():.1f}) img={w}x{h} pix_checksum={checksum:.4f}")
+        except Exception as _diag_exc:
+            print(f"[Render/DIAG] diag failed: {_diag_exc}")
 
         # Gemini доступен? (нужно знать заранее — от этого зависит, снимать ли
         # маску сегментации). Недоступность => тихий откат.
