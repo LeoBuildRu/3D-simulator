@@ -1132,6 +1132,36 @@ class RendererUtils:
         for _ in range(max(1, int(frames))):
             tm.step()
 
+    def _grab_window_screenshot(self, img, *, steps=2):
+        """Снять текущий кадр ОНСКРИН-окна БЕЗ рассинхрона на один кадр.
+
+        Критично: последней операцией перед win.getScreenshot() ДОЛЖЕН быть
+        РЕАЛЬНЫЙ кадр пайплайна (taskMgr.step), а НЕ голый
+        graphicsEngine.render_frame(). RenderPipeline выполняет всю
+        пофреймовую работу в ТАСКАХ (RP_UpdateManagers sort=10,
+        RP_Plugin_BeforeRender sort=12, RP_UpdateInputsAndStages sort=18):
+        именно там stage_mgr.update()/common_resources.update() обновляют
+        матрицы камеры и продвигают ping-pong индексы темпоральных стадий
+        (TAA и т.п.). igLoop (draw+flip) идёт ПОСЛЕ них (sort=50). Голый
+        render_frame() гоняет только draw+flip и НЕ выполняет эти таски —
+        поэтому окно перепрезентует УСТАРЕВШИЙ композит предыдущего реального
+        кадра. Это и есть «пустой кузов на первом кадре / сдвиг на один кадр
+        относительно предыдущего»: маска/глубина берутся из отдельной
+        offscreen-камеры (плоский шейдер, без стадий пайплайна) и всегда
+        актуальны, а цветной кадр застывал на итерацию назад.
+
+        Делаем несколько реальных шагов пайплайна (обновляют стадии + делают
+        flip с текущей позой/сценой), затем читаем передний буфер.
+        """
+        tm = getattr(self.panda_app, "taskMgr", None)
+        if tm is not None:
+            for _ in range(max(1, int(steps))):
+                tm.step()
+        else:
+            for _ in range(max(1, int(steps))):
+                self.panda_app.graphicsEngine.render_frame()
+        return self.panda_app.win.getScreenshot(img)
+
     def _get_gemini_processor(self):
         """Ленивое создание процессора постобработки (провайдер из config).
         None, если недоступен (нет ключа/токена, отключён и т.п.)."""
@@ -1207,23 +1237,23 @@ class RendererUtils:
         # кадрами (taskMgr.step), чтобы PSSM перестроил каскадные тени под
         # новую позу камеры/солнца, а motion blur / TAA сошлись. Иначе на
         # кадр иногда вылезает огромная ложная тень на полкадра.
+        self.settle_render(frames=30)
         self.panda_app.depth_renderer.set_overlay_visibility(False)
         self.settle_render(frames=30)
 
-        # ЯВНО прогоняем graphicsEngine.render_frame() прямо перед чтением —
-        # тот же приём, что делает SegmentationRenderer.capture() (и почему
-        # маска всегда корректна). Через taskMgr.step() главное окно рисуется
-        # в двойной буфер, и win.getScreenshot() иногда читает НЕ тот буфер —
-        # возвращается «замороженный» кадр (пустой кузов, дефолтная поза),
-        # хотя камера уже сдвинута. Пара явных кадров гарантирует, что в
-        # читаемом буфере лежит ТЕКУЩАЯ поза. render_frame() рисует и делает
-        # flip обоих буферов, поэтому двух вызовов достаточно и для
-        # double-buffered окна.
-        self.panda_app.graphicsEngine.render_frame()
-        self.panda_app.graphicsEngine.render_frame()
+        self.settle_render(frames=30)
 
+        # Читаем цветной кадр РЕАЛЬНЫМИ кадрами пайплайна (см.
+        # _grab_window_screenshot). Раньше здесь были два ГОЛЫХ
+        # graphicsEngine.render_frame() — они НЕ гоняют таски RenderPipeline
+        # (stage_mgr.update / common_resources.update), поэтому окно
+        # перепрезентовало устаревший композит на итерацию назад: цветной
+        # кадр «застревал» на пустом кузове / был сдвинут на один кадр
+        # относительно маски и глубины. taskMgr.step() обновляет стадии и
+        # делает flip с текущей позой/сценой — рассинхрон уходит.
         img = PNMImage()
-        if not self.panda_app.win.getScreenshot(img):
+        self.settle_render(frames=30)
+        if not self._grab_window_screenshot(img):
             self.panda_app.depth_renderer.set_overlay_visibility(False)
             return False
 
@@ -1306,10 +1336,8 @@ class RendererUtils:
                 except Exception as exc:
                     print(f"[Render] update_depth_texture failed: {exc}")
                 self.settle_render(frames=16)
-                self.panda_app.graphicsEngine.render_frame()
-                self.panda_app.graphicsEngine.render_frame()
                 depth_extra = PNMImage()
-                if not self.panda_app.win.getScreenshot(depth_extra):
+                if not self._grab_window_screenshot(depth_extra):
                     print("[Render] extra depth capture failed; "
                           "сохраняю только маску.")
                     depth_extra = None
@@ -1329,7 +1357,7 @@ class RendererUtils:
             self.settle_render(frames=16)
 
             depthImg = PNMImage()
-            if not self.panda_app.win.getScreenshot(depthImg):
+            if not self._grab_window_screenshot(depthImg):
                 dr.set_overlay_visibility(False)
                 if is_dataset and hasattr(dr, "set_grayscale"):
                     dr.set_grayscale(False)
