@@ -10,6 +10,8 @@ class DepthMapRenderer:
         self.max_depth = 100.0
         self.gradient_start = 0.2
         self.gradient_end = 0.4
+        # Ч/Б режим overlay — включается только на время съёмки датасетов.
+        self.grayscale = False
         self.depth_buffer = None
         self.depth_camera_np = None
         self.setup_depth_render()
@@ -25,6 +27,13 @@ class DepthMapRenderer:
         if self.overlay_node:
             self.overlay_node.setShaderInput("gradientEnd", value)
     
+    def set_grayscale(self, value):
+        """Ч/Б карта глубины (для датасетов) вместо радужного градиента."""
+        self.grayscale = bool(value)
+        if self.overlay_node:
+            self.overlay_node.setShaderInput(
+                "grayscale", 1.0 if self.grayscale else 0.0)
+
     def setup_depth_render(self):
         win_width = 1920
         win_height = 1080
@@ -107,6 +116,7 @@ class DepthMapRenderer:
         uniform float far;
         uniform float gradientStart;
         uniform float gradientEnd;
+        uniform float grayscale;
         in vec2 texcoord;
         out vec4 fragColor;
 
@@ -120,6 +130,14 @@ class DepthMapRenderer:
             float normalized_depth = (linear_depth - gradientStart) / (gradientEnd - gradientStart);
             normalized_depth = clamp(normalized_depth, 0.0, 1.0);
             float t = 1.0 - normalized_depth;
+
+            // Ч/Б режим (для датасетов): яркость = близость (near — белое,
+            // far — чёрное), монотонная карта глубины без радужного градиента.
+            if (grayscale > 0.5) {
+                fragColor = vec4(vec3(t), 1.0);
+                return;
+            }
+
             vec3 color;
 
             if (t >= 0.9) {
@@ -159,6 +177,7 @@ class DepthMapRenderer:
         self.overlay_node.setShaderInput("far", self.max_depth)
         self.overlay_node.setShaderInput("gradientStart", self.gradient_start)
         self.overlay_node.setShaderInput("gradientEnd", self.gradient_end)
+        self.overlay_node.setShaderInput("grayscale", 1.0 if self.grayscale else 0.0)
         self.overlay_node.setTransparency(TransparencyAttrib.MAlpha)
         self.overlay_node.setBin("fixed", 50)
         self.overlay_node.setDepthTest(False)

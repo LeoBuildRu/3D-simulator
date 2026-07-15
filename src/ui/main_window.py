@@ -2817,6 +2817,18 @@ class MainWindow(QMainWindow):
                     max_volume = float(cfg["max_volume"])
                 except (TypeError, ValueError):
                     max_volume = None
+        # Локальные наборы в YAML не хранят max_volume — берём эффективный
+        # (унаследованный от донора) max_volume, который load_model_set
+        # положил в panda_app.current_max_volume (тот же источник использует
+        # perlin_mesh_generator). Без этого max_volume оставался None и
+        # объём наполнения фиксировался значением спинбокса.
+        if (max_volume is None or max_volume <= 0):
+            stored_mv = getattr(self.panda_app, "current_max_volume", None)
+            if stored_mv:
+                try:
+                    max_volume = float(stored_mv)
+                except (TypeError, ValueError):
+                    max_volume = None
         if max_volume is None or max_volume <= 0:
             print("[SaveRender] max_volume not available for current "
                   "model set - falling back to spinbox-only count loop.")
@@ -3125,16 +3137,25 @@ class MainWindow(QMainWindow):
         """Датасет сегментации со случайными кадрами.
 
         Каждый снимок — полностью новая сцена: новое случайное наполнение
-        случайного объёма (0..max_volume), случайная поза камеры в текущих
+        случайного объёма (0..125% max_volume), случайная поза камеры в текущих
         рамках (± ANG_DEG по heading/pitch, ± OFFSET_M по горизонтали/
-        вертикали) и всегда полдень — солнце вертикально сверху (никаких
-        ночных/сумеречных кадров, никакой теневой полосы). Маска сегментации
-        и json сохраняются как в обычном сегментационном датасете.
+        вертикали). Освещение переопределяется: солнце ЖЁСТКО ставится в
+        зенит (светит вертикально сверху) через set_sun_overhead — не через
+        время суток, а прямым переопределением направления солнца. Теневой
+        полосы нет. Маска сегментации и json сохраняются как в обычном
+        сегментационном датасете.
         """
         from PyQt6.QtWidgets import QApplication
 
-        # Полдень: солнце в зените (вертикально сверху).
-        NOON = 12 * 60
+        def _set_sun_overhead(enable=True):
+            """Пин солнца в зенит (или снятие) на активном рендерере."""
+            app = getattr(self, "panda_app", None)
+            if app is not None and hasattr(app, "set_sun_overhead"):
+                try:
+                    app.set_sun_overhead(enable)
+                except Exception as exc:
+                    print(f"[SaveRender/rand] sun overhead failed: {exc}")
+
         # Те же рамки, что и у обычного датасета.
         OFFSET_M = 0.05
         ANG_DEG = 10.0
@@ -3166,9 +3187,11 @@ class MainWindow(QMainWindow):
         ok_count = 0
 
         for i in range(count):
-            # Случайный объём наполнения от нуля до максимума.
+            # Случайный объём наполнения: от 0% до 125% максимума грузовика
+            # (перегруз выше «паспортного» максимума — валидный кейс для
+            # обучения, поэтому верхняя граница 1.25·max_volume).
             if max_volume is not None:
-                target = random.uniform(0.0, float(max_volume))
+                target = random.uniform(0.0, 1.25 * float(max_volume))
             else:
                 target = float(rp.current_target_volume()) if rp else 0.0
 
@@ -3209,8 +3232,9 @@ class MainWindow(QMainWindow):
             cam.setHpr(base_hpr_t[0] + dh, base_hpr_t[1] + dp, base_hpr_t[2])
             cam.setPos(cam, lat, 0.0, vert)
 
-            # Всегда полдень — солнце вертикально сверху.
-            set_daytime(NOON)
+            # Освещение: солнце жёстко в зенит (вертикально сверху) —
+            # переопределяем направление солнца напрямую, а не через время.
+            _set_sun_overhead(True)
 
             # Дать Panda обработать новую позу/освещение перед снимком:
             # снова ждём 60 кадров И ≥1 c (PSSM/TAA сходятся, ресурсы на GPU).
@@ -3221,7 +3245,7 @@ class MainWindow(QMainWindow):
 
             variant_params = {
                 "dh": dh, "dp": dp, "lat": lat, "vert": vert,
-                "light": "day",
+                "light": "overhead",
             }
             extra_meta = {
                 "render_type": "dataset",
@@ -3229,7 +3253,8 @@ class MainWindow(QMainWindow):
                 "dataset_mode": "segmentation_random",
                 "random_background": random_background,
                 "gemini": gemini,
-                "light_mode": "day",
+                "light_mode": "overhead",
+                "sun_overhead": True,
                 "shadow_band": False,
                 "iteration": i,
                 "iteration_total": count,
@@ -3244,7 +3269,7 @@ class MainWindow(QMainWindow):
                     "h": base_hpr_t[0], "p": base_hpr_t[1], "r": base_hpr_t[2],
                 },
                 "base_daytime_minutes": int(base_daytime_mins),
-                "applied_daytime_minutes": NOON,
+                "applied_daytime_minutes": int(base_daytime_mins),
                 "target_volume": float(target),
                 "model_key":   model_key,
                 "texture_key": texture_key,
@@ -3261,6 +3286,7 @@ class MainWindow(QMainWindow):
                     random_background=random_background,
                     gemini=gemini,
                     shadow_band=False,
+                    also_depth=True,
                 )
                 if ok:
                     ok_count += 1
@@ -3276,6 +3302,8 @@ class MainWindow(QMainWindow):
             cam.setHpr(*base_hpr_t)
             QApplication.processEvents()
 
+        # Снять переопределение солнца и вернуть время суток из UI.
+        _set_sun_overhead(False)
         set_daytime(base_daytime_mins)
         print(f"[SaveRender/rand] saved {ok_count} random-seg render(s) "
               f"across {count} iteration(s); max_volume={max_volume}")

@@ -651,7 +651,7 @@ class RendererUtils:
     def _process_render_image(self, img, depthImg=None, camera_fov_x=None, camera_fov_y=None, output_dir="renders",
                          filename_prefix="render", metadata=None, dataset_type="depth",
                          seg_mask=None, bg_path=None, gemini_processor=None,
-                         shadow_band=False):
+                         shadow_band=False, depth_extra=None):
         # dataset_type: "depth" — depthImg это карта глубины (суффикс _depth);
         #               "segmentation" — depthImg это маска сегментации
         #               (суффикс _seg, масштабирование ближайшим соседом,
@@ -743,6 +743,10 @@ class RendererUtils:
         second_suffix = "_seg" if is_segmentation else "_depth"
         filenameDepth = f"{filename_prefix}_{timestamp}{second_suffix}.png"
         output_path_depth = os.path.join(output_dir, filenameDepth)
+        # Доп. карта глубины (режим сегментации + also_depth) — отдельный файл
+        # с суффиксом _depth рядом с маской _seg.
+        filenameDepthExtra = f"{filename_prefix}_{timestamp}_depth.png"
+        output_path_depth_extra = os.path.join(output_dir, filenameDepthExtra)
 
         # Параметры преобразований
         k1 = 0.04
@@ -826,7 +830,21 @@ class RendererUtils:
             depth_final = self.stretch_to_1920x1080(
                 depth_cropped, nearest=is_segmentation)
             depth_final = self.fix_alpha_to_opaque(depth_final)
-        
+
+        # Доп. карта глубины проходит ту же дисторсию/кроп/растяжение, что и
+        # цветной кадр и маска — билинейно (глубина — непрерывная величина).
+        depth_extra_final = None
+        if depth_extra is not None:
+            depth_extra_distorted = self.barrel_distortion(
+                depth_extra, k1=k1, k2=k2)
+            depth_extra_cropped = self.crop_image(
+                depth_extra_distorted, left=crop_left, top=crop_top,
+                right=crop_right, bottom=crop_bottom,
+            )
+            depth_extra_final = self.stretch_to_1920x1080(
+                depth_extra_cropped, nearest=False)
+            depth_extra_final = self.fix_alpha_to_opaque(depth_extra_final)
+
         # Преобразуем 2D точки с учетом всех примененных трансформаций
         transformed_points_2d = []
         
@@ -946,6 +964,9 @@ class RendererUtils:
         img_final.write(Filename.from_os_specific(output_path))
         if depth_final is not None:
             depth_final.write(Filename.from_os_specific(output_path_depth))
+        if depth_extra_final is not None:
+            depth_extra_final.write(
+                Filename.from_os_specific(output_path_depth_extra))
         
         # Формируем render_metadata только с необходимыми данными
         render_metadata = {}
@@ -958,6 +979,10 @@ class RendererUtils:
             render_metadata["gemini"] = gemini_meta
         render_metadata["second_image"] = (
             os.path.basename(output_path_depth) if depth_final is not None else None
+        )
+        render_metadata["depth_image"] = (
+            os.path.basename(output_path_depth_extra)
+            if depth_extra_final is not None else None
         )
         if is_segmentation:
             try:
@@ -1130,10 +1155,16 @@ class RendererUtils:
                            dataset_type="depth",
                            random_background=False,
                            gemini=False,
-                           shadow_band=False):
+                           shadow_band=False,
+                           also_depth=False):
         # dataset_type: "depth" (снимок + карта глубины, как раньше) или
         # "segmentation" (снимок + маска сегментации). Цветной кадр снимается
         # одинаково; меняется только второй кадр.
+        #
+        # also_depth: в режиме сегментации ДОПОЛНИТЕЛЬНО снять и сохранить
+        # карту глубины (файл с суффиксом _depth) рядом с маской _seg. Она
+        # проходит ту же barrel distortion / crop / stretch, что и остальные
+        # файлы этого кадра, поэтому попиксельно совпадает с ними.
         #
         # random_background: на ОБЫЧНОМ цветном рендере (после дисторсии) фон
         # сцены/неба заменяется случайной картинкой из assets/backgrounds;
@@ -1240,6 +1271,7 @@ class RendererUtils:
                 print("[Render] seg mask capture failed; "
                       "сохраняю без замены фона/Gemini/тени.")
 
+        depth_extra = None
         if is_segmentation:
             # Маска сегментации рендерится в отдельный offscreen-буфер
             # (плоские цвета, без постобработки). Overlay глубины не нужен.
@@ -1250,20 +1282,72 @@ class RendererUtils:
             if depthImg is None:
                 print("[Render] segmentation capture failed.")
                 return False
+
+            # Дополнительная карта глубины рядом с маской сегментации.
+            # Снимается тем же путём, что и в depth-режиме, но с явной
+            # синхронизацией кадра (иначе в буфер попадает обычный 3D-рендер,
+            # а не depth-overlay — «застывший» кадр до применения изменений):
+            #   1) включаем depth overlay;
+            #   2) обновляем карту глубины под ТЕКУЩУЮ позу камеры
+            #      (update_depth_texture рендерит depth-буфер depth-камерой);
+            #   3) settle_render — реальные кадры пайплайна с видимым overlay;
+            #   4) ДВА явных graphicsEngine.render_frame() прямо перед чтением
+            #      (тот же анти-«застывший буфер» приём, что и для цветного
+            #      кадра выше) — гарантируют, что getScreenshot прочитает
+            #      кадр С overlay, а не предыдущий обычный рендер.
+            if also_depth:
+                dr = self.panda_app.depth_renderer
+                dr.set_overlay_visibility(True)
+                # Ч/Б карта глубины — только для датасетов.
+                if hasattr(dr, "set_grayscale"):
+                    dr.set_grayscale(True)
+                try:
+                    dr.update_depth_texture()
+                except Exception as exc:
+                    print(f"[Render] update_depth_texture failed: {exc}")
+                self.settle_render(frames=16)
+                self.panda_app.graphicsEngine.render_frame()
+                self.panda_app.graphicsEngine.render_frame()
+                depth_extra = PNMImage()
+                if not self.panda_app.win.getScreenshot(depth_extra):
+                    print("[Render] extra depth capture failed; "
+                          "сохраняю только маску.")
+                    depth_extra = None
+                dr.set_overlay_visibility(False)
+                # Вернуть цветной градиент для живого overlay в UI.
+                if hasattr(dr, "set_grayscale"):
+                    dr.set_grayscale(False)
         else:
-            self.panda_app.depth_renderer.set_overlay_visibility(True)
+            dr = self.panda_app.depth_renderer
+            dr.set_overlay_visibility(True)
+            # Ч/Б карта глубины — только для датасетов (у одиночного рендера
+            # оставляем цветной градиент). Датасет распознаём по метаданным.
+            is_dataset = bool(extra_metadata
+                              and extra_metadata.get("render_type") == "dataset")
+            if is_dataset and hasattr(dr, "set_grayscale"):
+                dr.set_grayscale(True)
             self.settle_render(frames=16)
 
             depthImg = PNMImage()
             if not self.panda_app.win.getScreenshot(depthImg):
-                self.panda_app.depth_renderer.set_overlay_visibility(False)
+                dr.set_overlay_visibility(False)
+                if is_dataset and hasattr(dr, "set_grayscale"):
+                    dr.set_grayscale(False)
                 return False
 
-            self.panda_app.depth_renderer.set_overlay_visibility(False)
+            dr.set_overlay_visibility(False)
+            if is_dataset and hasattr(dr, "set_grayscale"):
+                dr.set_grayscale(False)
 
         img = self.stretch_to_1920x1080(img)
         depthImg = self.stretch_to_1920x1080(depthImg, nearest=is_segmentation)
         depthImg = self.fix_alpha_to_opaque(depthImg)
+
+        # Доп. карта глубины (режим сегментации + also_depth): та же
+        # нормализация, что и у depth-режима (билинейно, alpha->opaque).
+        if depth_extra is not None:
+            depth_extra = self.stretch_to_1920x1080(depth_extra, nearest=False)
+            depth_extra = self.fix_alpha_to_opaque(depth_extra)
 
         # Маску под вырезание приводим к 1920x1080 тем же ближайшим соседом
         # (как img/depth), чтобы геометрия совпала.
@@ -1328,6 +1412,7 @@ class RendererUtils:
             bg_path=bg_path,
             gemini_processor=gemini_processor,
             shadow_band=shadow_band,
+            depth_extra=depth_extra,
         )
 
         return True

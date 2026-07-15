@@ -647,6 +647,10 @@ class MyApp(ShowBase):
         sun_np = getattr(self, "sun_np", None)
         if sun_np is None:
             return
+        # While the sun is pinned overhead (dataset rendering) ignore
+        # time-of-day driven repositioning; set_sun_overhead(False) clears it.
+        if getattr(self, "_sun_overhead", False):
+            return
         from panda3d.core import Vec4
 
         # Sun elevation: below horizon before 06:00 / after 18:00.
@@ -695,6 +699,51 @@ class MyApp(ShowBase):
         # aerial haze, not a grey veil (and stays dark at night).
         if getattr(self, "_perf_fog", None) is not None:
             self._perf_fog.set_color(bg[0], bg[1], bg[2])
+
+    def set_sun_overhead(self, enable=True):
+        """Pin the sun straight overhead (zenith), overriding the
+        daytime-driven sun rotation, or restore normal behaviour.
+
+        Used by the dataset renderer to get consistent top-down lighting
+        regardless of the UI time-of-day slider. This overrides the sun's
+        *direction* directly — it does not change the time of day.
+
+        * RenderPipeline presets: pins the scattering plugin's ``sun_vector``
+          to (0, 0, 1) (sun in the zenith), which also drives PSSM shadows.
+        * performance preset: positions the directional sun straight above
+          the origin and applies a bright, neutral noon colour.
+
+        Pass ``enable=False`` to clear the override; the next call to
+        ``set_time_of_day`` then takes effect again.
+        """
+        from panda3d.core import Vec3, Vec4
+
+        if self.use_render_pipeline:
+            rp = getattr(self, "render_pipeline", None)
+            try:
+                scat = rp.plugin_mgr.instances.get("scattering") if rp else None
+            except Exception:
+                scat = None
+            if scat is not None:
+                scat.sun_vector_override = Vec3(0, 0, 1) if enable else None
+            return
+
+        # Performance (simplepbr) renderer: move the directional sun overhead.
+        sun_np = getattr(self, "sun_np", None)
+        if sun_np is None:
+            return
+        self._sun_overhead = bool(enable)
+        if not enable:
+            return
+        d = getattr(self, "_sun_distance", 120.0)
+        sun_np.set_pos(0.0, 0.0, d)
+        sun_np.look_at(0, 0, 0)
+        # Bright, near-neutral noon sun + low ambient floor for crisp,
+        # top-down shadows.
+        intensity = 2.8
+        self.sun.set_color(Vec4(intensity, 0.98 * intensity,
+                                0.92 * intensity, 1.0))
+        self.ambient_light.set_color(Vec4(0.07, 0.08, 0.105, 1.0))
 
     def _flat_normal_texture(self):
         """A cached 1x1 flat (0,0,1) tangent-space normal map. Bound on meshes

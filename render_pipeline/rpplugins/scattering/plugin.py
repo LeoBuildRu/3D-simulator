@@ -70,7 +70,15 @@ class Plugin(BasePlugin):
 
     @property
     def sun_vector(self):
-        """ Returns the sun vector """
+        """ Returns the sun vector.
+
+        If ``sun_vector_override`` is set (a Vec3), it is returned verbatim,
+        bypassing the daytime-driven altitude/azimuth. This lets callers pin
+        the sun to a fixed direction (e.g. straight overhead for dataset
+        rendering). Set it back to ``None`` to restore normal behaviour. """
+        override = getattr(self, "sun_vector_override", None)
+        if override is not None:
+            return override
         sun_altitude = self.get_daytime_setting("sun_altitude")
         sun_azimuth = self.get_daytime_setting("sun_azimuth")
         theta = (90 - sun_altitude) / 180.0 * math.pi

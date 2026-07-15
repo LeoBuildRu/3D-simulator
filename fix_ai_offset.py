@@ -15,11 +15,20 @@ the estimation -- SIFT keypoints, ECC intensity alignment, and the final scoring
 metric -- to a (dilated) truck-body mask. That is exactly the "distinct truck
 body lines" cue, isolated from the parts the AI was free to change.
 
-Two independent estimators are tried and the best-scoring result is kept:
-  * SIFT features + RANSAC similarity (good for clear texture/scale change)
-  * ECC intensity correlation on blurred images (good for small pure shifts)
-A candidate is only accepted if it beats leaving the image untouched, and the
-transform is clamped to a small, sane range so a bad fit can never wreck a frame.
+Pipeline (every stage is gated: it must measurably improve the alignment
+metric or it is discarded, so the output can never be worse than the input):
+  1. Global similarity (translation + zoom + rotation): grid search on masked
+     gradient-NCC, SIFT+RANSAC and ECC candidates; the best scorer wins.
+  2. Global affine refinement (anisotropic scale + shear) by coordinate
+     descent on the same masked metric.
+  3. Residual non-rigid correction: dense DIS optical flow computed only on
+     trusted truck-body pixels (forward/backward-consistent, textured),
+     averaged onto a coarse grid, smoothed, damped and hard-clamped to a few
+     pixels. It gently bends the AI image back onto the render but is too
+     smooth and too small to introduce the wavy over-warping older versions
+     of this script produced.
+All accepted warps are composed and applied to the AI image in a SINGLE
+resampling pass (no quality loss from chained warps).
 """
 
 import sys
@@ -409,126 +418,124 @@ def seg_score(orig_gray, ai_gray, tight_mask, M, max_dim=1000):
     return -float(dt[outline].mean())
 
 
-def _tps_fit(P, V, reg=1.0):
-    """Fit a 2D thin-plate spline mapping control points P (n,2) -> values V (n,2).
-    Returns (params (n+3, 2), P). `reg` smooths the fit."""
-    n = len(P)
-    diff = P[:, None, :] - P[None, :, :]
-    d2 = (diff * diff).sum(-1)
-    K = 0.5 * d2 * np.log(d2 + 1e-12)
-    K[np.arange(n), np.arange(n)] = reg
-    Pm = np.hstack([np.ones((n, 1)), P])
-    L = np.zeros((n + 3, n + 3))
-    L[:n, :n] = K
-    L[:n, n:] = Pm
-    L[n:, :n] = Pm.T
-    rhs = np.zeros((n + 3, 2))
-    rhs[:n] = V
-    params = np.linalg.solve(L, rhs)
-    return params, P
+def _fill_nan_grid(c):
+    """Fill NaN cells of a small 2D grid by repeated neighbor averaging, so the
+    flow field extrapolates smoothly outside the trusted (truck-body) area."""
+    for _ in range(c.size):
+        nan = np.isnan(c)
+        if not nan.any():
+            break
+        vs = cv2.blur(np.where(nan, 0, c).astype(np.float32), (3, 3))
+        ws = cv2.blur((~nan).astype(np.float32), (3, 3))
+        fill = nan & (ws > 1e-6)
+        c[fill] = vs[fill] / ws[fill]
+    return c
 
 
-def _tps_apply(params, P, pts):
-    """Evaluate the TPS at pts (m,2). Returns (m,2)."""
-    n = len(P)
-    diff = pts[:, None, :] - P[None, :, :]
-    d2 = (diff * diff).sum(-1)
-    U = 0.5 * d2 * np.log(d2 + 1e-12)
-    Pm = np.hstack([np.ones((len(pts), 1)), pts])
-    return U @ params[:n] + Pm @ params[n:]
+def _grad_image(gray):
+    """Contrast-normalized gradient magnitude as uint8. Optical flow between
+    the render and the AI repaint is only reliable on edge structure, not on
+    raw intensity (the AI changes colors/lighting freely)."""
+    g = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
+    mag = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0),
+                        cv2.Sobel(g, cv2.CV_32F, 0, 1))
+    return np.clip(mag / (np.percentile(mag, 95) + 1e-6) * 255, 0, 255).astype(np.uint8)
 
 
-def tps_refine(orig_gray, ai_gray, tight_mask, M_global, max_dim=1200,
-               search_frac=0.03, step=22):
-    """Boundary-guided thin-plate-spline. After the global warp M_global, the AI
-    truck edge still deviates from the seg outline by small, spatially-varying
-    amounts (lens/perspective 'curving' the AI reintroduced). We sample points
-    along the seg truck outline, find the nearest strong AI edge along the local
-    normal, and fit a TPS that snaps the AI edge onto the outline -- pinned by
-    identity anchors on a border grid so the interior stays stable.
+def flow_refine(orig_gray, aligned_gray, tight_mask, max_dim=1100,
+                damp=0.85, max_disp_px=15.0, cell_px=40, fb_thresh=1.2):
+    """Residual non-rigid correction after the global warp.
 
-    Returns a ('flow', mapx, mapy) full-res warp to apply *after* M_global, or None.
+    Dense optical flow orig->aligned (Farneback on gradient images) is
+    measured, but kept only where it can be trusted: inside the (eroded)
+    truck-body mask, forward/backward consistent, and on textured pixels.
+    The trusted vectors are averaged onto a coarse grid (~cell_px cells),
+    unknown cells are filled by smooth extrapolation, the grid is blurred,
+    damped and hard-clamped to max_disp_px. The result is a very smooth,
+    small-amplitude field.
+
+    Returns ('flow', mapx, mapy) absolute full-res sample maps into the
+    *aligned* image, or None if there is too little trusted signal.
     """
     h, w = orig_gray.shape
     scale = min(1.0, max_dim / max(h, w))
-    sh, sw = int(round(h * scale)), int(round(w * scale))
-    aligned = warp_gray(ai_gray, M_global, (w, h))
-    a = cv2.GaussianBlur(cv2.resize(aligned, (sw, sh), interpolation=cv2.INTER_AREA),
-                         (0, 0), 1.2).astype(np.float32)
-    ms = cv2.resize(tight_mask, (sw, sh), interpolation=cv2.INTER_NEAREST)
+    o = _grad_image(_resize(orig_gray, scale))
+    a = _grad_image(_resize(aligned_gray, scale))
+    sh, sw = o.shape
 
-    gm = cv2.magnitude(cv2.Sobel(a, cv2.CV_32F, 1, 0), cv2.Sobel(a, cv2.CV_32F, 0, 1))
-    gthr = np.percentile(gm, 60)
+    fb_args = (0.5, 5, 31, 5, 7, 1.5, 0)   # pyr_scale, levels, win, iters, poly
+    f_fw = cv2.calcOpticalFlowFarneback(o, a, None, *fb_args)
+    f_bw = cv2.calcOpticalFlowFarneback(a, o, None, *fb_args)
 
-    # Signed distance -> smooth inward normals along the outline.
-    din = cv2.distanceTransform(ms, cv2.DIST_L2, 3)
-    dout = cv2.distanceTransform(255 - ms, cv2.DIST_L2, 3)
-    sd = din - dout
-    nx = cv2.Sobel(sd, cv2.CV_32F, 1, 0, ksize=5)
-    ny = cv2.Sobel(sd, cv2.CV_32F, 0, 1, ksize=5)
+    xs, ys = np.meshgrid(np.arange(sw, dtype=np.float32),
+                         np.arange(sh, dtype=np.float32))
+    bx = cv2.remap(f_bw[..., 0], xs + f_fw[..., 0], ys + f_fw[..., 1],
+                   cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    by = cv2.remap(f_bw[..., 1], xs + f_fw[..., 0], ys + f_fw[..., 1],
+                   cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    fb_err = np.hypot(f_fw[..., 0] + bx, f_fw[..., 1] + by)
 
-    cnts, _ = cv2.findContours(ms, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not cnts:
+    if tight_mask is None:
         return None
-    cnt = max(cnts, key=cv2.contourArea).reshape(-1, 2)
-    R = max(4, int(round(search_frac * sw)))
-
-    src, dst = [], []            # aligned-AI point, outline point
-    for p in cnt[::step]:
-        px, py = int(p[0]), int(p[1])
-        if not (0 <= px < sw and 0 <= py < sh):
-            continue
-        n = np.array([nx[py, px], ny[py, px]], np.float32)
-        ln = np.hypot(*n)
-        if ln < 1e-3:
-            continue
-        n /= ln
-        best_t, best_g = 0.0, -1.0
-        for t in range(-R, R + 1):
-            qx, qy = px + n[0] * t, py + n[1] * t
-            ix, iy = int(round(qx)), int(round(qy))
-            if 0 <= ix < sw and 0 <= iy < sh and gm[iy, ix] > best_g:
-                best_g, best_t = gm[iy, ix], t
-        if best_g < gthr or abs(best_t) >= R:
-            continue
-        src.append([px + n[0] * best_t, py + n[1] * best_t])  # AI edge location
-        dst.append([px, py])                                  # where it should be
-
-    if len(src) < 8:
+    m = _resize(tight_mask, scale, nearest=True) > 0
+    m = cv2.erode(m.astype(np.uint8) * 255,
+                  np.ones((5, 5), np.uint8)) > 0   # stay off the repainted rim
+    if m.sum() < 500:
+        return None
+    gm = o.astype(np.float32)   # o is already a gradient-magnitude image
+    fmag = np.hypot(f_fw[..., 0], f_fw[..., 1])
+    max_disp_s = max_disp_px * scale
+    conf = (m & (fb_err < fb_thresh) & (gm > np.percentile(gm[m], 50))
+            & (fmag < 1.5 * max_disp_s)).astype(np.float32)
+    if conf.sum() < 500:
         return None
 
-    # Identity anchors on a border grid to regularize the interior.
-    gx = np.linspace(0, sw - 1, 7)
-    gy = np.linspace(0, sh - 1, 7)
-    for x in gx:
-        for y in gy:
-            if x in (gx[0], gx[-1]) or y in (gy[0], gy[-1]):
-                src.append([x, y]); dst.append([x, y])
+    gw = max(4, int(round(sw / cell_px)))
+    gh = max(3, int(round(sh / cell_px)))
+    den = cv2.resize(conf, (gw, gh), interpolation=cv2.INTER_AREA)
+    cells = []
+    for ch in range(2):
+        num = cv2.resize(f_fw[..., ch] * conf, (gw, gh), interpolation=cv2.INTER_AREA)
+        c = np.where(den > 0.05, num / np.maximum(den, 1e-6), np.nan)
+        cells.append(c)
+    if (~np.isnan(cells[0])).sum() < 6:
+        return None
+    cx = cv2.GaussianBlur(_fill_nan_grid(cells[0]), (0, 0), 1.0)
+    cy = cv2.GaussianBlur(_fill_nan_grid(cells[1]), (0, 0), 1.0)
 
-    P = np.array(dst, np.float64)   # outline-frame control points
-    V = np.array(src, np.float64)   # where to sample in the aligned AI
-    try:
-        params, P = _tps_fit(P, V, reg=1.0)
-    except np.linalg.LinAlgError:
-        return None
+    cx *= damp
+    cy *= damp
+    mag = np.hypot(cx, cy)
+    over = mag > max_disp_s
+    if over.any():
+        f = np.where(over, max_disp_s / (mag + 1e-9), 1.0)
+        cx *= f
+        cy *= f
 
-    # Evaluate the (smooth) TPS on a coarse grid, then upsample the map.
-    ecol = min(sw, 160)
-    erow = max(2, int(round(ecol * sh / sw)))
-    gx = np.linspace(0, sw - 1, ecol)
-    gy = np.linspace(0, sh - 1, erow)
-    mx, my = np.meshgrid(gx, gy)
-    grid = np.stack([mx.ravel(), my.ravel()], 1)
-    mapped = _tps_apply(params, P, grid).reshape(erow, ecol, 2)
-    mapx = cv2.resize(mapped[..., 0].astype(np.float32), (w, h)) / scale
-    mapy = cv2.resize(mapped[..., 1].astype(np.float32), (w, h)) / scale
-    if not (np.isfinite(mapx).all() and np.isfinite(mapy).all()):
+    fx = cv2.resize(cx.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC) / scale
+    fy = cv2.resize(cy.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC) / scale
+    if not (np.isfinite(fx).all() and np.isfinite(fy).all()):
         return None
-    # Reject if the field moved anything by an implausible amount.
-    if max(np.abs(mapx - np.arange(w)[None, :]).max(),
-           np.abs(mapy - np.arange(h)[:, None]).max()) > 0.10 * np.hypot(h, w):
-        return None
-    return ("flow", mapx.astype(np.float32), mapy.astype(np.float32))
+    xs_f, ys_f = np.meshgrid(np.arange(w, dtype=np.float32),
+                             np.arange(h, dtype=np.float32))
+    return ("flow", xs_f + fx, ys_f + fy)
+
+
+def compose_map(M, flow, w, h):
+    """Single remap combining the global warp M (AI->ORIG) and an optional
+    residual flow measured on the M-aligned image:
+        out(x) = ai( M^-1 (flow(x)) )
+    so the AI image is resampled exactly once."""
+    if flow is not None:
+        px, py = flow[1], flow[2]
+    else:
+        px, py = np.meshgrid(np.arange(w, dtype=np.float32),
+                             np.arange(h, dtype=np.float32))
+    Minv = np.linalg.inv(to33(M).astype(np.float64))
+    den = Minv[2, 0] * px + Minv[2, 1] * py + Minv[2, 2]
+    mapx = (Minv[0, 0] * px + Minv[0, 1] * py + Minv[0, 2]) / den
+    mapy = (Minv[1, 0] * px + Minv[1, 1] * py + Minv[1, 2]) / den
+    return mapx.astype(np.float32), mapy.astype(np.float32)
 
 
 def make_overlay(orig, aligned, mask=None, tight=None):
@@ -563,7 +570,7 @@ def _global_similarity(orig_gray, ai_gray, mask):
     return scored[0][2], scored[0][1]
 
 
-def process(ai_path, save=True, verbose=True, diag=False, nonrigid=False):
+def process(ai_path, save=True, verbose=True, diag=False, nonrigid=True):
     base = ai_path[:-len("_ai.png")]
     orig_path = base + ".png"
     seg_path = base + "_seg.png"
@@ -612,29 +619,42 @@ def process(ai_path, save=True, verbose=True, diag=False, nonrigid=False):
         if valid_generic(Ma, (oh, ow)) and score(Ma) > best_score + 1e-6:
             best_M, best_tag, best_score = Ma, best_tag + "+affine", score(Ma)
 
-    # --- Stage 3: boundary-guided TPS (non-rigid curvature). ------------------
+    apply_global = best_tag != "identity" and best_score > id_score + 1e-6
+    if not apply_global:
+        best_M, best_tag, best_score = IDENTITY, "identity", id_score
+
+    # --- Stage 2: residual smooth-flow correction (spatially varying warp). ---
+    # Gated on the whole-truck grad-NCC, a metric the flow cannot trivially
+    # game, and on the seg chamfer not getting worse.
     flow = None
-    if nonrigid and tight is not None and best_tag != "identity":
-        f = tps_refine(orig_gray, ai_gray, tight, best_M)
+    if nonrigid and tight is not None:
+        aligned = warp_gray(ai_gray, best_M, (ow, oh))
+        f = flow_refine(orig_gray, aligned, tight)
         if f is not None:
-            # Judge TPS by a metric it can't trivially game: whole-truck grad-NCC
-            # (NOT the outline chamfer it directly optimizes, which would reward
-            # interior 'water' distortion). Require a clear improvement.
-            aligned = warp_gray(ai_gray, best_M, (ow, oh))
             base_ncc = align_score(orig_gray, aligned, mask, IDENTITY)
-            warped = warp_gray(aligned, f, (ow, oh))
-            new_ncc = align_score(orig_gray, warped, mask, IDENTITY)
-            if new_ncc > base_ncc + 0.02:
-                flow, best_tag = f, best_tag + "+tps"
+            flowed = warp_gray(aligned, f, (ow, oh))
+            new_ncc = align_score(orig_gray, flowed, mask, IDENTITY)
+            base_ch = seg_score(orig_gray, aligned, tight, IDENTITY)
+            new_ch = seg_score(orig_gray, flowed, tight, IDENTITY)
+            # Combined-evidence gate: the two metrics vote (one clear win, or
+            # two moderate ones), and neither may degrade beyond a trivial
+            # amount. The flow never optimizes the chamfer directly, so a
+            # chamfer improvement is honest evidence of better alignment.
+            d_ncc = new_ncc - base_ncc
+            d_ch = new_ch - base_ch          # chamfer px, higher = better
+            if d_ncc > -0.012 and d_ch > -0.15 and d_ncc / 0.02 + d_ch / 0.5 > 1.0:
+                flow, best_tag = f, best_tag + "+flow"
+                best_score = new_ch if metric == "seg" else new_ncc
 
-    apply_fix = best_tag != "identity" and best_score > id_score + 1e-6
-    if not apply_fix:
-        best_M, flow = IDENTITY, None
-
-    # Compose the final warp: global similarity/affine/homography, then flow.
-    fixed = warp_gray(ai_r, best_M, (ow, oh), flags=cv2.INTER_CUBIC)
-    if flow is not None:
-        fixed = warp_gray(fixed, flow, (ow, oh), flags=cv2.INTER_CUBIC)
+    # Compose global warp + flow into ONE remap so the AI image is resampled
+    # exactly once.
+    if best_tag == "identity" and flow is None:
+        fixed = ai_r.copy()
+    else:
+        mapx, mapy = compose_map(best_M, flow, ow, oh)
+        fixed = cv2.remap(ai_r, mapx, mapy, cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
+    apply_fix = best_tag != "identity"
 
     out_path = base + "_ai_fix.png"
     if save:
@@ -652,10 +672,10 @@ def process(ai_path, save=True, verbose=True, diag=False, nonrigid=False):
 def main():
     args = sys.argv[1:]
     diag = "--diag" in args
-    nonrigid = "--tps" in args   # non-rigid TPS is opt-in (can distort; off by default)
+    nonrigid = "--no-flow" not in args   # smooth-flow stage is on by default
     jobs = 1
     rest = []
-    it = iter([a for a in args if a not in ("--diag", "--tps")])
+    it = iter([a for a in args if a not in ("--diag", "--no-flow")])
     for a in it:
         if a == "--jobs":
             jobs = int(next(it))
@@ -664,7 +684,7 @@ def main():
         else:
             rest.append(a)
     if not rest:
-        print("usage: fix_ai_offset.py [--diag] [--tps] [--jobs N] "
+        print("usage: fix_ai_offset.py [--diag] [--no-flow] [--jobs N] "
               "<folder | ai_image.png> [...]")
         return
     targets = []
