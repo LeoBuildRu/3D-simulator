@@ -69,6 +69,11 @@ class Debugger(RPObject):
         self.create_components()
         self.init_keybindings()
 
+        # Start with the debugger gui hidden, it can be toggled with F5
+        self.fullscreen_node.hide()
+        self.overlay_node.hide()
+        self.error_msg_handler.hide()
+
         if self.advanced_info:
             Globals.base.doMethodLater(
                 0.5, lambda task: self.collect_scene_data(), "RPDebugger_collectSceneData_initial")

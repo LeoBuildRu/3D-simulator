@@ -34,10 +34,10 @@ class RendererUtils:
     def _composite_random_background(self, img_final, mask_final, bg_path):
         """Заменить фон на цветном кадре случайной картинкой.
 
-        Передний план (кузов + груз) определяется по маске сегментации
-        mask_final (уже с теми же дисторсией/кропом/растяжением, что и
-        img_final). Все пиксели, кроме cargo/cuzov, заполняются картинкой
-        bg_path. Возвращает новый PNMImage или None при ошибке.
+        Передний план (кузов + груз + ткань + other/насыпь) определяется по
+        маске сегментации mask_final (уже с теми же дисторсией/кропом/
+        растяжением, что и img_final). Все остальные пиксели заполняются
+        картинкой bg_path. Возвращает новый PNMImage или None при ошибке.
         """
         try:
             import io
@@ -73,6 +73,8 @@ class RendererUtils:
             keep = _close(SEG_COLORS["cargo"]) | cuzov_mask
             if "cloth" in SEG_COLORS:
                 keep |= _close(SEG_COLORS["cloth"])
+            if "other" in SEG_COLORS:
+                keep |= _close(SEG_COLORS["other"])
 
             # 1) Цветовую температуру переднего плана подгоняем под фон, чтобы
             #    вставленный кузов+груз не выглядели «холоднее/теплее» картинки.
@@ -115,7 +117,7 @@ class RendererUtils:
         return new_pnm
 
     def _keep_mask_from_array(self, mask_arr, tol=40):
-        """bool-маска переднего плана (cargo+cuzov+cloth) из RGB-маски."""
+        """bool-маска переднего плана (cargo+cuzov+cloth+other) из RGB-маски."""
         import numpy as np
         from src.rendering.segmentation_renderer import SEG_COLORS
         mask_i = mask_arr.astype(np.int16)
@@ -128,6 +130,8 @@ class RendererUtils:
         keep = _close(SEG_COLORS["cargo"]) | cuzov
         if "cloth" in SEG_COLORS:
             keep |= _close(SEG_COLORS["cloth"])
+        if "other" in SEG_COLORS:
+            keep |= _close(SEG_COLORS["other"])
         return keep, cuzov
 
     def _apply_openai(self, img_final, processor, shadow_band=False):

@@ -42,6 +42,30 @@ import numpy as np
 
 _EPS = 1e-9
 
+# Податливость изгиба при stiff_bend = 1. Дальше alpha растёт как 1/k^2
+# (см. _bend_compliance).
+#
+# Величина НЕ масштабируется ячейкой — и это принципиально. Двугранный угол —
+# безразмерная мера кривизны, у регулярной сетки |e|^2/A ~ const, поэтому
+# энергия изгиба от плотности сетки не зависит. Прежняя формула умножала
+# податливость на cell^2, то есть ужесточала изгиб при сгущении сетки: после
+# утроения плотности в V2 ткань стала жёстче в ~9 раз, перестала драпироваться
+# и вместо складок раскрывалась «крылом» — плоское полотно (phi0 = pi)
+# распрямляло сгиб на кромке вместо того, чтобы свисать.
+BEND_COMPLIANCE = 0.06
+
+# Поверхностная плотность ткани — масса на единицу площади.
+#
+# Нужна аэродинамике: сила на треугольник пропорциональна его ПЛОЩАДИ, а масса
+# частицы бралась единичной независимо от шага сетки. Значит ускорение от ветра
+# падало как cell^2, и на плотных сетках V2 ветер не двигал полотно вообще
+# (замер: при 200 ячейках «шквал» смещал ткань на 0.005 единицы). Деление на
+# rho*cell^2 делает отклик на ветер независимым от разрешения.
+#
+# На связи не влияет: inv_mass частиц остаётся 0/1, масса входит только в
+# пересчёт аэродинамической СИЛЫ в ускорение.
+AREA_DENSITY = 8.0
+
 _wp = None
 _device = None
 
@@ -733,6 +757,11 @@ class WarpClothSolver:
                 rest[faces[:, 1]] - rest[faces[:, 0]], axis=1)))
         self.cell = max(float(cell), _EPS)
 
+        # Масса частицы = площадь её ячейки на поверхностную плотность. Входит
+        # ТОЛЬКО в пересчёт аэродинамической силы в ускорение (см. AREA_DENSITY);
+        # inv_mass связей остаётся 0/1, поэтому жёсткости не задеты.
+        self.particle_mass = AREA_DENSITY * self.cell * self.cell
+
         self._build_stretch(rest, stiff_structural, stiff_shear, n)
         self._build_bend(rest, faces, stiff_bend, n)
 
@@ -754,10 +783,17 @@ class WarpClothSolver:
         self.ground_z = None
         self.friction = 0.35
 
-        # Самопересечение. Радиус чуть меньше половины ячейки: больше — и
-        # барьер начинает драться со связями, раздувая полотно.
+        # Самопересечение. Радиус — это ТОЛЩИНА ткани: складка, легшая сама на
+        # себя, должна оставаться двумя различимыми слоями, иначе после
+        # подразбиения под рендер слои прошивают друг друга (ровно те
+        # самопересечения, что видны на кадре).
+        #
+        # Верхний предел — 2 ячейки: соседи по кольцу 1 из барьера исключены
+        # (их держат связи), а ближайшие НЕ исключённые — кольцо 2, они на
+        # расстоянии 2*cell. Радиус от 2*cell барьер начал бы драться с ними и
+        # раздувать полотно, поэтому 0.8 — с запасом.
         self.self_collision = True
-        self.self_radius = self.cell * 0.45
+        self.self_radius = self.cell * 0.8
         self._grid = wp.HashGrid(32, 32, 32, device=dev)
 
         self.wind_dir = np.array([0.0, 1.0, 0.0])
@@ -790,6 +826,20 @@ class WarpClothSolver:
         """
         k = float(np.clip(stiffness, 1e-3, 1.0))
         return (1.0 / k - 1.0) * (self.cell * self.cell) * 1e-3
+
+    @staticmethod
+    def _bend_compliance(stiffness):
+        """stiffness (0..1] -> податливость двугранного изгиба.
+
+        В отличие от растяжения, здесь НЕТ множителя cell^2: связь штрафует
+        угол, а не длину, и на регулярной сетке её энергия от плотности не
+        зависит (см. BEND_COMPLIANCE). Рост как 1/k^2 растягивает диапазон:
+        при k = 0.45 получается заметно упругий брезент, при k = 0.05 —
+        совсем мягкое полотно, и оба края остаются в режиме, где ткань
+        драпируется складками.
+        """
+        k = float(np.clip(stiffness, 1e-3, 1.0))
+        return BEND_COMPLIANCE / (k * k)
 
     def _build_stretch(self, rest, k_struct, k_shear, n):
         """structural (соседи по сетке) + shear (диагонали ячейки).
@@ -873,7 +923,7 @@ class WarpClothSolver:
         self.b_phi0 = wp.array(phi0.astype(np.float32), dtype=float, device=dev)
         # Изгиб мягче растяжения на порядки — это и есть ткань, а не резина.
         self.b_alpha = wp.array(
-            np.full(len(quads), self._compliance(k_bend) * 1e3 + 1e-6,
+            np.full(len(quads), self._bend_compliance(k_bend),
                     dtype=np.float32), dtype=float, device=dev)
         self.b_lambda = wp.zeros(len(quads), dtype=float, device=dev)
         self.bend_ranges = ranges
@@ -946,7 +996,8 @@ class WarpClothSolver:
                               self.time])
         wp.launch(k["integrate"], dim=n,
                   inputs=[self.x, self.v, self.x_prev, self.inv_mass,
-                          self.force, gravity, 1.0, self.damping, sub_dt])
+                          self.force, gravity, self.particle_mass,
+                          self.damping, sub_dt])
 
         # XPBD: множители обнуляются на КАЖДОМ подшаге — они накапливают
         # импульс связи в пределах одного шага, не дольше.

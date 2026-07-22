@@ -703,9 +703,12 @@ class ClothSimulator:
     # опорный (референс): небольшой тент на ближней к кабине стенке.
     # «Полотно во весь кадр» оставлено редким: как штатный вид оно слишком
     # закрывает сцену.
+    # Свисающий через борт тент — основной случай датасета: суммарно 80%
+    # (near_wall + any_rail). Остальное — редкие виды для разнообразия.
     PLACEMENTS = {
-        "near_wall": 0.62,   # через ближнюю (к кабине/камере) стенку
-        "any_rail": 0.28,    # через произвольный борт
+        "near_wall": 0.55,   # через ПЕРЕДНИЙ борт, тот, что к кабине
+        "any_rail": 0.25,    # через произвольный борт
+        "on_load": 0.10,     # просто лежит на грузе у кабины
         "full_frame": 0.10,  # у самой камеры, закрывает весь кадр
     }
 
@@ -730,6 +733,69 @@ class ClothSimulator:
         lo, hi = bounds
         return (np.array([lo[0], lo[1], lo[2]], dtype=np.float64),
                 np.array([hi[0], hi[1], hi[2]], dtype=np.float64))
+
+    # Кабина всегда в +Y (проверено по моделям: у MAZ радиатор на y ~ +4.4).
+    CABIN_AXIS = 1
+    CABIN_SIGN = 1.0
+
+    def _body_bounds(self, cuzov_verts, cargo_verts):
+        """AABB ГРУЗОВОГО КУЗОВА, а не всего грузовика.
+
+        current_cuzov_path указывает на модель ЦЕЛИКОМ — вместе с кабиной,
+        зеркалами и рамой. Её габарит шире и длиннее кузова (у MAZ: кузов
+        y[-2.66, 2.86], x[+-1.21], а весь грузовик y[-2.66, 4.68], x[-1.34, 1.38]),
+        поэтому кромки борта, посчитанные по нему, оказывались:
+          * на 0.15 единицы СНАРУЖИ настоящей стенки — тент перекидывался через
+            воображаемое ребро и висел в воздухе, ничего не касаясь;
+          * у +Y — на крыше КАБИНЫ, а не на переднем борту кузова.
+        Отсюда и «висит над всеми мешами» и «всегда с одной стороны».
+
+        Границы берутся от ОТПЕЧАТКА ГРУЗА: наполнение генерируется внутрь
+        кузова, значит его габарит по xy — это внутренний проём, а борта лежат
+        сразу за ним. Так кузов находится в любой модели, без опоры на имена
+        узлов (KUZOV есть только у MAZ, у остальных Mesh.0NN).
+        """
+        whole = self._cuzov_bounds()
+        if whole is None:
+            return None
+        if (cuzov_verts is None or len(cuzov_verts) == 0
+                or cargo_verts is None or len(cargo_verts) < 8):
+            return whole
+
+        cmin = cargo_verts.min(axis=0)
+        cmax = cargo_verts.max(axis=0)
+        span_xy = np.maximum(cmax[:2] - cmin[:2], _EPS)
+
+        # Кольцо захвата — доля МЕНЬШЕЙ стороны. По длинной оси щедрый допуск
+        # дотянулся бы до кабины и вернул её за борт кузова.
+        pad = 0.12 * float(np.min(span_xy))
+        lo = np.array([cmin[0] - pad, cmin[1] - pad,
+                       cmin[2] - 0.05 * max(cmax[2] - cmin[2], _EPS)])
+        hi = np.array([cmax[0] + pad, cmax[1] + pad, whole[1][2]])
+
+        sel = np.all((cuzov_verts >= lo) & (cuzov_verts <= hi), axis=1)
+        if int(sel.sum()) < 32:
+            return whole
+
+        v = cuzov_verts[sel]
+        # По xy — квантиль, а не экстремум: в кольцо у +Y попадает край кабины,
+        # и по минимуму/максимуму габарит уехал бы на неё. По z нужен именно
+        # максимум — это и есть кромка борта, через которую перекидывают тент.
+        bmin = np.quantile(v, 0.01, axis=0)
+        bmax = np.quantile(v, 0.99, axis=0)
+        bmin[2] = v[:, 2].min()
+        bmax[2] = v[:, 2].max()
+        if np.any(bmax - bmin <= _EPS):
+            return whole
+        return bmin, bmax
+
+    def _cabin_rail(self, rails):
+        """Кромка переднего (обращённого к кабине) борта."""
+        axis, sign = self.CABIN_AXIS, self.CABIN_SIGN
+        facing = [r for r in rails
+                  if int(np.argmax(np.abs(r[2]))) == axis
+                  and r[2][axis] * sign > 0]
+        return facing[0] if facing else None
 
     def _cuzov_node(self):
         app = self.app
@@ -771,13 +837,13 @@ class ClothSimulator:
         except Exception:
             return None
 
-    def _layout(self, placement, rng, cuzov_verts=None):
+    def _layout(self, placement, rng, cuzov_verts=None, cargo_verts=None):
         """Стартовая сетка + маска закреплённых точек + препятствия.
 
         Возвращает dict с полями grid, rest, pinned, ground_z, wind_dir,
         span (характерный размер — от него берутся сила ветра и шаг сетки).
         """
-        bounds = self._cuzov_bounds()
+        bounds = self._body_bounds(cuzov_verts, cargo_verts)
         if bounds is None:
             return None
 
@@ -787,22 +853,91 @@ class ClothSimulator:
         bmin, bmax = bounds
         rails = self._rails(bmin, bmax)
 
+        if placement == "on_load":
+            return self._layout_on_load(bounds, rng, cargo_verts)
+
         if placement == "near_wall":
-            # Опорный случай (см. референс): тент лежит на ближней к кабине
-            # стенке. «Ближняя к кабине» = ближняя к камере — камера в этом
-            # проекте и смотрит из кабины в кузов. Так тент гарантированно
-            # попадает в кадр, а не прячется за дальним бортом.
-            cam = self._camera_pos()
-            if cam is not None:
-                rail = min(rails, key=lambda r: np.linalg.norm(r[0] - cam))
-            else:
+            # Опорный случай (см. референс): тент перекинут через ПЕРЕДНИЙ борт
+            # кузова, тот, что смотрит на кабину. Раньше здесь брался борт,
+            # ближайший к КАМЕРЕ, — а она стоит сбоку, поэтому тент всегда
+            # оказывался на одном и том же боковом борту (см. _body_bounds).
+            rail = self._cabin_rail(rails)
+            if rail is None:
                 rail = rails[int(rng.integers(0, len(rails)))]
         else:
             rail = rails[int(rng.integers(0, len(rails)))]
 
-        return self._layout_rail(rail, bounds, rng, placement, cuzov_verts)
+        return self._layout_rail(rail, bounds, rng, placement, cuzov_verts,
+                                 cargo_verts)
 
-    def _layout_rail(self, rail, bounds, rng, placement, cuzov_verts=None):
+    def _layout_on_load(self, bounds, rng, cargo_verts):
+        """Полотно, ЛЕЖАЩЕЕ на грузе у переднего борта.
+
+        Ничего не закрепляется: тент просто брошен на насыпь и удерживается
+        трением. Стартует чуть выше груза и падает на него, поэтому складки
+        рождаются самим падением, а не затравкой.
+        """
+        bmin, bmax = bounds
+        size = bmax - bmin
+        axis = self.CABIN_AXIS
+        other = 1 - axis
+
+        # Верх насыпи: по нему выставляется высота старта.
+        if cargo_verts is not None and len(cargo_verts):
+            top = float(np.quantile(cargo_verts[:, 2], 0.98))
+        else:
+            top = float(bmin[2] + 0.6 * size[2])
+
+        width = size[other] * float(rng.uniform(0.55, 0.95))
+        length = size[axis] * float(rng.uniform(0.35, 0.70))
+
+        # Смещаем к кабине, но не впритык к борту.
+        near = bmax[axis] - length * 0.5 - size[axis] * float(
+            rng.uniform(0.02, 0.18))
+        centre = np.zeros(3)
+        centre[axis] = near
+        centre[other] = 0.5 * (bmin[other] + bmax[other]) + size[other] * float(
+            rng.uniform(-0.12, 0.12))
+
+        gather = float(rng.uniform(1.08, 1.40))
+        rest_width = width * gather
+        cell_est = max(rest_width, length) / (
+            rng.uniform(95.0, 145.0) if warp_available()
+            else rng.uniform(44.0, 62.0))
+        nx, ny, cell = self._grid_dims(rest_width, length, cell_est)
+
+        drop = max(cell * 4.0, size[2] * float(rng.uniform(0.05, 0.18)))
+        u = np.linspace(-width * 0.5, width * 0.5, nx)
+        v = np.linspace(-length * 0.5, length * 0.5, ny)
+        uu, vv = np.meshgrid(u, v)
+
+        grid = np.zeros((ny, nx, 3), dtype=np.float64)
+        grid[..., other] = centre[other] + uu
+        grid[..., axis] = centre[axis] + vv
+        grid[..., 2] = top + drop
+
+        # Лёгкая волна по высоте — полотно ложится неровно, а не плитой.
+        depth = np.abs(vv) / max(np.abs(v).max(), _EPS)
+        grid[..., 2] += self._buckle_seed(nx, ny, cell * 1.5, depth, rng)
+
+        wind_dir = np.zeros(3)
+        wind_dir[other] = float(rng.uniform(-1.0, 1.0))
+        wind_dir[axis] = float(rng.uniform(-1.0, 1.0))
+        wind_dir[2] = float(rng.uniform(-0.1, 0.35))
+
+        return {
+            "grid": grid,
+            "rest": self._rest_sheet(nx, ny, rest_width, length),
+            "pinned": np.zeros((ny, nx), dtype=bool),   # ничем не закреплён
+            "ground_z": self._ground_z(bmin),
+            "wind_dir": wind_dir,
+            "span": max(width, length),
+            "cell": cell,
+            "gather": gather,
+        }
+
+    def _layout_rail(self, rail, bounds, rng, placement, cuzov_verts=None,
+                     cargo_verts=None):
         """Тент, переброшенный через кромку борта.
 
         Раскладка идёт снизу-снаружи -> вверх по наружной стороне -> через
@@ -819,7 +954,10 @@ class ClothSimulator:
         height = max(size[2], _EPS)
 
         # Реальная толщина борта — тент ПЕРЕКРЫВАЕТ её, а не протыкает.
-        wall = self._wall_thickness(cuzov_verts, rail, bounds)
+        axis_out = int(np.argmax(np.abs(outward)))
+        wall = self._wall_inset(bounds, cargo_verts, axis_out,
+                                float(np.sign(outward[axis_out])),
+                                cuzov_verts, rail)
 
         # Тент вписывается в ВНУТРЕННИЙ проём кузова, а не в габарит по AABB:
         # свисающая часть висит между боковыми стенками, и полотно шириной во
@@ -831,7 +969,9 @@ class ClothSimulator:
                       if int(np.argmax(np.abs(r[2]))) == axis_along]
         inset_lo = inset_hi = 0.0
         for r in side_walls:
-            w = self._wall_thickness(cuzov_verts, r, bounds)
+            w = self._wall_inset(bounds, cargo_verts, axis_along,
+                                 float(np.sign(r[2][axis_along])),
+                                 cuzov_verts, r)
             if r[2][axis_along] > 0:
                 inset_hi = w
             else:
@@ -840,10 +980,12 @@ class ClothSimulator:
         interior_hi = bmax[axis_along] - inset_hi
         usable = max(interior_hi - interior_lo, _EPS)
 
-        # Размеры с референса: тент заметно УЖЕ борта и не достаёт до земли.
-        width = usable * float(rng.uniform(0.28, 0.62))
-        drop_in = height * float(rng.uniform(0.45, 1.1))    # внутрь кузова
-        drop_out = height * float(rng.uniform(0.12, 0.45))  # наружу
+        # Размеры: тент занимает заметную часть борта. Уже борта он остаётся
+        # (иначе края вдавливаются в перпендикулярные стенки), но мелким уже
+        # не бывает — прежние доли давали лоскут на пол-кадра.
+        width = usable * float(rng.uniform(0.45, 0.90))
+        drop_in = height * float(rng.uniform(0.70, 1.50))   # внутрь кузова
+        drop_out = height * float(rng.uniform(0.25, 0.70))  # наружу
 
         gather = float(rng.uniform(1.10, 1.55))
         rest_width = width * gather
@@ -897,7 +1039,12 @@ class ClothSimulator:
         # снаружи. Сетка на GPU втрое плотнее, и зазор в долях ячейки съёжился
         # бы втрое — ткань начинала бы внутри стенки и там и оставалась.
         # Поэтому есть второй, независимый от плотности предел: доля борта.
-        clear = max(cell * 1.6, wall * 0.4)
+        # Доля борта здесь — лишь СТРАХОВКА на случай, когда ячейка сильно
+        # мельче стенки; сам зазор должен быть минимальным, иначе тент стартует
+        # (и, если он жёсткий, остаётся) заметно в стороне от кузова. Барьер
+        # коллизии — 1.2 ячейки, так что cell * 1.6 его гарантированно
+        # перекрывает.
+        clear = max(cell * 1.6, wall * 0.15)
         cross0, cross1 = drop_out, drop_out + cross_w
         lateral = np.where(
             vv < cross0,
@@ -1172,7 +1319,7 @@ class ClothSimulator:
         return data
 
     def _collect_meshes(self):
-        """(меш кузова | None, [все меши для коллизий]).
+        """(меш кузова | None, меш груза | None, [все меши для коллизий]).
 
         Меш кузова нужен отдельно: по нему измеряется РЕАЛЬНАЯ толщина борта
         (см. _wall_thickness), без которой раскладка тента попадает внутрь
@@ -1202,7 +1349,7 @@ class ClothSimulator:
         if cargo is not None:
             meshes.append(cargo)
 
-        return cuzov_mesh, meshes
+        return cuzov_mesh, cargo, meshes
 
     @staticmethod
     def _make_collider(meshes, thickness, region, gpu=False):
@@ -1220,6 +1367,32 @@ class ClothSimulator:
         for verts, faces in meshes:
             collider.add_mesh(verts, faces, region=region)
         return collider if collider.build() else None
+
+    def _wall_inset(self, bounds, cargo_verts, axis, sign,
+                    cuzov_verts=None, rail=None):
+        """Толщина борта по оси `axis` со стороны `sign`.
+
+        Внутренняя грань борта — это край ОТПЕЧАТКА ГРУЗА: наполнение
+        генерируется вплотную к стенкам, поэтому зазор между габаритом кузова и
+        габаритом груза и есть борт.
+
+        Так надёжнее, чем искать вторую грань среди вершин (_wall_thickness):
+        тот берёт 2% квантиль глубины в окне шириной 0.3 габарита и потому
+        цепляет не стенку, а пол и раму за ней. На MAZ он давал 0.594 при
+        потолке 0.25*габарита — то есть упирался в ограничитель, съедал
+        половину ширины кузова, и тент выходил вдвое меньше заданного.
+        """
+        bmin, bmax = bounds
+        size = float(bmax[axis] - bmin[axis])
+        if cargo_verts is not None and len(cargo_verts) >= 8:
+            lo = float(np.quantile(cargo_verts[:, axis], 0.01))
+            hi = float(np.quantile(cargo_verts[:, axis], 0.99))
+            t = (bmax[axis] - hi) if sign > 0 else (lo - bmin[axis])
+            if 0.0 < t < 0.25 * size:
+                return float(t)
+        if cuzov_verts is not None and rail is not None:
+            return self._wall_thickness(cuzov_verts, rail, bounds)
+        return size * 0.04
 
     @staticmethod
     def _wall_thickness(verts, rail, bounds):
@@ -1272,10 +1445,11 @@ class ClothSimulator:
 
         # Геометрия читается ОДИН раз: раскладке она нужна для замера толщины
         # борта, коллайдеру — как препятствие.
-        cuzov_mesh, meshes = self._collect_meshes()
+        cuzov_mesh, cargo_mesh, meshes = self._collect_meshes()
         cuzov_verts = cuzov_mesh[0] if cuzov_mesh is not None else None
+        cargo_verts = cargo_mesh[0] if cargo_mesh is not None else None
 
-        layout = self._layout(placement, rng, cuzov_verts)
+        layout = self._layout(placement, rng, cuzov_verts, cargo_verts)
         if layout is None:
             print("[Cloth] кузов не найден — полотно не создано")
             return None
@@ -1416,26 +1590,49 @@ class ClothSimulator:
         # сетка тента — это десятки тысяч вершин, и цикл на Python по ним
         # стоил бы больше, чем вся симуляция на GPU. Формат v3n3t2 —
         # чередование 8 float32 на вершину, ровно как в массиве ниже.
+        # Полотно строится ДВУСТОРОННИМ явно: та же поверхность дублируется с
+        # обратной намоткой и ИНВЕРТИРОВАННЫМИ нормалями.
+        #
+        # setTwoSided(True) для этого не годится: он лишь отключает отсечение
+        # задних граней, но нормаль остаётся передней, и обратная сторона
+        # освещается как отвёрнутая от света — то есть уходит в чёрный. Ни один
+        # шейдер проекта gl_FrontFacing не обрабатывает, так что чинить надо
+        # геометрией. Ткань тонкая и постоянно повёрнута к камере изнанкой,
+        # поэтому цена (вдвое больше вершин) оправдана.
+        n_vert = nx * ny
+
         fmt = GeomVertexFormat.getV3n3t2()
         vdata = GeomVertexData("cloth", fmt, Geom.UHStatic)
-        vdata.set_num_rows(nx * ny)
+        vdata.set_num_rows(n_vert * 2)
 
-        interleaved = np.empty((nx * ny, 8), dtype=np.float32)
-        interleaved[:, 0:3] = grid.reshape(-1, 3)
-        interleaved[:, 3:6] = normals.reshape(-1, 3)
-        interleaved[:, 6] = uu.reshape(-1)
-        interleaved[:, 7] = vv.reshape(-1)
+        interleaved = np.empty((n_vert * 2, 8), dtype=np.float32)
+        interleaved[:n_vert, 0:3] = grid.reshape(-1, 3)
+        interleaved[:n_vert, 3:6] = normals.reshape(-1, 3)
+        interleaved[:n_vert, 6] = uu.reshape(-1)
+        interleaved[:n_vert, 7] = vv.reshape(-1)
+        # Изнанка: те же позиции и UV, нормаль наружу с другой стороны.
+        interleaved[n_vert:] = interleaved[:n_vert]
+        interleaved[n_vert:, 3:6] *= -1.0
         vdata.modify_array(0).modify_handle().set_data(
             interleaved.tobytes())
 
-        idx = np.arange(nx * ny).reshape(ny, nx)
+        idx = np.arange(n_vert).reshape(ny, nx)
         a = idx[:-1, :-1].reshape(-1)
         b = idx[1:, :-1].reshape(-1)
         c = idx[:-1, 1:].reshape(-1)
         d = idx[1:, 1:].reshape(-1)
-        tris = np.empty((2 * a.size, 3), dtype=np.uint32)
-        tris[0::2] = np.stack([a, b, c], axis=1)
-        tris[1::2] = np.stack([b, d, c], axis=1)
+        # Намотка ОБЯЗАНА совпадать с нормалью из grid_normals (cross(du, dv)):
+        # порядок (a, b, c) даёт геометрическую нормаль cross(dv, du), то есть
+        # ПРОТИВОПОЛОЖНУЮ. Прежнему коду это сходило с рук — setTwoSided(True)
+        # отключал отсечение, и грань рисовалась с любой стороны. Как только
+        # отсечение включено, лицевая половина отсекается, остаётся только
+        # изнанка с инвертированной нормалью — полотно становится сплошь
+        # чёрным. Поэтому здесь (a, c, b) и (b, c, d).
+        front = np.empty((2 * a.size, 3), dtype=np.uint32)
+        front[0::2] = np.stack([a, c, b], axis=1)
+        front[1::2] = np.stack([b, c, d], axis=1)
+        # Обратная намотка, чтобы изнанка смотрела наружу своей нормалью.
+        tris = np.concatenate([front, front[:, ::-1] + n_vert])
 
         prim = GeomTriangles(Geom.UHStatic)
         # 32-битные индексы: при плотной сетке вершин заметно больше 65536,
@@ -1463,8 +1660,9 @@ class ClothSimulator:
         gnode.addGeom(geom)
         node = self.app.render.attachNewNode(gnode)
 
-        # Ткань видна с обеих сторон — она тонкая и часто повёрнута изнанкой.
-        node.setTwoSided(True)
+        # setTwoSided НЕ включаем: обе стороны уже есть в геометрии, каждая со
+        # своей нормалью. Отключение отсечения здесь только удваивало бы
+        # растеризацию и возвращало бы чёрную изнанку.
 
         apply_shader = getattr(self.app, "_apply_auto_shader", None)
         if apply_shader is not None:

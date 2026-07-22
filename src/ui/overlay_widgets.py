@@ -179,10 +179,34 @@ class SceneOverlay(QWidget):
         self.show()
         self.raise_()
 
-    def set_rows(self, rows: list[tuple[str, str]]) -> None:
+    def set_rows(self, rows: list[tuple[str, str]],
+                 columns: int = 1) -> None:
+        """
+        Fill the card with key/value rows. `columns` > 1 packs several
+        pairs onto one physical line — the card then needs far less
+        vertical space, which matters for the bottom-left telemetry card
+        that also hosts the daytime slider, camera modes, presets and the
+        whole dataset/save block.
+        """
         self._clear_rows()
-        for key, value in rows:
-            self._rows_holder.addWidget(self._make_row(key, value))
+        columns = max(1, int(columns))
+        if columns == 1:
+            for key, value in rows:
+                self._rows_holder.addWidget(self._make_row(key, value))
+        else:
+            for i in range(0, len(rows), columns):
+                chunk = rows[i:i + columns]
+                line = QWidget()
+                lay = QHBoxLayout(line)
+                lay.setContentsMargins(0, 0, 0, 0)
+                lay.setSpacing(14)
+                for key, value in chunk:
+                    lay.addWidget(self._make_row(key, value), 1)
+                # Pad the last, short line so its cells keep the same
+                # width as the full lines above.
+                for _ in range(columns - len(chunk)):
+                    lay.addStretch(1)
+                self._rows_holder.addWidget(line)
         # Re-fit height to contents after the row list changes.
         self.adjustSize()
         self._reposition()
@@ -239,15 +263,22 @@ class SceneOverlay(QWidget):
         h = self.sizeHint().height()
         m = self._margin
 
+        # A bottom-anchored card that grew taller than the viewport would
+        # otherwise run off the top edge and lose its first rows. Clamp the
+        # height so the card always starts at the top margin and stays
+        # fully inside the viewport.
+        if self._anchor.startswith("bottom"):
+            h = min(h, max(1, ph - 2 * m))
+
         # Anchor point in `owner` local coordinates.
         if self._anchor == "top-left":
             local = QPoint(m, m)
         elif self._anchor == "top-right":
             local = QPoint(pw - w - m, m)
         elif self._anchor == "bottom-left":
-            local = QPoint(m, ph - h - m)
+            local = QPoint(m, max(m, ph - h - m))
         else:  # bottom-right
-            local = QPoint(pw - w - m, ph - h - m)
+            local = QPoint(pw - w - m, max(m, ph - h - m))
 
         # Translate to screen-space — we're a top-level window now.
         gp = owner.mapToGlobal(local)

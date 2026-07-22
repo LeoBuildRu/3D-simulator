@@ -219,12 +219,19 @@ class MainWindow(QMainWindow):
         # ~8 FPS preview is plenty and stays out of RP's way.
 
         # ---- Camera telemetry (BOTTOM-LEFT) -------------------------
+        # Wider than the default 240px card: this one carries the whole
+        # camera + dataset control stack (telemetry, daytime, camera modes,
+        # presets, snapshot options), so the extra width lets the rows sit
+        # side by side instead of overflowing.
         self.telemetry = SceneOverlay(
             "Камера · Телеметрия",
             anchor="bottom-left",
             parent=self.panda_container,
             margin=16,
+            width=240,
         )
+        # Two columns → 7 telemetry rows collapse to 4 lines, freeing the
+        # vertical space the controls below need.
         self.telemetry.set_rows([
             ("PITCH", "  0.0"),
             ("YAW",   "  0.0"),
@@ -233,7 +240,7 @@ class MainWindow(QMainWindow):
             ("X",     "  0.0"),
             ("Y",     "  0.0"),
             ("Z",     "  0.0"),
-        ])
+        ], columns=2)
         self.telemetry.attach()
 
         # ---- Time-of-day slider (sits inside the telemetry card) ----
@@ -490,6 +497,7 @@ class MainWindow(QMainWindow):
                 QFrame as _QFr2,
                 QComboBox as _QCB2,
                 QCheckBox as _QCk2,
+                QGridLayout as _QGr2,
             )
             from src.ui.ui_theme import (
                 COLOR_TEXT as _RCT,
@@ -502,9 +510,10 @@ class MainWindow(QMainWindow):
             save_holder.setStyleSheet(
                 "QFrame { background: transparent; border: none; }"
             )
-            # Две строки: 1) подпись + кол-во + тип датасета; 2) случайный
-            # фон + кнопка сохранения. Так контролы не сжимаются в одну
-            # узкую строку.
+            # Три блока: 1) подпись + кол-во + тип датасета; 2) сетка
+            # опций 2x2 (случ. фон / ИИ-обработка / ткань); 3) кнопка
+            # сохранения во всю ширину. Так ничего не сжимается и не
+            # вылезает за края карточки.
             sh_lay = _QVB2(save_holder)
             sh_lay.setContentsMargins(0, 6, 0, 0)
             sh_lay.setSpacing(6)
@@ -512,9 +521,10 @@ class MainWindow(QMainWindow):
             sh_row1 = _QHB2()
             sh_row1.setContentsMargins(0, 0, 0, 0)
             sh_row1.setSpacing(6)
-            sh_row2 = _QHB2()
-            sh_row2.setContentsMargins(0, 0, 0, 0)
-            sh_row2.setSpacing(6)
+            sh_opts = _QGr2()
+            sh_opts.setContentsMargins(0, 0, 0, 0)
+            sh_opts.setHorizontalSpacing(10)
+            sh_opts.setVerticalSpacing(4)
 
             sr_label = _QL2("СНИМОК")
             sr_label.setStyleSheet(
@@ -674,15 +684,18 @@ class MainWindow(QMainWindow):
             sh_row1.addWidget(self.spn_render_count, 0, Qt.AlignmentFlag.AlignVCenter)
             sh_row1.addWidget(self.cmb_dataset_type, 1, Qt.AlignmentFlag.AlignVCenter)
 
-            # Строка 2: случайный фон + Gemini + ткань + кнопка сохранения.
-            sh_row2.addWidget(self.chk_random_bg, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_row2.addWidget(self.chk_gemini, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_row2.addWidget(self.chk_cloth, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_row2.addStretch(1)
-            sh_row2.addWidget(self.btn_save_render, 0, Qt.AlignmentFlag.AlignVCenter)
+            # Сетка опций 2x2: чекбоксы больше не соревнуются за ширину
+            # с кнопкой сохранения и не обрезаются.
+            sh_opts.addWidget(self.chk_random_bg, 0, 0)
+            sh_opts.addWidget(self.chk_gemini,    0, 1)
+            sh_opts.addWidget(self.chk_cloth,     1, 0)
+            sh_opts.setColumnStretch(0, 1)
+            sh_opts.setColumnStretch(1, 1)
 
             sh_lay.addLayout(sh_row1)
-            sh_lay.addLayout(sh_row2)
+            sh_lay.addLayout(sh_opts)
+            # Кнопка сохранения — отдельной строкой во всю ширину карточки.
+            sh_lay.addWidget(self.btn_save_render)
 
             self.telemetry.attach_extra(save_holder)
         except Exception as exc:
