@@ -700,16 +700,15 @@ class ClothSimulator:
     THICKNESS_CELLS_GPU = 1.2
 
     # Режимы размещения и их веса при случайном выборе. Основной случай —
-    # опорный (референс): небольшой тент на ближней к кабине стенке.
-    # «Полотно во весь кадр» оставлено редким: как штатный вид оно слишком
-    # закрывает сцену.
+    # опорный (референс): тент лежит на кромке ближнего к кабине борта и
+    # свисает с него наружу.
     # Свисающий через борт тент — основной случай датасета: суммарно 80%
     # (near_wall + any_rail). Остальное — редкие виды для разнообразия.
     PLACEMENTS = {
         "near_wall": 0.55,   # через ПЕРЕДНИЙ борт, тот, что к кабине
         "any_rail": 0.25,    # через произвольный борт
         "on_load": 0.10,     # просто лежит на грузе у кабины
-        "full_frame": 0.10,  # у самой камеры, закрывает весь кадр
+        "full_frame": 0.10,  # тот же передний борт, но полотно во весь кузов
     }
 
     def __init__(self, panda_app):
@@ -847,20 +846,19 @@ class ClothSimulator:
         if bounds is None:
             return None
 
-        if placement == "full_frame":
-            return self._layout_full_frame(rng, bounds)
-
         bmin, bmax = bounds
         rails = self._rails(bmin, bmax)
 
         if placement == "on_load":
             return self._layout_on_load(bounds, rng, cargo_verts)
 
-        if placement == "near_wall":
-            # Опорный случай (см. референс): тент перекинут через ПЕРЕДНИЙ борт
-            # кузова, тот, что смотрит на кабину. Раньше здесь брался борт,
+        if placement in ("near_wall", "full_frame"):
+            # Опорный случай (см. референс): тент лежит на ПЕРЕДНЕМ борту
+            # кузова, том, что смотрит на кабину. Раньше здесь брался борт,
             # ближайший к КАМЕРЕ, — а она стоит сбоку, поэтому тент всегда
             # оказывался на одном и том же боковом борту (см. _body_bounds).
+            # full_frame — тот же борт, но полотно размером с кузов (см.
+            # _layout_rail).
             rail = self._cabin_rail(rails)
             if rail is None:
                 rail = rails[int(rng.integers(0, len(rails)))]
@@ -938,11 +936,23 @@ class ClothSimulator:
 
     def _layout_rail(self, rail, bounds, rng, placement, cuzov_verts=None,
                      cargo_verts=None):
-        """Тент, переброшенный через кромку борта.
+        """Тент, лежащий НА кромке борта и свисающий с неё наружу.
 
-        Раскладка идёт снизу-снаружи -> вверх по наружной стороне -> через
-        кромку -> вниз ВНУТРЬ кузова. Внутренняя часть — основная (как на
-        референсе), снаружи свисает лишь край.
+        Раскладка идёт снизу-снаружи -> вверх по наружной грани -> через торец
+        борта -> и дальше ГОРИЗОНТАЛЬНО внутрь, поверх груза.
+
+        Раньше внутренняя часть свисала ВНИЗ вдоль внутренней грани, и полотно
+        получалось перевёрнутой буквой U: узкая полоска, оседлавшая кромку и
+        подвёрнутая с обеих сторон. Настоящий тент так не лежит — основная его
+        масса лежит ПЛАШМЯ на верху кузова (на кромке и на насыпи), собираясь
+        в пару складок, и только свободный край свисает через борт наружу.
+        Поэтому внутренний участок теперь не падение, а горизонтальный настил
+        длиной в заметную долю кузова.
+
+        Режим full_frame — тот же самый расклад, но полотно размером с сам
+        кузов: наружу свисает лишь кромка, а весь настил уносит ветром в
+        сторону, противоположную борту, так что тент развевается над кузовом
+        и закрывает часть кадра или весь кадр.
 
         Ткань нигде не закрепляется жёстко: её держит перегиб через кромку и
         трение о борт — именно поэтому нужна коллизия с реальной геометрией,
@@ -980,15 +990,35 @@ class ClothSimulator:
         interior_hi = bmax[axis_along] - inset_hi
         usable = max(interior_hi - interior_lo, _EPS)
 
+        big = placement == "full_frame"
+
+        # Габарит кузова ПОПЕРЁК кромки: от него отмеряется настил. Привязка
+        # именно к нему, а не к высоте борта, и делает тент «лежащим на
+        # кузове», а не оседлавшим кромку.
+        depth_body = max(float(size[axis_out]), _EPS)
+
         # Размеры: тент занимает заметную часть борта. Уже борта он остаётся
         # (иначе края вдавливаются в перпендикулярные стенки), но мелким уже
         # не бывает — прежние доли давали лоскут на пол-кадра.
-        width = usable * float(rng.uniform(0.45, 0.90))
-        drop_in = height * float(rng.uniform(0.70, 1.50))   # внутрь кузова
-        drop_out = height * float(rng.uniform(0.25, 0.70))  # наружу
+        if big:
+            # Полотно размером с кузов. Наружу почти ничего не свисает: всё
+            # полотно уходит настилом внутрь и подхватывается ветром.
+            width = usable * float(rng.uniform(0.95, 1.45))
+            lie_in = depth_body * float(rng.uniform(0.8, 1.35))
+            drop_out = height * float(rng.uniform(0.05, 0.25))
+        else:
+            width = usable * float(rng.uniform(0.45, 0.90))
+            lie_in = depth_body * float(rng.uniform(0.18, 0.45))  # настил
+            drop_out = height * float(rng.uniform(0.55, 1.25))    # наружу
 
         gather = float(rng.uniform(1.10, 1.55))
         rest_width = width * gather
+
+        # Припуск ВДОЛЬ полотна (поперёк кромки). Без него настил — натянутая
+        # плоскость: складкам просто неоткуда взяться, лишнего материала нет.
+        # Пара процентов уже даёт 1-2 гребня на лежащей части.
+        gather_v = float(rng.uniform(1.02, 1.08) if big
+                         else rng.uniform(1.05, 1.20))
 
         # Сдвиг вдоль кромки — тент не обязан быть по центру борта, но целиком
         # остаётся в проёме. Место резервируется по REST_WIDTH, а не по
@@ -1009,7 +1039,7 @@ class ClothSimulator:
         # а не гранёными. Ниже ещё идёт сглаживающее подразбиение под рендер.
         density = (rng.uniform(95.0, 145.0) if warp_available()
                    else rng.uniform(44.0, 62.0))
-        est = drop_in + drop_out + max(wall, _EPS)
+        est = lie_in + drop_out + max(wall, _EPS)
         cell_est = max(rest_width, est) / density
 
         # Переход не может быть уже пары ячеек: борт бывает тоньше шага сетки,
@@ -1017,7 +1047,7 @@ class ClothSimulator:
         # ЗАКРЕПЛЁННЫЙ ряд перегиба проваливается в толщу борта (коллизия
         # якоря не спасала). Ткань и в жизни ложится на кромку с напуском.
         cross_w = max(wall, cell_est * 2.5)
-        total = drop_in + drop_out + cross_w
+        total = lie_in + drop_out + cross_w
         nx, ny, cell = self._grid_dims(rest_width, total, cell_est)
 
         u = np.linspace(-width * 0.5, width * 0.5, nx) + offset
@@ -1029,7 +1059,7 @@ class ClothSimulator:
         # Профиль поперёк борта из трёх участков (как настоящий тент):
         #   v < drop_out          — свисает СНАРУЖИ вдоль наружной грани;
         #   drop_out .. +wall     — лежит на торце борта, пересекая толщину;
-        #   дальше                — свисает ВНУТРЬ вдоль внутренней грани.
+        #   дальше                — ЛЕЖИТ ПЛАШМЯ внутрь, поверх груза.
         # lateral отсчитывается от НАРУЖНОЙ грани: + наружу, − внутрь кузова.
         # Зазор до борта должен быть заметно больше барьера коллизии
         # (thickness = cell*0.75), иначе ткань стартует уже в барьере.
@@ -1046,16 +1076,48 @@ class ClothSimulator:
         # перекрывает.
         clear = max(cell * 1.6, wall * 0.15)
         cross0, cross1 = drop_out, drop_out + cross_w
+
+        # Высота настила. В обычном режиме он ложится на то, что выше —
+        # кромку борта или насыпь; стартовать НИЖЕ верха груза нельзя, иначе
+        # полотно начинает внутри насыпи, а незнаковая коллизия его оттуда не
+        # достаёт. В режиме full_frame настил специально поднят над кузовом:
+        # ему предстоит не лечь, а развеваться.
+        rest_top = bmax[2]
+        if cargo_verts is not None and len(cargo_verts):
+            rest_top = max(rest_top, float(np.quantile(cargo_verts[:, 2], 0.97)))
+        lie_z = rest_top + clear
+        if big:
+            lie_z += height * float(rng.uniform(0.35, 0.90))
+
+        # Настил идёт ГОРИЗОНТАЛЬНО внутрь: lateral убегает в −outward, а z
+        # держится на lie_z. Подъём от торца борта до lie_z — на первой трети
+        # настила, чтобы не было ступеньки у закреплённого перегиба.
+        ramp = np.clip((vv - cross1) / max(lie_in * 0.35, _EPS), 0.0, 1.0)
         lateral = np.where(
             vv < cross0,
             clear,
             np.where(vv > cross1,
-                     -(wall + clear),
+                     -(wall + clear) - (vv - cross1),
                      clear - (wall + 2.0 * clear)
                      * (vv - cross0) / max(cross_w, _EPS)))
         z = np.where(
             vv < cross0, bmax[2] - (cross0 - vv),
-            np.where(vv > cross1, bmax[2] - (vv - cross1), bmax[2] + clear))
+            np.where(vv > cross1,
+                     (bmax[2] + clear) + (lie_z - bmax[2] - clear) * ramp,
+                     bmax[2] + clear))
+
+        # Складки на настиле: 1-3 гребня поперёк полотна, смещение только
+        # ВВЕРХ — вниз некуда, там опора. При ramp = 0 (у самого перегиба)
+        # гребень нулевой, поэтому стыка с участком на торце борта нет.
+        lie_t = np.clip((vv - cross1) / max(lie_in, _EPS), 0.0, 1.0)
+        folds = float(rng.integers(1, 4))
+        ridge = 0.5 - 0.5 * np.cos(2.0 * math.pi * folds * lie_t)
+        # Гребни не строго прямые — лёгкая раскачка вдоль кромки.
+        wave = float(rng.integers(1, 4))
+        ridge *= 1.0 + 0.25 * np.sin(
+            wave * math.pi * (uu - uu.min()) / max(uu.max() - uu.min(), _EPS)
+            + float(rng.uniform(0.0, 2.0 * math.pi)))
+        z = z + max(cell * 3.0, clear * 2.0) * ridge
 
         # Острые углы на кромке сглаживаем вдоль v: настоящая ткань ложится на
         # торец борта скруглённо, а не ломается под 90°.
@@ -1082,7 +1144,7 @@ class ClothSimulator:
         grid += outward[None, None, :] * self._buckle_seed(
             nx, ny, clear * 0.35, depth, rng)[..., None]
 
-        rest = self._rest_sheet(nx, ny, rest_width, total)
+        rest = self._rest_sheet(nx, ny, rest_width, total * gather_v)
 
         # Закрепляем только узкую полосу на самом перегибе: физически тент
         # держится именно кромкой. Всё остальное свободно и ложится складками.
@@ -1091,9 +1153,16 @@ class ClothSimulator:
         pinned[crease, :] = True
         self._punch_pins(pinned, rng, row=crease)
 
-        wind_dir = outward * float(rng.uniform(-0.6, 1.0)) \
-            + along * float(rng.uniform(-0.5, 0.5))
-        wind_dir[2] = float(rng.uniform(-0.1, 0.3))
+        if big:
+            # Ветер строго ОТ борта внутрь кузова (для переднего борта это −Y):
+            # полотно не свисает, а развевается над кузовом в сторону камеры.
+            wind_dir = -outward * float(rng.uniform(0.85, 1.0)) \
+                + along * float(rng.uniform(-0.25, 0.25))
+            wind_dir[2] = float(rng.uniform(0.05, 0.35))
+        else:
+            wind_dir = outward * float(rng.uniform(-0.6, 1.0)) \
+                + along * float(rng.uniform(-0.5, 0.5))
+            wind_dir[2] = float(rng.uniform(-0.1, 0.3))
 
         return {
             "grid": grid,
@@ -1104,84 +1173,10 @@ class ClothSimulator:
             "span": max(width, total),
             "cell": cell,
             "gather": gather,
-        }
-
-    def _layout_full_frame(self, rng, bounds):
-        """Полотно перед камерой — закрывает весь кадр или его часть.
-
-        Крепление — горизонтальная линия выше верхней кромки кадра, полотно
-        падает поперёк обзора. Ширина/длина берутся из FOV, поэтому режим
-        работает при любой позе камеры.
-        """
-        app = self.app
-        cam = app.cam
-        render = app.render
-        pos = cam.getPos(render)
-        cam_pos = np.array([pos[0], pos[1], pos[2]], dtype=np.float64)
-
-        quat = cam.getQuat(render)
-        fwd = np.array(list(quat.getForward()), dtype=np.float64)
-        right = np.array(list(quat.getRight()), dtype=np.float64)
-        up = np.array(list(quat.getUp()), dtype=np.float64)
-
-        lens = cam.node().getLens()
-        try:
-            fov_x, fov_y = lens.getFov()[0], lens.getFov()[1]
-        except Exception:
-            fov_x, fov_y = 45.0, 30.0
-
-        bmin, bmax = bounds
-        # Дистанция до полотна: между камерой и кузовом.
-        to_truck = np.linalg.norm((bmin + bmax) * 0.5 - cam_pos)
-        dist = to_truck * rng.uniform(0.25, 0.6)
-
-        half_w = dist * math.tan(math.radians(fov_x * 0.5))
-        half_h = dist * math.tan(math.radians(fov_y * 0.5))
-
-        # Запас, чтобы края полотна уходили за кадр (иначе видно кромку).
-        width = 2.0 * half_w * rng.uniform(1.15, 1.9)
-        drop = 2.0 * half_h * rng.uniform(1.3, 2.4)
-
-        gather = float(rng.uniform(1.06, 1.7))
-        rest_width = width * gather
-
-        cell = max(rest_width, drop) / (rng.uniform(70.0, 110.0)
-                                        if warp_available()
-                                        else rng.uniform(24.0, 34.0))
-        nx, ny, cell = self._grid_dims(rest_width, drop, cell)
-
-        centre = cam_pos + fwd * dist + up * (half_h * rng.uniform(0.9, 1.25))
-        u = np.linspace(-width * 0.5, width * 0.5, nx)
-        v = np.linspace(0.0, drop, ny)
-        uu, vv = np.meshgrid(u, v)
-
-        grid = (centre[None, None, :]
-                + right[None, None, :] * uu[..., None]
-                + up[None, None, :] * (-vv[..., None]))
-        # Небольшой наклон к камере — полотно «надувается» в объектив.
-        grid -= fwd[None, None, :] * (0.15 * vv[..., None])
-        # Складки выпучиваются вдоль оси обзора (см. _buckle_seed). Преград
-        # рядом нет, поэтому амплитуду ограничивает только вид.
-        grid -= fwd[None, None, :] * self._buckle_seed(
-            nx, ny, cell * 0.8, vv / max(drop, _EPS), rng)[..., None]
-
-        pinned = np.zeros((ny, nx), dtype=bool)
-        pinned[0, :] = True
-        self._punch_pins(pinned, rng)
-
-        # Ветер преимущественно на камеру.
-        wind_dir = -fwd + right * rng.uniform(-0.6, 0.6) + up * rng.uniform(-0.2, 0.4)
-
-        return {
-            "grid": grid,
-            "rest": self._rest_sheet(nx, ny, rest_width, drop),
-            "pinned": pinned,
-            "boxes": [],          # у камеры кузов не мешает
-            "ground_z": None,
-            "wind_dir": wind_dir,
-            "span": max(width, drop),
-            "cell": cell,
-            "gather": gather,
+            # full_frame живёт ветром: без штиля и без полного улёгшегося
+            # провиса, иначе полотно просто ляжет на груз (см. spawn_random).
+            "wind_forced": big,
+            "catch_flight": big,
         }
 
     @staticmethod
@@ -1498,8 +1493,8 @@ class ClothSimulator:
             print("[Cloth] сетка кузова недоступна, откат на AABB")
             for bmin, bmax in layout.get("boxes", []):
                 solver.add_box(bmin, bmax, margin=cell * 0.35)
-        # Иначе рядом с полотном просто нет геометрии (например, режим
-        # full_frame у камеры) — это норма, преград не нужно.
+        # Иначе рядом с полотном просто нет геометрии — это норма, преград
+        # не нужно.
 
         if layout["ground_z"] is not None:
             solver.set_ground(layout["ground_z"] + cell * 0.2)
@@ -1507,8 +1502,14 @@ class ClothSimulator:
 
         # Ветер в долях g — не зависит от масштаба сцены. Штиль (тяжёлый
         # провис) и шквал (полотно почти горизонтально) — обе крайности нужны.
-        wind_state = str(rng.choice(
-            ["calm", "breeze", "gusty", "strong"], p=[0.28, 0.30, 0.24, 0.18]))
+        if layout.get("wind_forced"):
+            # Полотно во весь кузов держится в воздухе ТОЛЬКО ветром: при
+            # штиле оно просто ляжет на груз и режим выродится в on_load.
+            wind_state = str(rng.choice(["gusty", "strong"], p=[0.35, 0.65]))
+        else:
+            wind_state = str(rng.choice(
+                ["calm", "breeze", "gusty", "strong"],
+                p=[0.28, 0.30, 0.24, 0.18]))
         wind_scale = {
             "calm": 0.0, "breeze": 0.35, "gusty": 0.7, "strong": 1.25,
         }[wind_state]
@@ -1523,7 +1524,9 @@ class ClothSimulator:
 
         # Сколько шагов «отпустить» ткань. Мало шагов = пойманное на лету
         # полоскание, много = улёгшийся тяжёлый провис.
-        if wind_scale > 0.0 and rng.random() < 0.5:
+        if layout.get("catch_flight"):
+            steps = int(rng.integers(55, 130))     # полотно ещё в полёте
+        elif wind_scale > 0.0 and rng.random() < 0.5:
             steps = int(rng.integers(45, 110))     # ловим движение
         else:
             steps = int(rng.integers(160, 340))    # даём улечься

@@ -1141,35 +1141,186 @@ class RendererUtils:
         for _ in range(max(1, int(frames))):
             tm.step()
 
-    def _grab_window_screenshot(self, img, *, steps=2):
-        """Снять текущий кадр ОНСКРИН-окна БЕЗ рассинхрона на один кадр.
+    # ==================================================================
+    # ЗАХВАТ КАДРА ОНСКРИН-ОКНА
+    #
+    # КОРЕНЬ СТАРОГО БАГА («оригинал = ПРЕДЫДУЩИЙ сэмпл, вырезанный по
+    # ТЕКУЩЕЙ маске»).
+    #
+    # Когда окно Panda перестаёт РИСОВАТЬ (свёрнуто / перекрыто; на WGL
+    # begin_frame() просто возвращает false для minimized-окна), его
+    # framebuffer сохраняет последний нарисованный кадр — то есть сцену
+    # ПРЕДЫДУЩЕГО сэмпла. При этом offscreen-буферы (маска сегментации,
+    # карта глубины) продолжают рендериться штатно: они не окна, состояние
+    # окна на них не влияет.
+    #
+    # Итог: маска и глубина — от ТЕКУЩЕГО сэмпла, цветной кадр — от
+    # ПРЕДЫДУЩЕГО. При замене фона (random_background) устаревший цветной
+    # кадр вырезается по актуальной маске — ровно наблюдаемый симптом.
+    #
+    # Измерено на этой машине (окно свёрнуто, 8 итераций):
+    #     win.get_screenshot()   -> устаревший кадр, 6/8 неверных
+    #     triggered copy         -> копии НЕТ вообще, 8/8
+    #     offscreen-буфер        -> ВЕРНО 8/8
+    #
+    # Отсюда два вывода, на которых построен этот код:
+    #
+    #  1) win.get_screenshot() НЕЛЬЗЯ использовать никогда: он молча отдаёт
+    #     устаревший кадр, и отличить его от корректного невозможно. Именно
+    #     этот молчаливый откат и делал прошлые попытки починки частичными —
+    #     добавление settle-кадров меняет лишь ВЕРОЯТНОСТЬ, но не ГАРАНТИЮ:
+    #     ожидание не заставит несвёрнутое окно рисовать.
+    #
+    #  2) RTM_triggered_copy_ram — одновременно и способ чтения, и ДЕТЕКТОР
+    #     устаревания. Panda копирует framebuffer внутри
+    #     GraphicsOutput::end_frame() — после отрисовки и до flip'а. Если
+    #     кадр не рисовался, копия НЕ ПРИХОДИТ. Значит: копия пришла =>
+    #     кадр реально нарисован сейчас => изображение по построению
+    #     актуально. Копии нет => кадр устарел => отказ, а НЕ тихая запись
+    #     испорченного сэмпла в датасет.
+    # ==================================================================
+    def _ensure_capture_texture(self):
+        """Один раз повесить на окно triggered-copy-текстуру. None при отказе.
 
-        Критично: последней операцией перед win.getScreenshot() ДОЛЖЕН быть
-        РЕАЛЬНЫЙ кадр пайплайна (taskMgr.step), а НЕ голый
-        graphicsEngine.render_frame(). RenderPipeline выполняет всю
-        пофреймовую работу в ТАСКАХ (RP_UpdateManagers sort=10,
-        RP_Plugin_BeforeRender sort=12, RP_UpdateInputsAndStages sort=18):
-        именно там stage_mgr.update()/common_resources.update() обновляют
-        матрицы камеры и продвигают ping-pong индексы темпоральных стадий
-        (TAA и т.п.). igLoop (draw+flip) идёт ПОСЛЕ них (sort=50). Голый
-        render_frame() гоняет только draw+flip и НЕ выполняет эти таски —
-        поэтому окно перепрезентует УСТАРЕВШИЙ композит предыдущего реального
-        кадра. Это и есть «пустой кузов на первом кадре / сдвиг на один кадр
-        относительно предыдущего»: маска/глубина берутся из отдельной
-        offscreen-камеры (плоский шейдер, без стадий пайплайна) и всегда
-        актуальны, а цветной кадр застывал на итерацию назад.
-
-        Делаем несколько реальных шагов пайплайна (обновляют стадии + делают
-        flip с текущей позой/сценой), затем читаем передний буфер.
+        RenderPipeline вызывает clear_render_textures() только на СВОИХ
+        внутренних буферах (render_target.py), окна не трогает, — так что
+        текстура тут держится стабильно. Пока копия не затребована явно,
+        стоимость нулевая (в отличие от RTM_copy_ram, копирующего каждый кадр).
         """
+        tex = getattr(self, "_capture_tex", None)
+        if tex is not None:
+            return tex
+        if getattr(self, "_capture_tex_failed", False):
+            return None
+
+        win = getattr(self.panda_app, "win", None)
+        if win is None:
+            return None
+        try:
+            tex = Texture("frame_capture")
+            ok = win.add_render_texture(
+                tex,
+                GraphicsOutput.RTM_triggered_copy_ram,
+                GraphicsOutput.RTP_color,
+            )
+            # На этой сборке Panda add_render_texture возвращает None (а не
+            # True) при успехе — отказом считаем только явный False.
+            if ok is False:
+                raise RuntimeError("add_render_texture отклонён")
+        except Exception as exc:
+            print(f"[Render] triggered-copy недоступен: {exc}")
+            self._capture_tex_failed = True
+            return None
+
+        self._capture_tex = tex
+        return tex
+
+    def _step_frames(self, count):
+        """`count` РЕАЛЬНЫХ кадров пайплайна (taskMgr.step, а не голый
+        render_frame): RenderPipeline делает всю пофреймовую работу в тасках
+        (RP_UpdateManagers sort=10, RP_Plugin_BeforeRender sort=12,
+        RP_UpdateInputsAndStages sort=18) — именно там обновляются матрицы
+        камеры и продвигаются ping-pong индексы темпоральных стадий (TAA).
+        igLoop (draw+flip) идёт ПОСЛЕ них, sort=50. Голый render_frame()
+        выполняет только draw+flip и эти таски НЕ гоняет."""
         tm = getattr(self.panda_app, "taskMgr", None)
-        if tm is not None:
-            for _ in range(max(1, int(steps))):
+        for _ in range(max(1, int(count))):
+            if tm is not None:
                 tm.step()
-        else:
-            for _ in range(max(1, int(steps))):
+            else:
                 self.panda_app.graphicsEngine.render_frame()
-        return self.panda_app.win.getScreenshot(img)
+
+    def _ensure_window_drawable(self):
+        """Вернуть окно в рисуемое состояние (развернуть, если свёрнуто).
+
+        Свёрнутое окно не рисуется — а значит, любой снятый с него кадр
+        устарел. Разворачиваем и ждём, пока Panda подтвердит смену свойств.
+        True, если окно рисуемо."""
+        win = getattr(self.panda_app, "win", None)
+        if win is None:
+            return False
+        try:
+            if not win.get_properties().get_minimized():
+                return True
+            print("[Render] окно свёрнуто — разворачиваю "
+                  "(свёрнутое окно не рисуется, кадр был бы устаревшим)")
+            props = WindowProperties()
+            props.set_minimized(False)
+            win.request_properties(props)
+            for _ in range(30):
+                self._step_frames(1)
+                if not win.get_properties().get_minimized():
+                    return True
+            return False
+        except Exception as exc:
+            print(f"[Render] проверка состояния окна не удалась: {exc}")
+            return True   # не блокируем съёмку из-за самой проверки
+
+    def _grab_window_screenshot(self, img, *, steps=2):
+        """Снять кадр окна ГАРАНТИРОВАННО актуальным, иначе честно отказать.
+
+        Возвращает False, если актуальность кадра подтвердить не удалось.
+        Вызывающий код обязан трактовать False как «сэмпл не снят» — лучше
+        потерять кадр, чем записать в датасет цветную картинку от предыдущего
+        сэмпла (её потом не отличить от корректной)."""
+        win = getattr(self.panda_app, "win", None)
+        if win is None:
+            return False
+
+        tex = self._ensure_capture_texture()
+        if tex is None:
+            # Драйвер не умеет triggered-copy. Тогда хотя бы не снимаем с
+            # заведомо нерисуемого окна: без детектора это единственная
+            # доступная проверка актуальности.
+            if not self._ensure_window_drawable():
+                print("[Render] ОТКАЗ: окно не рисуется, а triggered-copy "
+                      "недоступен — кадр был бы устаревшим.")
+                return False
+            self._step_frames(steps)
+            return win.getScreenshot(img)
+
+        for attempt in range(2):
+            if not self._ensure_window_drawable():
+                print("[Render] ОТКАЗ: окно не удалось вернуть в рисуемое "
+                      "состояние.")
+                return False
+
+            # Settle ДО триггера: копируемый кадр должен быть уже сошедшимся
+            # (TAA/каскадные тени/ленивая загрузка ресурсов на GPU).
+            self._step_frames(steps)
+
+            # Сбрасываем прошлую копию — иначе has_ram_image() ниже мог бы
+            # подтвердиться копией от ПРЕДЫДУЩЕГО захвата, и детектор
+            # устаревания молча пропустил бы устаревший кадр.
+            tex.clear_ram_image()
+
+            # trigger_copy() = «скопировать в конце СЛЕДУЮЩЕГО кадра».
+            win.trigger_copy()
+            self._step_frames(1)
+            for _ in range(8):
+                if tex.has_ram_image():
+                    break
+                self._step_frames(1)
+
+            if tex.has_ram_image():
+                if tex.store(img):
+                    # Ориентацию Texture.store() берёт на себя: проверено —
+                    # белая полоса, нарисованная СВЕРХУ, оказывается сверху и
+                    # в PNMImage. Ручной flip не нужен (та же схема, что и в
+                    # SegmentationRenderer.capture()).
+                    return True
+                print("[Render] tex.store() не удался.")
+                return False
+
+            # Копии нет => кадр не рисовался => он устарел. Единственная
+            # попытка спасения — пересоздать условия и повторить.
+            print(f"[Render] кадр не был нарисован (копия не пришла), "
+                  f"попытка {attempt + 1}/2")
+
+        print("[Render] ОТКАЗ: не удалось получить АКТУАЛЬНЫЙ кадр окна. "
+              "Сэмпл пропущен намеренно — запись устаревшего кадра испортила "
+              "бы датасет.")
+        return False
 
     def _get_gemini_processor(self):
         """Ленивое создание процессора постобработки (провайдер из config).
@@ -1308,40 +1459,16 @@ class RendererUtils:
 
         self.settle_render(frames=30)
 
-        # Читаем цветной кадр РЕАЛЬНЫМИ кадрами пайплайна (см.
-        # _grab_window_screenshot). Раньше здесь были два ГОЛЫХ
-        # graphicsEngine.render_frame() — они НЕ гоняют таски RenderPipeline
-        # (stage_mgr.update / common_resources.update), поэтому окно
-        # перепрезентовало устаревший композит на итерацию назад: цветной
-        # кадр «застревал» на пустом кузове / был сдвинут на один кадр
-        # относительно маски и глубины. taskMgr.step() обновляет стадии и
-        # делает flip с текущей позой/сценой — рассинхрон уходит.
+        # Цветной кадр. _grab_window_screenshot возвращает False, если не смог
+        # ПОДТВЕРДИТЬ актуальность кадра (окно не рисовалось) — тогда сэмпл
+        # пропускается целиком. Именно здесь раньше в датасет утекал цветной
+        # кадр от предыдущего сэмпла: он молча снимался со свёрнутого окна и
+        # затем вырезался по АКТУАЛЬНОЙ маске.
         img = PNMImage()
         self.settle_render(frames=30)
         if not self._grab_window_screenshot(img):
             self.panda_app.depth_renderer.set_overlay_visibility(False)
             return False
-
-        # --- ДИАГНОСТИКА (временно): подтверждаем гипотезу «замороженного»
-        # цветного кадра. Печатаем позу камеры + пару пикселей снятого кадра.
-        # Если поза камеры МЕНЯЕТСЯ от кадра к кадру, а пиксели/сумма НЕ
-        # меняются — значит win.getScreenshot() читает застывший буфер, и
-        # проблема в чтении онскрин-окна, а не в рендере/ожидании.
-        try:
-            cam = self.panda_app.camera
-            w, h = img.get_x_size(), img.get_y_size()
-            xs = [w // 4, w // 2, (3 * w) // 4]
-            ys = [h // 4, h // 2, (3 * h) // 4]
-            checksum = 0.0
-            for yy in ys:
-                for xx in xs:
-                    c = img.get_xel(xx, yy)
-                    checksum += c[0] + c[1] + c[2]
-            print(f"[Render/DIAG] cam pos=({cam.getX():.2f},{cam.getY():.2f},"
-                  f"{cam.getZ():.2f}) hpr=({cam.getH():.1f},{cam.getP():.1f},"
-                  f"{cam.getR():.1f}) img={w}x{h} pix_checksum={checksum:.4f}")
-        except Exception as _diag_exc:
-            print(f"[Render/DIAG] diag failed: {_diag_exc}")
 
         # Gemini доступен? (нужно знать заранее — от этого зависит, снимать ли
         # маску сегментации). Недоступность => тихий откат.
@@ -1386,10 +1513,9 @@ class RendererUtils:
             #   2) обновляем карту глубины под ТЕКУЩУЮ позу камеры
             #      (update_depth_texture рендерит depth-буфер depth-камерой);
             #   3) settle_render — реальные кадры пайплайна с видимым overlay;
-            #   4) ДВА явных graphicsEngine.render_frame() прямо перед чтением
-            #      (тот же анти-«застывший буфер» приём, что и для цветного
-            #      кадра выше) — гарантируют, что getScreenshot прочитает
-            #      кадр С overlay, а не предыдущий обычный рендер.
+            #   4) _grab_window_screenshot — читает кадр только после того, как
+            #      подтвердил, что он реально нарисован (triggered copy), т.е.
+            #      кадр гарантированно С overlay, а не предыдущий рендер.
             if also_depth:
                 dr = self.panda_app.depth_renderer
                 dr.set_overlay_visibility(True)
@@ -1580,7 +1706,12 @@ class RendererUtils:
                 current_hpr = self.panda_app.camera.getHpr()
                 
                 img = PNMImage()
-                if not self.panda_app.win.getScreenshot(img):
+                # Тот же проверяемый путь, что и в _save_single_render: голый
+                # win.getScreenshot() молча отдавал кадр предыдущего сэмпла,
+                # когда окно было свёрнуто/перекрыто.
+                if not self._grab_window_screenshot(img, steps=2):
+                    print(f"[Dataset] сэмпл volume={volume:.1f} "
+                          f"pass={pass_num} пропущен: кадр неактуален.")
                     continue
                 
                 output_path = self._process_render_image(
