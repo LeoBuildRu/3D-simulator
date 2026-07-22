@@ -1230,65 +1230,47 @@ class RendererUtils:
             else:
                 self.panda_app.graphicsEngine.render_frame()
 
-    def _ensure_window_drawable(self):
-        """Вернуть окно в рисуемое состояние (развернуть, если свёрнуто).
-
-        Свёрнутое окно не рисуется — а значит, любой снятый с него кадр
-        устарел. Разворачиваем и ждём, пока Panda подтвердит смену свойств.
-        True, если окно рисуемо."""
-        win = getattr(self.panda_app, "win", None)
-        if win is None:
-            return False
-        try:
-            if not win.get_properties().get_minimized():
-                return True
-            print("[Render] окно свёрнуто — разворачиваю "
-                  "(свёрнутое окно не рисуется, кадр был бы устаревшим)")
-            props = WindowProperties()
-            props.set_minimized(False)
-            win.request_properties(props)
-            for _ in range(30):
-                self._step_frames(1)
-                if not win.get_properties().get_minimized():
-                    return True
-            return False
-        except Exception as exc:
-            print(f"[Render] проверка состояния окна не удалась: {exc}")
-            return True   # не блокируем съёмку из-за самой проверки
-
     def _grab_window_screenshot(self, img, *, steps=2):
         """Снять кадр окна ГАРАНТИРОВАННО актуальным, иначе честно отказать.
 
         Возвращает False, если актуальность кадра подтвердить не удалось.
         Вызывающий код обязан трактовать False как «сэмпл не снят» — лучше
         потерять кадр, чем записать в датасет цветную картинку от предыдущего
-        сэмпла (её потом не отличить от корректной)."""
+        сэмпла (её потом не отличить от корректной).
+
+        ВАЖНО: тут НЕЛЬЗЯ трогать свойства окна (request_properties). Окно
+        Panda встроено ДОЧЕРНИМ HWND в Qt-виджет (main_window: winId() +
+        SetWindowPos по _panda_hwnd), и requestProperties используется только
+        для origin/size. Запрос смены minimized на встроенном окне заставляет
+        Panda переконфигурировать/пересоздать окно — оно отваливается от
+        Qt-родителя и всплывает отдельным окном верхнего уровня, после чего
+        рендер в виджет прекращается. Детектору манипуляции окном и не нужны:
+        отсутствие triggered-copy само по себе означает «кадр не рисовался».
+        """
         win = getattr(self.panda_app, "win", None)
         if win is None:
             return False
 
         tex = self._ensure_capture_texture()
         if tex is None:
-            # Драйвер не умеет triggered-copy. Тогда хотя бы не снимаем с
-            # заведомо нерисуемого окна: без детектора это единственная
-            # доступная проверка актуальности.
-            if not self._ensure_window_drawable():
-                print("[Render] ОТКАЗ: окно не рисуется, а triggered-copy "
-                      "недоступен — кадр был бы устаревшим.")
-                return False
+            # Драйвер не умеет triggered-copy — проверить актуальность нечем.
+            # Работаем как раньше (кадр может оказаться устаревшим), но громко
+            # предупреждаем один раз.
+            if not getattr(self, "_capture_warned", False):
+                print("[Render] ВНИМАНИЕ: triggered-copy недоступен, "
+                      "актуальность кадра НЕ проверяется — возможен захват "
+                      "кадра предыдущего сэмпла.")
+                self._capture_warned = True
             self._step_frames(steps)
             return win.getScreenshot(img)
 
-        for attempt in range(2):
-            if not self._ensure_window_drawable():
-                print("[Render] ОТКАЗ: окно не удалось вернуть в рисуемое "
-                      "состояние.")
-                return False
+        # Settle ДО триггера: копируемый кадр должен быть уже сошедшимся
+        # (TAA/каскадные тени/ленивая загрузка ресурсов на GPU).
+        self._step_frames(steps)
 
-            # Settle ДО триггера: копируемый кадр должен быть уже сошедшимся
-            # (TAA/каскадные тени/ленивая загрузка ресурсов на GPU).
-            self._step_frames(steps)
-
+        # Несколько попыток: окно могло не рисоваться временно (пользователь
+        # свернул/переключился). Ждём его возвращения, но БЕЗ вмешательства.
+        for attempt in range(3):
             # Сбрасываем прошлую копию — иначе has_ram_image() ниже мог бы
             # подтвердиться копией от ПРЕДЫДУЩЕГО захвата, и детектор
             # устаревания молча пропустил бы устаревший кадр.
@@ -1297,7 +1279,7 @@ class RendererUtils:
             # trigger_copy() = «скопировать в конце СЛЕДУЮЩЕГО кадра».
             win.trigger_copy()
             self._step_frames(1)
-            for _ in range(8):
+            for _ in range(20):
                 if tex.has_ram_image():
                     break
                 self._step_frames(1)
@@ -1312,14 +1294,13 @@ class RendererUtils:
                 print("[Render] tex.store() не удался.")
                 return False
 
-            # Копии нет => кадр не рисовался => он устарел. Единственная
-            # попытка спасения — пересоздать условия и повторить.
-            print(f"[Render] кадр не был нарисован (копия не пришла), "
-                  f"попытка {attempt + 1}/2")
+            # Копии нет => кадр не рисовался => он устарел.
+            print(f"[Render] окно не рисуется (копия не пришла), "
+                  f"жду... попытка {attempt + 1}/3")
 
-        print("[Render] ОТКАЗ: не удалось получить АКТУАЛЬНЫЙ кадр окна. "
-              "Сэмпл пропущен намеренно — запись устаревшего кадра испортила "
-              "бы датасет.")
+        print("[Render] ОТКАЗ: окно не рисуется (свёрнуто?) — АКТУАЛЬНЫЙ кадр "
+              "получить нельзя. Сэмпл пропущен намеренно: запись устаревшего "
+              "кадра испортила бы датасет. Разверните окно приложения.")
         return False
 
     def _get_gemini_processor(self):
