@@ -67,9 +67,12 @@ class RendererUtils:
                 d = np.abs(mask_i - np.array(color, dtype=np.int16))
                 return (d[..., 0] <= tol) & (d[..., 1] <= tol) & (d[..., 2] <= tol)
 
-            # Передний план = груз (cargo) + кузов (cuzov). Остальное — фон.
+            # Передний план = груз (cargo) + кузов (cuzov) + ткань (cloth).
+            # Остальное — фон.
             cuzov_mask = _close(SEG_COLORS["cuzov"])
             keep = _close(SEG_COLORS["cargo"]) | cuzov_mask
+            if "cloth" in SEG_COLORS:
+                keep |= _close(SEG_COLORS["cloth"])
 
             # 1) Цветовую температуру переднего плана подгоняем под фон, чтобы
             #    вставленный кузов+груз не выглядели «холоднее/теплее» картинки.
@@ -112,7 +115,7 @@ class RendererUtils:
         return new_pnm
 
     def _keep_mask_from_array(self, mask_arr, tol=40):
-        """bool-маска переднего плана (cargo+cuzov) из RGB-маски сегментации."""
+        """bool-маска переднего плана (cargo+cuzov+cloth) из RGB-маски."""
         import numpy as np
         from src.rendering.segmentation_renderer import SEG_COLORS
         mask_i = mask_arr.astype(np.int16)
@@ -123,6 +126,8 @@ class RendererUtils:
 
         cuzov = _close(SEG_COLORS["cuzov"])
         keep = _close(SEG_COLORS["cargo"]) | cuzov
+        if "cloth" in SEG_COLORS:
+            keep |= _close(SEG_COLORS["cloth"])
         return keep, cuzov
 
     def _apply_openai(self, img_final, processor, shadow_band=False):
@@ -1186,7 +1191,63 @@ class RendererUtils:
                            random_background=False,
                            gemini=False,
                            shadow_band=False,
-                           also_depth=False):
+                           also_depth=False,
+                           cloth=False,
+                           cloth_probability=0.8,
+                           cloth_seed=None,
+                           cloth_placement=None):
+        """Обёртка: ткань живёт ровно один кадр.
+
+        Полотно симулируется под ТЕКУЩУЮ сцену (кузов уже загружен, груз уже
+        сгенерирован) и снимается после съёмки — иначе следующий сэмпл
+        унаследует чужие складки. finally обязателен: в _save_single_render
+        много ранних `return False`.
+
+        cloth_probability < 1 оставляет часть кадров без ткани — датасету
+        нужны и негативные примеры.
+        """
+        cloth_meta = None
+        if cloth:
+            sim = getattr(self.panda_app, "cloth_simulator", None)
+            if sim is None:
+                print("[Cloth] cloth_simulator недоступен — кадр без ткани")
+            elif random.random() <= cloth_probability:
+                try:
+                    if sim.spawn_random(seed=cloth_seed,
+                                        placement=cloth_placement) is not None:
+                        cloth_meta = sim.last_params
+                except Exception as exc:
+                    print(f"[Cloth] генерация не удалась: {exc}")
+                    sim.clear()
+
+        if cloth_meta is not None:
+            extra_metadata = dict(extra_metadata or {})
+            extra_metadata["cloth"] = cloth_meta
+
+        try:
+            return self._save_single_render(
+                output_dir=output_dir,
+                filename_prefix=filename_prefix,
+                extra_metadata=extra_metadata,
+                dataset_type=dataset_type,
+                random_background=random_background,
+                gemini=gemini,
+                shadow_band=shadow_band,
+                also_depth=also_depth,
+            )
+        finally:
+            sim = getattr(self.panda_app, "cloth_simulator", None)
+            if sim is not None:
+                sim.clear()
+
+    def _save_single_render(self, output_dir="renders/single",
+                            filename_prefix="single_render",
+                            extra_metadata=None,
+                            dataset_type="depth",
+                            random_background=False,
+                            gemini=False,
+                            shadow_band=False,
+                            also_depth=False):
         # dataset_type: "depth" (снимок + карта глубины, как раньше) или
         # "segmentation" (снимок + маска сегментации). Цветной кадр снимается
         # одинаково; меняется только второй кадр.

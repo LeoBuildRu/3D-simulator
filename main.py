@@ -54,6 +54,7 @@ def load_tls_config(base_path):
 from src.ui.panda_widget import Panda3DWidget
 from src.rendering.depth_map_renderer import DepthMapRenderer
 from src.rendering.segmentation_renderer import SegmentationRenderer
+from src.rendering.cloth_simulator import ClothSimulator
 from src.rendering.perlin_mesh_generator import PerlinMeshGenerator
 from src.rendering.renderer_utils import RendererUtils
 from src.rendering.mesh_reconstruction import MeshReconstruction
@@ -345,6 +346,10 @@ class MyApp(ShowBase):
         # Рендер карты сегментации для датасетов (GL-буфер создаётся лениво,
         # при первом снимке). Глубинный рендерер остаётся без изменений.
         self.segmentation_renderer = SegmentationRenderer(self)
+
+        # Ткань, свисающая с борта. Полотно создаётся под конкретный кадр
+        # датасета и снимается после него (см. RendererUtils.save_single_render).
+        self.cloth_simulator = ClothSimulator(self)
 
         self.mesh_reconstruction = MeshReconstruction(self, tls_client=self.tls_client)
 
@@ -2585,6 +2590,11 @@ class MyApp(ShowBase):
         return True
 
     def clear_scene(self):
+        # Ткань привязана к геометрии кузова, который сейчас будет выгружен,
+        # поэтому снимаем её первой.
+        if getattr(self, 'cloth_simulator', None) is not None:
+            self.cloth_simulator.clear()
+
         if hasattr(self, 'test_perlin_mesh') and self.test_perlin_mesh:
             if self.test_perlin_mesh in self.loaded_models:
                 self.loaded_models.remove(self.test_perlin_mesh)

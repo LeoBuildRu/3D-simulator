@@ -617,6 +617,30 @@ class MainWindow(QMainWindow):
                 "  background: #00FF88; }"
             )
 
+            # Ткань: тент, свисающий с борта (симуляция ClothSimulator).
+            # В маске сегментации — отдельный ярко-оранжевый класс "cloth".
+            self.chk_cloth = _QCk2("Ткань")
+            self.chk_cloth.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.chk_cloth.setToolTip(
+                "Добавить в кадр тент/полог, свисающий с борта: физическая "
+                "симуляция провиса, складок и полоскания на ветру. Место "
+                "крепления, размер, сборка, сила ветра и степень укладки "
+                "случайны от кадра к кадру; иногда полотно закрывает весь "
+                "кадр. В маске сегментации ткань размечена отдельным ярко-"
+                "оранжевым классом. Часть кадров (~20%) остаётся без ткани."
+            )
+            self.chk_cloth.setStyleSheet(
+                f"QCheckBox {{ color: {_RCT}; font-size: 10px;"
+                f" letter-spacing: 0.3px; background: transparent; }}"
+                "QCheckBox::indicator { width: 12px; height: 12px; }"
+                "QCheckBox::indicator:unchecked {"
+                f"  border: 1px solid {_RCH}; border-radius: 3px;"
+                "  background: rgba(255,255,255,4); }"
+                "QCheckBox::indicator:checked {"
+                "  border: 1px solid #00FF88; border-radius: 3px;"
+                "  background: #00FF88; }"
+            )
+
             self.btn_save_render = _QPB2("Сохранить")
             self.btn_save_render.setCursor(Qt.CursorShape.PointingHandCursor)
             self.btn_save_render.setFixedHeight(22)
@@ -650,9 +674,10 @@ class MainWindow(QMainWindow):
             sh_row1.addWidget(self.spn_render_count, 0, Qt.AlignmentFlag.AlignVCenter)
             sh_row1.addWidget(self.cmb_dataset_type, 1, Qt.AlignmentFlag.AlignVCenter)
 
-            # Строка 2: случайный фон + Gemini + кнопка сохранения.
+            # Строка 2: случайный фон + Gemini + ткань + кнопка сохранения.
             sh_row2.addWidget(self.chk_random_bg, 0, Qt.AlignmentFlag.AlignVCenter)
             sh_row2.addWidget(self.chk_gemini, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_row2.addWidget(self.chk_cloth, 0, Qt.AlignmentFlag.AlignVCenter)
             sh_row2.addStretch(1)
             sh_row2.addWidget(self.btn_save_render, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -2804,6 +2829,10 @@ class MainWindow(QMainWindow):
         chk_gem = getattr(self, "chk_gemini", None)
         gemini = bool(chk_gem.isChecked()) if chk_gem is not None else False
 
+        # Ткань, свисающая с борта (отдельный класс маски).
+        chk_cl = getattr(self, "chk_cloth", None)
+        cloth = bool(chk_cl.isChecked()) if chk_cl is not None else False
+
         # Resolve current model + texture from the right panel and pull
         # max_volume from the model's YAML config.
         rp = getattr(self, "right_panel", None)
@@ -2913,6 +2942,7 @@ class MainWindow(QMainWindow):
                     texture_key=texture_key,
                     random_background=random_background,
                     gemini=gemini,
+                    cloth=cloth,
                     base_daytime_mins=base_daytime_mins,
                     set_daytime=_set_daytime,
                     render_dataset_type=render_dataset_type,
@@ -3092,6 +3122,7 @@ class MainWindow(QMainWindow):
                             random_background=random_background,
                             gemini=gemini,
                             shadow_band=shadow_band,
+                            cloth=cloth,
                         )
                         if ok:
                             ok_count += 1
@@ -3133,7 +3164,7 @@ class MainWindow(QMainWindow):
     def _run_random_seg_dataset(self, *, count, max_volume, model_key,
                                 texture_key, random_background, gemini,
                                 base_daytime_mins, set_daytime,
-                                render_dataset_type, ru) -> None:
+                                render_dataset_type, ru, cloth=False) -> None:
         """Датасет сегментации со случайными кадрами.
 
         Каждый снимок — полностью новая сцена: новое случайное наполнение
@@ -3287,6 +3318,7 @@ class MainWindow(QMainWindow):
                     gemini=gemini,
                     shadow_band=False,
                     also_depth=True,
+                    cloth=cloth,
                 )
                 if ok:
                     ok_count += 1
