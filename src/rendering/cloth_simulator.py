@@ -829,6 +829,117 @@ class ClothSimulator:
                 out.append((mid, along, outward, length))
         return out
 
+    @staticmethod
+    def _top_surface_z(verts, faces, points):
+        """Высота верхней поверхности под каждой точкой xy -> (M,), nan если нет.
+
+        Вертикальный луч вниз из бесконечности: берётся САМЫЙ ВЫСОКИЙ
+        треугольник, накрывающий точку. Это единственный способ узнать, где у
+        кузова кромка НА САМОМ ДЕЛЕ: AABB знает только один общий максимум по z,
+        а у кузовов с вырезами (высокий борт FAV J6 8x4) верх борта то есть, то
+        его нет, и разница доходит до половины высоты. Тент, разложенный по
+        общему максимуму, над вырезом просто висел в воздухе.
+
+        Треугольники обрабатываются блоками: матрица (точки x треугольники)
+        целиком не помещалась бы в память на плотной сетке.
+        """
+        pts = np.asarray(points, dtype=np.float64)
+        best = np.full(len(pts), -np.inf)
+        if verts is None or faces is None or len(faces) == 0:
+            return np.full(len(pts), np.nan)
+
+        tri = verts[faces]                                  # (T, 3, 3)
+        for s in range(0, len(tri), 4096):
+            t = tri[s:s + 4096]
+            p0 = t[:, 0, :2]
+            e1 = t[:, 1, :2] - p0
+            e2 = t[:, 2, :2] - p0
+            den = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+            ok = np.abs(den) > _EPS                         # вертикальные грани
+            if not ok.any():
+                continue
+            t, p0, e1, e2, den = t[ok], p0[ok], e1[ok], e2[ok], den[ok]
+
+            d = pts[:, None, :] - p0[None, :, :]            # (M, T', 2)
+            u = (d[..., 0] * e2[None, :, 1]
+                 - d[..., 1] * e2[None, :, 0]) / den
+            v = (e1[None, :, 0] * d[..., 1]
+                 - e1[None, :, 1] * d[..., 0]) / den
+            inside = (u >= -1e-6) & (v >= -1e-6) & (u + v <= 1.0 + 1e-6)
+            if not inside.any():
+                continue
+            z = (t[None, :, 0, 2]
+                 + u * (t[None, :, 1, 2] - t[None, :, 0, 2])
+                 + v * (t[None, :, 2, 2] - t[None, :, 0, 2]))
+            best = np.maximum(best, np.where(inside, z, -np.inf).max(axis=1))
+
+        return np.where(np.isfinite(best), best, np.nan)
+
+    def _rail_top_profile(self, cuzov_verts, cuzov_faces, bounds, rail,
+                          u_world, wall):
+        """Просадка кромки борта по столбцам полотна -> (nx,) <= 0, или None.
+
+        `dz[j]` — насколько верх борта НАПРОТИВ столбца j ниже общего верха
+        кузова (bmax[2]). У ровного борта это нули, у борта с вырезом —
+        настоящий профиль выреза.
+
+        Луч пускается не в одной точке, а на нескольких глубинах внутрь стенки:
+        толщина борта известна лишь оценочно (см. _wall_inset), и единственная
+        проба легко промахивается мимо плиты. Из проб берётся максимум — верх
+        борта, а не то, что за ним.
+        """
+        if cuzov_verts is None or cuzov_faces is None or len(cuzov_faces) == 0:
+            return None
+
+        bmin, bmax = bounds
+        mid, along, outward, _ = rail
+        ax_out = int(np.argmax(np.abs(outward)))
+        ax_al = int(np.argmax(np.abs(along)))
+        sign = float(np.sign(outward[ax_out]))
+        height = max(float(bmax[2] - bmin[2]), _EPS)
+
+        # Треугольники только у этой кромки: остальной грузовик к профилю борта
+        # отношения не имеет, а стоимость лучей линейна по их числу.
+        tri = cuzov_verts[cuzov_faces]
+        depth = (tri[:, :, ax_out] - mid[ax_out]) * sign      # <=0 внутрь кузова
+        band = max(wall * 2.5, 1e-3 * height)
+        near = (depth.max(axis=1) > -band) & (depth.min(axis=1) < band)
+        near &= tri[:, :, 2].max(axis=1) > bmin[2] + 0.2 * height
+        lo = u_world.min() - band
+        hi = u_world.max() + band
+        near &= (tri[:, :, ax_al].max(axis=1) >= lo) & \
+                (tri[:, :, ax_al].min(axis=1) <= hi)
+        if int(near.sum()) < 2:
+            return None
+        faces_near = cuzov_faces[near]
+
+        # Пробы поперёк толщины стенки, от наружной грани внутрь.
+        probes = np.array([0.2, 0.45, 0.7, 0.95]) * max(wall, _EPS)
+        top = np.full(len(u_world), -np.inf)
+        for off in probes:
+            pts = np.empty((len(u_world), 2), dtype=np.float64)
+            pts[:, ax_al] = u_world
+            pts[:, ax_out] = mid[ax_out] - sign * off
+            z = self._top_surface_z(cuzov_verts, faces_near, pts)
+            top = np.maximum(top, np.where(np.isfinite(z), z, -np.inf))
+
+        valid = np.isfinite(top)
+        # Меньше трети попаданий — профиль не читается (нестандартная геометрия
+        # или мимо стенки); лучше честно откатиться на общий габарит.
+        if int(valid.sum()) < max(3, len(u_world) // 3):
+            return None
+
+        # Пустые столбцы (сквозной вырез) добираем ближайшим соседом: там борта
+        # нет вообще, и ткань должна начинаться с уровня соседней кромки, а
+        # дальше её опустит сама симуляция.
+        idx = np.arange(len(top))
+        top = np.interp(idx, idx[valid], top[valid])
+
+        dz = np.minimum(top - float(bmax[2]), 0.0)
+        # Ограничение — страховка от мусорной геометрии под кузовом: провал
+        # глубже борта означает, что луч поймал не кромку, а раму или пол.
+        return np.maximum(dz, -0.9 * height)
+
     def _camera_pos(self):
         try:
             p = self.app.cam.getPos(self.app.render)
@@ -836,7 +947,8 @@ class ClothSimulator:
         except Exception:
             return None
 
-    def _layout(self, placement, rng, cuzov_verts=None, cargo_verts=None):
+    def _layout(self, placement, rng, cuzov_verts=None, cargo_verts=None,
+                cuzov_faces=None):
         """Стартовая сетка + маска закреплённых точек + препятствия.
 
         Возвращает dict с полями grid, rest, pinned, ground_z, wind_dir,
@@ -866,7 +978,7 @@ class ClothSimulator:
             rail = rails[int(rng.integers(0, len(rails)))]
 
         return self._layout_rail(rail, bounds, rng, placement, cuzov_verts,
-                                 cargo_verts)
+                                 cargo_verts, cuzov_faces)
 
     def _layout_on_load(self, bounds, rng, cargo_verts):
         """Полотно, ЛЕЖАЩЕЕ на грузе у переднего борта.
@@ -935,7 +1047,7 @@ class ClothSimulator:
         }
 
     def _layout_rail(self, rail, bounds, rng, placement, cuzov_verts=None,
-                     cargo_verts=None):
+                     cargo_verts=None, cuzov_faces=None):
         """Тент, лежащий НА кромке борта и свисающий с неё наружу.
 
         Раскладка идёт снизу-снаружи -> вверх по наружной грани -> через торец
@@ -991,6 +1103,13 @@ class ClothSimulator:
         usable = max(interior_hi - interior_lo, _EPS)
 
         big = placement == "full_frame"
+        # Борт, обращённый к кабине. Через него тент перекидывают в реальности
+        # чаще всего, и лежит он там иначе: за бортом сразу кабина, полотно
+        # некуда свесить далеко, зато вся его масса уходит НАЗАД, на верх
+        # кузова, где и собирается складками. Короткий настил (как у боковых
+        # бортов) давал полоску, оседлавшую кромку, — не то, что нужно.
+        is_cabin = (axis_out == self.CABIN_AXIS
+                    and float(np.sign(outward[axis_out])) == self.CABIN_SIGN)
 
         # Габарит кузова ПОПЕРЁК кромки: от него отмеряется настил. Привязка
         # именно к нему, а не к высоте борта, и делает тент «лежащим на
@@ -1006,6 +1125,12 @@ class ClothSimulator:
             width = usable * float(rng.uniform(0.95, 1.45))
             lie_in = depth_body * float(rng.uniform(0.8, 1.35))
             drop_out = height * float(rng.uniform(0.05, 0.25))
+        elif is_cabin:
+            # Настил во всю глубину кузова и шире: тент должен лежать и
+            # складываться ПО ВЕРХУ, а не только висеть с кромки.
+            width = usable * float(rng.uniform(0.60, 1.0))
+            lie_in = depth_body * float(rng.uniform(0.55, 1.05))  # настил
+            drop_out = height * float(rng.uniform(0.35, 0.95))    # наружу
         else:
             width = usable * float(rng.uniform(0.45, 0.90))
             lie_in = depth_body * float(rng.uniform(0.18, 0.45))  # настил
@@ -1027,8 +1152,15 @@ class ClothSimulator:
         # и достаёт до перпендикулярных стенок, вдавливаясь в них краем.
         # Незнаковая коллизия из толщи стенки уже не вытаскивает.
         span_needed = min(rest_width, usable)
-        centre = float(rng.uniform(interior_lo + span_needed * 0.5,
-                                   interior_hi - span_needed * 0.5))
+        lo_c = interior_lo + span_needed * 0.5
+        hi_c = interior_hi - span_needed * 0.5
+        if hi_c < lo_c:
+            # Полотно занимает проём целиком — сдвигать его некуда. Границы
+            # схлопываются не только при вырожденном проёме: при
+            # span_needed == usable они совпадают лишь с точностью до округления,
+            # и rng.uniform падает на отрицательном интервале.
+            lo_c = hi_c = 0.5 * (interior_lo + interior_hi)
+        centre = float(rng.uniform(lo_c, hi_c))
         offset = centre - mid[axis_along]
 
         # Ширина перехода через торец завязана на шаг сетки, а шаг — на полную
@@ -1077,6 +1209,18 @@ class ClothSimulator:
         clear = max(cell * 1.6, wall * 0.15)
         cross0, cross1 = drop_out, drop_out + cross_w
 
+        # ВЕРТИКАЛЬНЫЙ зазор — отдельная величина, и он МЕНЬШЕ бокового.
+        # Боковому приходится перекрывать долю борта: сбоку стенка тонкая, и
+        # незнаковая коллизия из её толщи ткань не вытаскивает. Сверху такой
+        # опасности нет — торец борта горизонтален, барьер всегда выталкивает
+        # вверх. Зато лишняя высота здесь видна напрямую: ряд крепления висит
+        # над той высотой, на которую ложится свободная ткань, и каждый якорь
+        # торчит конусом. Поэтому зазор ровно чуть больше барьера коллизии —
+        # закреплённая кромка садится туда же, куда легла бы сама.
+        barrier = cell * (self.THICKNESS_CELLS_GPU if warp_available()
+                          else self.THICKNESS_CELLS)
+        clear_z = barrier * 1.15
+
         # Высота настила. В обычном режиме он ложится на то, что выше —
         # кромку борта или насыпь; стартовать НИЖЕ верха груза нельзя, иначе
         # полотно начинает внутри насыпи, а незнаковая коллизия его оттуда не
@@ -1085,7 +1229,7 @@ class ClothSimulator:
         rest_top = bmax[2]
         if cargo_verts is not None and len(cargo_verts):
             rest_top = max(rest_top, float(np.quantile(cargo_verts[:, 2], 0.97)))
-        lie_z = rest_top + clear
+        lie_z = rest_top + clear_z
         if big:
             lie_z += height * float(rng.uniform(0.35, 0.90))
 
@@ -1100,24 +1244,46 @@ class ClothSimulator:
                      -(wall + clear) - (vv - cross1),
                      clear - (wall + 2.0 * clear)
                      * (vv - cross0) / max(cross_w, _EPS)))
+
+        # Верх борта НАПРОТИВ КАЖДОГО СТОЛБЦА, а не один общий bmax[2].
+        # Кузов — не коробка: вырезы, скосы и ступени опускают кромку местами
+        # на полборта, и полотно, разложенное по общему максимуму, над вырезом
+        # начиналось (и, будучи закреплённым, оставалось) в воздухе. Профиль
+        # сажает и свисающую часть, и сам ряд крепления на настоящую кромку.
+        u_world = mid[axis_along] + u
+        dz = self._rail_top_profile(cuzov_verts, cuzov_faces, bounds, rail,
+                                    u_world, wall)
+        if dz is None:
+            dz = np.zeros(nx, dtype=np.float64)
+        top = bmax[2] + dz[None, :]                       # (1, nx)
+
+        # Просадка кромки действует на свисающую часть и перегиб ЦЕЛИКОМ, а на
+        # настиле сходит на нет: настил ложится поверх ГРУЗА, чья насыпь идёт
+        # по общему уровню кузова, и повторять там профиль борта — значит
+        # загнать полотно внутрь насыпи, откуда незнаковая коллизия не спасёт.
         z = np.where(
-            vv < cross0, bmax[2] - (cross0 - vv),
+            vv < cross0, top - (cross0 - vv),
             np.where(vv > cross1,
-                     (bmax[2] + clear) + (lie_z - bmax[2] - clear) * ramp,
-                     bmax[2] + clear))
+                     (top + clear_z)
+                     + (lie_z - top - clear_z) * ramp,
+                     top + clear_z))
 
         # Складки на настиле: 1-3 гребня поперёк полотна, смещение только
         # ВВЕРХ — вниз некуда, там опора. При ramp = 0 (у самого перегиба)
         # гребень нулевой, поэтому стыка с участком на торце борта нет.
         lie_t = np.clip((vv - cross1) / max(lie_in, _EPS), 0.0, 1.0)
-        folds = float(rng.integers(1, 4))
+        # Число гребней — на ЕДИНИЦУ длины настила, а не на настил целиком:
+        # у длинного настила (передний борт) три складки, растянутые на всю
+        # глубину кузова, читались бы как пологая волна, а не как ткань.
+        folds = float(rng.integers(1, 4)) * float(np.clip(
+            lie_in / max(0.30 * depth_body, _EPS), 1.0, 3.0))
         ridge = 0.5 - 0.5 * np.cos(2.0 * math.pi * folds * lie_t)
         # Гребни не строго прямые — лёгкая раскачка вдоль кромки.
         wave = float(rng.integers(1, 4))
         ridge *= 1.0 + 0.25 * np.sin(
             wave * math.pi * (uu - uu.min()) / max(uu.max() - uu.min(), _EPS)
             + float(rng.uniform(0.0, 2.0 * math.pi)))
-        z = z + max(cell * 3.0, clear * 2.0) * ridge
+        z = z + max(cell * 3.0, clear_z * 2.0) * ridge
 
         # Острые углы на кромке сглаживаем вдоль v: настоящая ткань ложится на
         # торец борта скруглённо, а не ломается под 90°.
@@ -1151,7 +1317,8 @@ class ClothSimulator:
         pinned = np.zeros((ny, nx), dtype=bool)
         crease = int(np.argmin(np.abs(v - (drop_out + cross_w * 0.5))))
         pinned[crease, :] = True
-        self._punch_pins(pinned, rng, row=crease)
+        self._punch_pins(pinned, rng, row=crease,
+                         allow_free=(not big and lie_in > drop_out * 1.2))
 
         if big:
             # Ветер строго ОТ борта внутрь кузова (для переднего борта это −Y):
@@ -1173,6 +1340,10 @@ class ClothSimulator:
             "span": max(width, total),
             "cell": cell,
             "gather": gather,
+            # Ряд заламывания через кромку: солвер отпускает там изгиб, иначе
+            # плоское полотно распрямляет сгиб и отгибает свисающую часть
+            # наружу «крылом» (см. CREASE_RELIEF).
+            "crease_row": crease,
             # full_frame живёт ветром: без штиля и без полного улёгшегося
             # провиса, иначе полотно просто ляжет на груз (см. spawn_random).
             "wind_forced": big,
@@ -1239,7 +1410,7 @@ class ClothSimulator:
         return nx, ny, cell
 
     @staticmethod
-    def _punch_pins(pinned, rng, row=0):
+    def _punch_pins(pinned, rng, row=0, allow_free=False):
         """Разрежаем линию крепления: сплошной ряд даёт скучную «штору».
 
         Варианты повторяют то, как тент реально держится: сплошная кромка,
@@ -1248,16 +1419,33 @@ class ClothSimulator:
         """
         nx = pinned.shape[1]
         pinned_row = pinned[row]
-        mode = rng.choice(
-            ["full", "grommets", "corners", "torn"],
-            p=[0.30, 0.34, 0.20, 0.16])
+        # «Свободный» тент допустим лишь когда настил перевешивает свисающую
+        # часть. Иначе полотно просто стягивает с борта и оно падает на землю —
+        # сэмпл в брак.
+        modes = ["none", "full", "grommets", "corners", "torn"]
+        weights = ([0.22, 0.24, 0.28, 0.15, 0.11] if allow_free
+                   else [0.0, 0.31, 0.36, 0.19, 0.14])
+        mode = rng.choice(modes, p=weights)
 
+        if mode == "none":
+            # Ничего не закреплено: тент держат вес настила и трение о борт.
+            # Это и есть самый частый реальный случай, и единственный, где у
+            # кромки заведомо нет ни одной выделяющейся точки.
+            pinned_row[:] = False
+            return
         if mode == "full":
             return
         if mode == "grommets":
-            step = int(rng.integers(3, 7))
+            step = int(rng.integers(4, 9))
+            # Люверс — не ОДИН узел, а пятно в пару ячеек: точечный якорь
+            # висит конусом, потому что вся окрестная ткань проседает вокруг
+            # одной удерживаемой вершины. Пятно распределяет нагрузку, и
+            # крепление читается складкой, а не шипом.
+            wide = int(rng.integers(1, 3))
+            centres = np.arange(0, nx, step)
             keep = np.zeros(nx, dtype=bool)
-            keep[::step] = True
+            for off in range(-wide, wide + 1):
+                keep[np.clip(centres + off, 0, nx - 1)] = True
             keep[0] = keep[-1] = True
             pinned_row[~keep] = False
         elif mode == "corners":
@@ -1444,7 +1632,10 @@ class ClothSimulator:
         cuzov_verts = cuzov_mesh[0] if cuzov_mesh is not None else None
         cargo_verts = cargo_mesh[0] if cargo_mesh is not None else None
 
-        layout = self._layout(placement, rng, cuzov_verts, cargo_verts)
+        cuzov_faces = cuzov_mesh[1] if cuzov_mesh is not None else None
+
+        layout = self._layout(placement, rng, cuzov_verts, cargo_verts,
+                              cuzov_faces)
         if layout is None:
             print("[Cloth] кузов не найден — полотно не создано")
             return None
@@ -1465,7 +1656,9 @@ class ClothSimulator:
             # У XPBD итерации внутри подшага почти не нужны: точность даёт
             # дробление шага (см. WarpClothSolver.SUBSTEPS).
             solver = WarpClothSolver(layout["grid"], layout["pinned"],
-                                     iterations=3, cell=cell, **common)
+                                     iterations=3, cell=cell,
+                                     crease_row=layout.get("crease_row"),
+                                     **common)
         else:
             solver = ClothSolver(layout["grid"], layout["pinned"],
                                  iterations=int(rng.integers(4, 7)), **common)

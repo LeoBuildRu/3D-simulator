@@ -66,6 +66,33 @@ BEND_COMPLIANCE = 0.06
 # пересчёт аэродинамической СИЛЫ в ускорение.
 AREA_DENSITY = 8.0
 
+# Во сколько раз податливее изгиб В РЯДАХ ПЕРЕГИБА через кромку борта.
+#
+# Угол покоя берётся из НЕДЕФОРМИРОВАННОГО полотна, а оно плоское (phi0 = pi).
+# Но тент, переброшенный через борт, сложен на кромке вдвое — то есть ровно там
+# сетка держит угол, максимально далёкий от покоя, и связь изо всех сил
+# РАСПРЯМЛЯЕТ сгиб. Замер: свисающая наружу часть отходила от стенки на 0.5
+# единицы при высоте борта 3 (и отход прямо следовал за жёсткостью изгиба:
+# 0.59 при k=0.45 против 0.33 при k=0.05) — она не висела, а отгибалась
+# наружу «крылом».
+#
+# Настоящий брезент на кромке заламывается и никакой памяти о плоскости там не
+# имеет. Поэтому ряды перегиба делаются почти свободным шарниром. Это надёжнее,
+# чем задавать им сложенный phi0: конкретный угол сгиба зависит от толщины
+# борта, а свободный шарнир просто отдаёт выбор гравитации.
+#
+# Эффект измерен, и он УМЕРЕННЫЙ: средний отход по 8 сэмплам 0.40 -> 0.31
+# (около 22%). Остаток даёт не изгиб, а сама раскладка (стартовый зазор до
+# борта плюс барьер коллизии), поэтому гнаться здесь за нулём бессмысленно.
+CREASE_RELIEF = 40.0
+
+# Полуширина полосы перегиба в РЯДАХ сетки. Перегиб — не одна линия: он
+# занимает участок шириной cross_w (пара-тройка ячеек) и дополнительно
+# размазан сглаживанием раскладки. Замер по ширине полосы: +-1 ряд даёт
+# 0.40 -> 0.36, +-3 ряда 0.40 -> 0.31, +-6 рядов 0.40 -> 0.32 — то есть 3
+# накрывает сгиб целиком, а дальше отпускать уже нечего.
+CREASE_HALF_ROWS = 3
+
 _wp = None
 _device = None
 
@@ -729,7 +756,9 @@ class WarpClothSolver:
                  stiff_bend=0.25,
                  damping=0.02,
                  iterations=2,
-                 cell=None):
+                 cell=None,
+                 crease_row=None,
+                 crease_half=CREASE_HALF_ROWS):
         wp, dev = _wp_mod()
         self.wp = wp
         self.device = dev
@@ -763,7 +792,7 @@ class WarpClothSolver:
         self.particle_mass = AREA_DENSITY * self.cell * self.cell
 
         self._build_stretch(rest, stiff_structural, stiff_shear, n)
-        self._build_bend(rest, faces, stiff_bend, n)
+        self._build_bend(rest, faces, stiff_bend, n, crease_row, crease_half)
 
         f = lambda a, d: wp.array(np.ascontiguousarray(a), dtype=d, device=dev)
         self.x = f(pos.astype(np.float32), wp.vec3)
@@ -888,7 +917,8 @@ class WarpClothSolver:
         self.s_lambda = wp.zeros(len(pairs), dtype=float, device=dev)
         self.stretch_ranges = ranges
 
-    def _build_bend(self, rest, faces, k_bend, n):
+    def _build_bend(self, rest, faces, k_bend, n, crease_row=None,
+                    crease_half=CREASE_HALF_ROWS):
         """Двугранный изгиб по парам смежных треугольников.
 
         Угол покоя берётся из НЕДЕФОРМИРОВАННОГО полотна (оно плоское, значит
@@ -922,9 +952,23 @@ class WarpClothSolver:
         self.b_i2, self.b_i3 = arr(quads[:, 2]), arr(quads[:, 3])
         self.b_phi0 = wp.array(phi0.astype(np.float32), dtype=float, device=dev)
         # Изгиб мягче растяжения на порядки — это и есть ткань, а не резина.
-        self.b_alpha = wp.array(
-            np.full(len(quads), self._bend_compliance(k_bend),
-                    dtype=np.float32), dtype=float, device=dev)
+        alpha = np.full(len(quads), self._bend_compliance(k_bend),
+                        dtype=np.float64)
+
+        if crease_row is not None:
+            # Ряды заламывания через кромку — почти свободный шарнир
+            # (см. CREASE_RELIEF). Отпускаются только связи, чьё ОБЩЕЕ РЕБРО
+            # идёт ВДОЛЬ кромки: именно они меряют угол сложения полотна.
+            # Рёбра поперёк кромки держат складки свисающей части, и трогать
+            # их нельзя — иначе тент теряет жёсткость целиком.
+            r0, c0 = quads[:, 0] // self.nx, quads[:, 0] % self.nx
+            r1, c1 = quads[:, 1] // self.nx, quads[:, 1] % self.nx
+            fold = ((r0 == r1) & (np.abs(c0 - c1) == 1)
+                    & (np.abs(r0 - int(crease_row)) <= int(crease_half)))
+            alpha[fold] *= CREASE_RELIEF
+
+        self.b_alpha = wp.array(alpha.astype(np.float32), dtype=float,
+                                device=dev)
         self.b_lambda = wp.zeros(len(quads), dtype=float, device=dev)
         self.bend_ranges = ranges
 
