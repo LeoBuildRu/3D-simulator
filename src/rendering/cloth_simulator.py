@@ -803,6 +803,57 @@ class ClothSimulator:
             return whole
         return bmin, bmax
 
+    def _forward_reach(self, cuzov_verts, bounds):
+        """Докуда кузов простирается ВПЕРЁД поверху -> координата или None.
+
+        У самосвала над передним бортом есть КОЗЫРЁК (защита кабины): плита на
+        уровне верха кузова, вынесенная вперёд, к кабине. У FAW J6 8x4 кузов по
+        AABB кончается на y=+3.83, а козырёк доходит до y=+4.29.
+
+        Для тента это принципиально: его крепят к ПЕРЕДНЕЙ КРОМКЕ КОЗЫРЬКА, а не
+        к борту — оттуда полотно и раскатывают назад по кузову. Отпечаток груза
+        козырёк не захватывает (под ним груза нет), поэтому _body_bounds его
+        срезает, и крепление всё это время отмерялось от борта — на полметра
+        позади настоящего места.
+
+        Идём вперёд от борта шагами и останавливаемся на первом РАЗРЫВЕ: так
+        козырёк (сплошное продолжение кузова) отделяется от крыши кабины,
+        которая стоит отдельно и до которой тенту дела нет.
+        """
+        if cuzov_verts is None or len(cuzov_verts) == 0:
+            return None
+
+        bmin, bmax = bounds
+        ax = self.CABIN_AXIS
+        sign = self.CABIN_SIGN
+        height = max(float(bmax[2] - bmin[2]), _EPS)
+        length = max(float(bmax[ax] - bmin[ax]), _EPS)
+
+        # Козырёк лежит на уровне верха кузова и не шире его.
+        top = cuzov_verts[:, 2] > bmax[2] - 0.20 * height
+        for other in range(2):
+            if other == ax:
+                continue
+            pad = 0.15 * max(float(bmax[other] - bmin[other]), _EPS)
+            top &= ((cuzov_verts[:, other] >= bmin[other] - pad)
+                    & (cuzov_verts[:, other] <= bmax[other] + pad))
+        if not top.any():
+            return None
+
+        y = cuzov_verts[top, ax] * sign
+        edge = float(bmax[ax] if sign > 0 else -bmin[ax])
+
+        step = max(0.04 * length, _EPS)
+        reach = edge
+        # Дальше половины кузова козырьков не бывает — это уже кабина.
+        for _ in range(int(0.5 * length / step) + 1):
+            nxt = reach + step
+            band = y[(y > reach - 1e-6) & (y <= nxt)]
+            if band.size < 4:
+                break
+            reach = float(band.max())
+        return reach * sign if reach > edge + 1e-6 else None
+
     def _cabin_rail(self, rails):
         """Кромка переднего (обращённого к кабине) борта."""
         axis, sign = self.CABIN_AXIS, self.CABIN_SIGN
@@ -1258,6 +1309,20 @@ class ClothSimulator:
         is_cabin = (axis_out == self.CABIN_AXIS
                     and float(np.sign(outward[axis_out])) == self.CABIN_SIGN)
 
+        # КОЗЫРЁК над передним бортом: тент крепится к его передней кромке, а не
+        # к борту. Кромка выносится вперёд, а «толщина борта» для раскладки
+        # становится глубиной козырька — полотно перегибается через его край и
+        # ложится назад по кузову, как раскатанный тент и лежит.
+        visor = 0.0
+        if is_cabin:
+            reach = self._forward_reach(cuzov_verts, bounds)
+            if reach is not None:
+                visor = abs(float(reach) - float(mid[axis_out]))
+                if visor > _EPS:
+                    mid = np.array(mid, dtype=np.float64)
+                    mid[axis_out] = float(reach)
+                    wall = wall + visor
+
         # Габарит кузова ПОПЕРЁК кромки: от него отмеряется настил. Привязка
         # именно к нему, а не к высоте борта, и делает тент «лежащим на
         # кузове», а не оседлавшим кромку.
@@ -1393,10 +1458,19 @@ class ClothSimulator:
         # позади, под ним настил на грузе), ткань вокруг него подпёрта со всех
         # сторон, и якорю почти нечего держать — перегиб через кромку держится
         # собственным весом настила и трением.
-        anchor_inset = float(np.clip(
-            ANCHOR_INSET * float(rng.uniform(0.8, 1.25)),
-            wall, max(wall, 0.5 * lie_in)))
-        v_anchor = cross1 + max(anchor_inset - wall, 0.0)
+        if visor > _EPS:
+            # Есть козырёк — крепление садится НА НЕГО, у самой передней кромки.
+            # Это и есть настоящее место крепления тента, а плита под якорем
+            # плоская и сплошная, так что бугров от точечной нагрузки нет.
+            # Небольшой отступ от края: ровно на кромке якорь снова оказался бы
+            # на тонком ребре.
+            v_anchor = cross0 + 0.25 * cross_w
+            anchor_inset = 0.25 * cross_w
+        else:
+            anchor_inset = float(np.clip(
+                ANCHOR_INSET * float(rng.uniform(0.8, 1.25)),
+                wall, max(wall, 0.5 * lie_in)))
+            v_anchor = cross1 + max(anchor_inset - wall, 0.0)
 
         # Настил идёт ГОРИЗОНТАЛЬНО внутрь: lateral убегает в −outward, а z
         # держится на lie_z. Подъём от торца борта до lie_z заканчивается
