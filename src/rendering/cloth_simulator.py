@@ -890,8 +890,91 @@ class ClothSimulator:
 
         return np.where(np.isfinite(best), best, np.nan)
 
+    @staticmethod
+    def _fill_gaps(a):
+        """Заполнить nan линейной интерполяцией по соседям. Всё nan -> None."""
+        ok = np.isfinite(a)
+        if not ok.any():
+            return None
+        idx = np.arange(len(a))
+        return np.interp(idx, idx[ok], a[ok])
+
+    def _rail_face_profile(self, cuzov_verts, bounds, rail, u_world):
+        """Наружная грань борта по столбцам полотна -> (nx,) <= 0, или None.
+
+        dl[j] — насколько НАСТОЯЩАЯ грань напротив столбца j лежит внутрь от
+        габаритной (bmax/bmin по оси борта).
+
+        Без этого тент висит в воздухе, и вот почему. Габарит по xy берётся по
+        ВСЕЙ высоте кузова, а борт сверху уже, чем низ: у самосвалов низ
+        расширен отбортовкой, брусом или скошенными под 45° полигонами перехода
+        к раме. Замер по моделям (отставание верха борта от габарита):
+        Shacman 0.136, tonar 0.556 при ширине кузова ~2.6. Кромка, отложенная
+        по габариту, оказывается СНАРУЖИ настоящей стенки — тент перекидывается
+        через воображаемое ребро и не касается ничего.
+
+        Меряется по вершинам (это дёшево) и только в ВЕРХНЕЙ части борта:
+        нижняя как раз и врёт.
+        """
+        if cuzov_verts is None or len(cuzov_verts) == 0 or len(u_world) < 2:
+            return None
+
+        bmin, bmax = bounds
+        mid, along, outward, _ = rail
+        ax_out = int(np.argmax(np.abs(outward)))
+        ax_al = int(np.argmax(np.abs(along)))
+        sign = float(np.sign(outward[ax_out]))
+        height = max(float(bmax[2] - bmin[2]), _EPS)
+        width = max(float(bmax[ax_out] - bmin[ax_out]), _EPS)
+
+        v = cuzov_verts
+        # depth <= 0 — насколько вершина внутри от габаритной грани.
+        depth = (v[:, ax_out] - mid[ax_out]) * sign
+        sel = (v[:, 2] > bmax[2] - 0.35 * height) & (v[:, 2] <= bmax[2] + _EPS)
+        # Только ЭТОТ борт: противоположная стенка тоже «верхняя».
+        sel &= (depth > -0.45 * width) & (depth < 0.02 * width)
+        sel &= (v[:, ax_al] >= bmin[ax_al]) & (v[:, ax_al] <= bmax[ax_al])
+        if int(sel.sum()) < 16:
+            return None
+
+        v = v[sel]
+        depth = depth[sel]
+
+        # Столбец полотна -> максимум depth среди попавших вершин, то есть
+        # самая наружная точка борта напротив этого столбца.
+        edges = np.concatenate([[-np.inf],
+                                0.5 * (u_world[1:] + u_world[:-1]),
+                                [np.inf]])
+        col = np.clip(np.digitize(v[:, ax_al], edges) - 1, 0, len(u_world) - 1)
+        best = np.full(len(u_world), -np.inf)
+        np.maximum.at(best, col, depth)
+
+        dl = self._fill_gaps(np.where(np.isfinite(best) & (best > -np.inf),
+                                      best, np.nan))
+        if dl is None:
+            return None
+
+        # Одиночные провалы — это столбцы, где борта попросту НЕТ (проём, вырез,
+        # стык с кабиной): там максимум берётся уже по чему-то другому, далеко
+        # внутри кузова. Замер по моделям: у MAZ на ровном борту со сдвигом
+        # -0.015 попадаются столбцы -0.800. Такой выброс утащил бы за собой
+        # кусок кромки, поэтому профиль чистится медианным фильтром (он
+        # выбрасывает всплеск, но сохраняет настоящую ступень борта) и
+        # ограничивается по отклонению от медианы.
+        try:
+            from scipy.ndimage import median_filter, gaussian_filter1d
+            k = int(np.clip(len(dl) // 12 * 2 + 1, 3, 9))
+            dl = median_filter(dl, size=k, mode="nearest")
+            dl = gaussian_filter1d(dl, 1.0, mode="nearest")
+        except Exception:
+            pass
+        floor = float(np.median(dl)) - 0.12 * width
+
+        # Наружу габарита борт уйти не может — это и есть определение габарита.
+        return np.clip(dl, max(floor, -0.45 * width), 0.0)
+
     def _rail_top_profile(self, cuzov_verts, cuzov_faces, bounds, rail,
-                          u_world, wall):
+                          u_world, wall, face_dl=None):
         """Просадка кромки борта по столбцам полотна -> (nx,) <= 0, или None.
 
         `dz[j]` — насколько верх борта НАПРОТИВ столбца j ниже общего верха
@@ -917,8 +1000,11 @@ class ClothSimulator:
         # отношения не имеет, а стоимость лучей линейна по их числу.
         tri = cuzov_verts[cuzov_faces]
         depth = (tri[:, :, ax_out] - mid[ax_out]) * sign      # <=0 внутрь кузова
+        # Полоса отсчитывается от самой ГЛУБОКОЙ настоящей грани: борт может
+        # уходить внутрь на сотые доли (MAZ) или на полметра (tonar).
+        deepest = 0.0 if face_dl is None else float(np.min(face_dl))
         band = max(wall * 2.5, 1e-3 * height)
-        near = (depth.max(axis=1) > -band) & (depth.min(axis=1) < band)
+        near = (depth.max(axis=1) > deepest - band) & (depth.min(axis=1) < band)
         near &= tri[:, :, 2].max(axis=1) > bmin[2] + 0.2 * height
         lo = u_world.min() - band
         hi = u_world.max() + band
@@ -928,13 +1014,18 @@ class ClothSimulator:
             return None
         faces_near = cuzov_faces[near]
 
-        # Пробы поперёк толщины стенки, от наружной грани внутрь.
+        # Пробы поперёк толщины стенки, от наружной грани внутрь. Отсчёт — от
+        # НАСТОЯЩЕЙ грани (face_dl), а не от габаритной: на кузове с расширенным
+        # низом габаритная грань висит в воздухе снаружи борта, и все пробы
+        # уходили мимо стенки — профиль верха молча откатывался на bmax[2].
+        face = (np.zeros(len(u_world)) if face_dl is None
+                else np.asarray(face_dl, dtype=np.float64))
         probes = np.array([0.2, 0.45, 0.7, 0.95]) * max(wall, _EPS)
         top = np.full(len(u_world), -np.inf)
         for off in probes:
             pts = np.empty((len(u_world), 2), dtype=np.float64)
             pts[:, ax_al] = u_world
-            pts[:, ax_out] = mid[ax_out] - sign * off
+            pts[:, ax_out] = mid[ax_out] + sign * (face - off)
             z = self._top_surface_z(cuzov_verts, faces_near, pts)
             top = np.maximum(top, np.where(np.isfinite(z), z, -np.inf))
 
@@ -954,6 +1045,47 @@ class ClothSimulator:
         # Ограничение — страховка от мусорной геометрии под кузовом: провал
         # глубже борта означает, что луч поймал не кромку, а раму или пол.
         return np.maximum(dz, -0.9 * height)
+
+    @staticmethod
+    def _support_field(verts_list, pts_al, pts_out, ax_al, ax_out, cell):
+        """Верх опоры под каждой точкой сетки -> (ny, nx), nan где опоры нет.
+
+        Настил ложится на НАСЫПЬ, а насыпь не плоская. Стартовая высота бралась
+        по одному числу — квантилю 0.97 высоты всего груза, — поэтому везде, где
+        насыпь выше этого квантиля (гребень, горка у борта), полотно начинало
+        ВНУТРИ груза. Незнаковая коллизия оттуда не вытаскивает: ей неоткуда
+        узнать, где у насыпи «снаружи», и ткань так и оставалась в песке.
+
+        Высота берётся по ВЕРШИНАМ, а не лучами по треугольникам: насыпь — это
+        сотни тысяч мелких граней, луч по ним стоил бы дороже всей симуляции, а
+        максимум z по ячейке даёт ту же огибающую с точностью до шага сетки.
+        """
+        pts = [v for v in verts_list if v is not None and len(v)]
+        if not pts:
+            return None
+        v = np.concatenate(pts)
+
+        step = max(float(cell) * 1.5, _EPS)
+        lo_a, hi_a = float(pts_al.min()) - step, float(pts_al.max()) + step
+        lo_o, hi_o = float(pts_out.min()) - step, float(pts_out.max()) + step
+        na = int(np.clip((hi_a - lo_a) / step, 2, 512))
+        no = int(np.clip((hi_o - lo_o) / step, 2, 512))
+
+        ia = np.floor((v[:, ax_al] - lo_a) / (hi_a - lo_a) * na).astype(np.int64)
+        io = np.floor((v[:, ax_out] - lo_o) / (hi_o - lo_o) * no).astype(np.int64)
+        keep = (ia >= 0) & (ia < na) & (io >= 0) & (io < no)
+        if not keep.any():
+            return None
+
+        grid = np.full((na, no), -np.inf)
+        np.maximum.at(grid, (ia[keep], io[keep]), v[keep, 2])
+
+        ga = np.clip(np.floor((pts_al - lo_a) / (hi_a - lo_a) * na
+                              ).astype(np.int64), 0, na - 1)
+        go = np.clip(np.floor((pts_out - lo_o) / (hi_o - lo_o) * no
+                              ).astype(np.int64), 0, no - 1)
+        out = grid[ga, go]
+        return np.where(np.isfinite(out), out, np.nan)
 
     def _camera_pos(self):
         try:
@@ -1287,11 +1419,40 @@ class ClothSimulator:
         # начиналось (и, будучи закреплённым, оставалось) в воздухе. Профиль
         # сажает и свисающую часть, и сам ряд крепления на настоящую кромку.
         u_world = mid[axis_along] + u
+
+        # Наружная грань борта напротив каждого столбца. Габаритная грань у
+        # кузова с расширенным низом лежит СНАРУЖИ настоящей стенки (замер:
+        # Shacman 0.14, tonar 0.56), и тент, отложенный по ней, висел в
+        # воздухе, ничего не касаясь.
+        dl = self._rail_face_profile(cuzov_verts, bounds, rail, u_world)
+        if dl is None:
+            dl = np.zeros(nx, dtype=np.float64)
+
         dz = self._rail_top_profile(cuzov_verts, cuzov_faces, bounds, rail,
-                                    u_world, wall)
+                                    u_world, wall, face_dl=dl)
         if dz is None:
             dz = np.zeros(nx, dtype=np.float64)
         top = bmax[2] + dz[None, :]                       # (1, nx)
+
+        # Весь профиль поперёк борта сдвигается на настоящую грань.
+        lateral = lateral + dl[None, :]
+
+        # Высота НАСТИЛА по каждой точке, а не одно число на всё полотно.
+        # lie_z построен на квантиле 0.97 высоты груза, то есть на СРЕДНЕМ
+        # верхе насыпи; там, где насыпь выше (гребень, горка у борта), полотно
+        # стартовало внутри груза и там же оставалось — незнаковая коллизия из
+        # толщи насыпи не вытаскивает. Опора меряется по факту и полотно
+        # кладётся заведомо над ней.
+        lie_surface = np.full_like(vv, lie_z)
+        if not big:
+            pts_al = np.broadcast_to(u_world[None, :], vv.shape)
+            pts_out = mid[axis_out] + float(np.sign(outward[axis_out])) * lateral
+            support = self._support_field(
+                [cargo_verts], pts_al, pts_out, axis_along, axis_out, cell)
+            if support is not None:
+                lie_surface = np.maximum(
+                    lie_surface, np.where(np.isfinite(support),
+                                          support + clear_z, -np.inf))
 
         # Просадка кромки действует на свисающую часть и перегиб ЦЕЛИКОМ, а на
         # настиле сходит на нет: настил ложится поверх ГРУЗА, чья насыпь идёт
@@ -1301,7 +1462,7 @@ class ClothSimulator:
             vv < cross0, top - (cross0 - vv),
             np.where(vv > cross1,
                      (top + clear_z)
-                     + (lie_z - top - clear_z) * ramp,
+                     + (lie_surface - top - clear_z) * ramp,
                      top + clear_z))
 
         # Складки на настиле: гребни поперёк полотна, смещение только ВВЕРХ —
@@ -1724,6 +1885,22 @@ class ClothSimulator:
         margin = layout["span"] * 0.35
         region = (grid.reshape(-1, 3).min(axis=0) - margin,
                   grid.reshape(-1, 3).max(axis=0) + margin)
+
+        # ГРУЗ входит в коллизию ЦЕЛИКОМ, независимо от рабочей зоны.
+        #
+        # Зона считается по стартовой раскладке плюс доля размаха, но полотно
+        # свободно: под ветром и при падении оно уходит дальше. Треугольники
+        # груза, оказавшиеся за границей зоны, в BVH не попадали — а значит для
+        # ткани их просто НЕ СУЩЕСТВОВАЛО, и она проваливалась в насыпь. Ровно
+        # тот случай, когда «коллизия с наполнителем работает» на глаз, но
+        # изредка ткань оказывается внутри груза.
+        #
+        # Насыпь ограничена кузовом, так что расширение зоны до её габарита
+        # стоит немного, а тунеллирование сквозь груз исключает полностью.
+        if cargo_verts is not None and len(cargo_verts):
+            pad = cell * 2.0
+            region = (np.minimum(region[0], cargo_verts.min(axis=0) - pad),
+                      np.maximum(region[1], cargo_verts.max(axis=0) + pad))
 
         collider = self._make_collider(meshes, thickness, region, gpu=gpu)
         if collider is not None:

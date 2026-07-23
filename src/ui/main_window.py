@@ -2812,6 +2812,21 @@ class MainWindow(QMainWindow):
         """
         if self.panda_app is None:
             return
+
+        # Съёмка САМА крутит кадры, поэтому запускаться изнутри кадра нельзя:
+        # насос подавил бы вложенные шаги (иначе — рекурсивный poll), кадры бы
+        # не продвигались, и ожидание сцены зависло бы. Слот может приехать
+        # именно так — через QApplication.processEvents(), вызванный из-под
+        # идущего кадра. Если это наш случай — откладываем старт до момента,
+        # когда кадр завершится (singleShot(0) = следующая итерация цикла
+        # событий, уже вне кадра).
+        pump = getattr(self.panda_app, "frame_pump", None)
+        if pump is not None and pump.busy:
+            print("[SaveRender] запуск изнутри кадра — откладываю на "
+                  "следующий цикл событий.")
+            QTimer.singleShot(0, self._on_save_render_clicked)
+            return
+
         ru = getattr(self.panda_app, "renderer_utils", None)
         if ru is None or not hasattr(ru, "save_single_render"):
             print("[SaveRender] renderer_utils.save_single_render missing.")
@@ -3220,23 +3235,46 @@ class MainWindow(QMainWindow):
             """Ждём по ОБОИМ условиям: не меньше `frames` РЕАЛЬНО выполненных
             кадров и не меньше `seconds` секунд.
 
-            Кадры считаем по фактически выполненным (pump.step возвращает их
-            число): раньше здесь считались ПОПЫТКИ, а часть шагов Panda молча
-            игнорировала как рекурсивные, из-за чего «60 кадров» могли
-            означать сильно меньше и сцена не успевала сойтись."""
+            Кадры считаем по фактически ВЫПОЛНЕННЫМ (pump.step возвращает их
+            число): если считать попытки, часть шагов Panda молча игнорирует
+            как рекурсивные, и «60 кадров» означают сильно меньше — сцена не
+            успевает сойтись к моменту снимка.
+
+            КРИТИЧНО: у цикла ОБЯЗАН быть выход, не зависящий от числа
+            выполненных кадров. Если мы сами оказались внутри кадра (насос
+            подавляет повторный вход и возвращает 0), кадры отсюда не
+            продвинутся НИКОГДА — и `while n < frames` висел бы вечно, ровно
+            как «после пайплайна ничего не происходит». Поэтому есть и
+            детектор простоя, и жёсткий дедлайн: лучше выйти рано и дать
+            захвату честно отказаться, чем повесить приложение."""
             pump = getattr(self.panda_app, "frame_pump", None)
             start = time.perf_counter()
+            deadline = start + max(seconds * 4.0, seconds + 15.0)
             n = 0
+            stalled = 0
             while True:
                 if pump is not None:
-                    n += pump.step(1)
+                    done = pump.step(1)
+                    n += done
+                    stalled = 0 if done else stalled + 1
                 else:
                     self.panda_app.taskMgr.step()
                     n += 1
                 # processEvents держит UI живым; тик _panda_timer, доехавший
                 # отсюда, отсекается защитой насоса от повторного входа.
                 QApplication.processEvents()
-                if n >= frames and (time.perf_counter() - start) >= seconds:
+
+                now = time.perf_counter()
+                if n >= frames and (now - start) >= seconds:
+                    break
+                if stalled >= 50:
+                    print("[SaveRender] кадры не продвигаются (вызов изнутри "
+                          "кадра); выхожу из ожидания, чтобы не зависнуть.")
+                    break
+                if now >= deadline:
+                    print(f"[SaveRender] дедлайн ожидания: выполнено {n} из "
+                          f"{frames} кадров за {now - start:.1f} c — иду "
+                          f"дальше.")
                     break
                 time.sleep(0.005)                   # мягкая пауза, без простоя
 
