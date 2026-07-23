@@ -109,8 +109,12 @@ class MainWindow(QMainWindow):
 
         self._reposition_panda()
 
+        # Кадры гоним ЧЕРЕЗ FramePump, а не напрямую taskMgr.step. Пока идёт
+        # съёмка датасета (она сама крутит кадры), тик этого таймера, доехавший
+        # через QApplication.processEvents, отсекается защитой от повторного
+        # входа — вместо «Ignoring recursive poll()» и молча пропущенного кадра.
         self._panda_timer = QTimer(self)
-        self._panda_timer.timeout.connect(panda_app.taskMgr.step)
+        self._panda_timer.timeout.connect(self._pump_frame)
         self._panda_timer.start(16)
 
         # ---- Depth-map overlay (top-LEFT, live image only) ---------
@@ -3213,15 +3217,24 @@ class MainWindow(QMainWindow):
         WAIT_SECONDS = 1.0
 
         def _settle_wait(frames=WAIT_FRAMES, seconds=WAIT_SECONDS):
-            tm = getattr(self.panda_app, "taskMgr", None)
+            """Ждём по ОБОИМ условиям: не меньше `frames` РЕАЛЬНО выполненных
+            кадров и не меньше `seconds` секунд.
+
+            Кадры считаем по фактически выполненным (pump.step возвращает их
+            число): раньше здесь считались ПОПЫТКИ, а часть шагов Panda молча
+            игнорировала как рекурсивные, из-за чего «60 кадров» могли
+            означать сильно меньше и сцена не успевала сойтись."""
+            pump = getattr(self.panda_app, "frame_pump", None)
             start = time.perf_counter()
             n = 0
             while True:
-                if tm is not None:
-                    tm.step()                       # реальный кадр пайплайна
+                if pump is not None:
+                    n += pump.step(1)
                 else:
-                    self.panda_app.graphicsEngine.renderFrame()
-                n += 1
+                    self.panda_app.taskMgr.step()
+                    n += 1
+                # processEvents держит UI живым; тик _panda_timer, доехавший
+                # отсюда, отсекается защитой насоса от повторного входа.
                 QApplication.processEvents()
                 if n >= frames and (time.perf_counter() - start) >= seconds:
                     break
@@ -3468,6 +3481,17 @@ class MainWindow(QMainWindow):
                 return children[0]
 
         return None
+
+    def _pump_frame(self) -> None:
+        """Тик Qt-таймера: один кадр Panda через защищённый насос."""
+        app = getattr(self, "panda_app", None)
+        if app is None:
+            return
+        pump = getattr(app, "frame_pump", None)
+        if pump is not None:
+            pump.step(1)
+        else:
+            app.taskMgr.step()
 
     def _reposition_panda(self) -> None:
         if self.panda_app is None:

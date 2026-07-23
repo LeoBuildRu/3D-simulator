@@ -1142,87 +1142,144 @@ class RendererUtils:
             tm.step()
 
     # ==================================================================
-    # ЗАХВАТ КАДРА ОНСКРИН-ОКНА
+    # ЗАХВАТ КАДРА — ТОЛЬКО ИЗ OFFSCREEN-БУФЕРОВ, ОКНО НЕ ЧИТАЕТСЯ НИКОГДА.
     #
-    # КОРЕНЬ СТАРОГО БАГА («оригинал = ПРЕДЫДУЩИЙ сэмпл, вырезанный по
-    # ТЕКУЩЕЙ маске»).
+    # КОРЕНЬ БАГА («оригинал = чужой кадр» / «в датасет попадают GitHub,
+    # VSCode, проводник»).
     #
-    # Когда окно Panda перестаёт РИСОВАТЬ (свёрнуто / перекрыто; на WGL
-    # begin_frame() просто возвращает false для minimized-окна), его
-    # framebuffer сохраняет последний нарисованный кадр — то есть сцену
-    # ПРЕДЫДУЩЕГО сэмпла. При этом offscreen-буферы (маска сегментации,
-    # карта глубины) продолжают рендериться штатно: они не окна, состояние
-    # окна на них не влияет.
+    # Окно Panda встроено ДОЧЕРНИМ HWND в Qt-виджет (main_window: winId() +
+    # SetWindowPos по _panda_hwnd). У такого окна нет собственного
+    # композитора, и win.get_screenshot() читает НЕ GL-поверхность, а
+    # ПИКСЕЛИ РАБОЧЕГО СТОЛА под областью окна. Отсюда посторонние окна в
+    # датасете. Если же окно вдобавок не рисуется (свёрнуто/перекрыто), в
+    # буфере остаётся кадр ПРЕДЫДУЩЕГО сэмпла — та самая «маска текущая,
+    # цвет предыдущий».
     #
-    # Итог: маска и глубина — от ТЕКУЩЕГО сэмпла, цветной кадр — от
-    # ПРЕДЫДУЩЕГО. При замене фона (random_background) устаревший цветной
-    # кадр вырезается по актуальной маске — ровно наблюдаемый симптом.
-    #
-    # Измерено на этой машине (окно свёрнуто, 8 итераций):
+    # Измерено (свёрнутое окно, 8 итераций):
     #     win.get_screenshot()   -> устаревший кадр, 6/8 неверных
-    #     triggered copy         -> копии НЕТ вообще, 8/8
+    #     triggered copy окна    -> копии НЕТ вообще, 8/8
     #     offscreen-буфер        -> ВЕРНО 8/8
     #
-    # Отсюда два вывода, на которых построен этот код:
+    # И отдельно проверено на RenderPipeline (видимое / свёрнутое /
+    # восстановленное окно): чтение цели FinalStage даёт АКТУАЛЬНЫЙ кадр во
+    # всех трёх состояниях.
     #
-    #  1) win.get_screenshot() НЕЛЬЗЯ использовать никогда: он молча отдаёт
-    #     устаревший кадр, и отличить его от корректного невозможно. Именно
-    #     этот молчаливый откат и делал прошлые попытки починки частичными —
-    #     добавление settle-кадров меняет лишь ВЕРОЯТНОСТЬ, но не ГАРАНТИЮ:
-    #     ожидание не заставит несвёрнутое окно рисовать.
-    #
-    #  2) RTM_triggered_copy_ram — одновременно и способ чтения, и ДЕТЕКТОР
-    #     устаревания. Panda копирует framebuffer внутри
-    #     GraphicsOutput::end_frame() — после отрисовки и до flip'а. Если
-    #     кадр не рисовался, копия НЕ ПРИХОДИТ. Значит: копия пришла =>
-    #     кадр реально нарисован сейчас => изображение по построению
-    #     актуально. Копии нет => кадр устарел => отказ, а НЕ тихая запись
-    #     испорченного сэмпла в датасет.
+    # ПОЭТОМУ все три выхода датасета берутся из offscreen-FBO:
+    #     цвет   <- RenderPipeline FinalStage (полная постобработка)
+    #     маска  <- SegmentationRenderer (свой буфер, уже так работало)
+    #     глубина<- DepthMapRenderer + свой offscreen-колорайзер
+    # Состояние окна не влияет ни на один из них, и все три согласованы по
+    # кадру между собой.
     # ==================================================================
-    def _ensure_capture_texture(self):
-        """Один раз повесить на окно triggered-copy-текстуру. None при отказе.
+    def _rp_final_target(self):
+        """RenderTarget стадии FinalStage (цель с полной постобработкой).
 
-        RenderPipeline вызывает clear_render_textures() только на СВОИХ
-        внутренних буферах (render_target.py), окна не трогает, — так что
-        текстура тут держится стабильно. Пока копия не затребована явно,
-        стоимость нулевая (в отличие от RTM_copy_ram, копирующего каждый кадр).
+        Кэшируем только сам ОБЪЕКТ СТАДИИ (он живёт всё время), но НЕ его
+        target: RenderPipeline слушает 'window-event' и при изменении размера
+        окна ПЕРЕСОЗДАЁТ все свои render target'ы. Закэшированный target (и
+        тем более его буфер) после этого висячий, и trigger_copy по нему роняет
+        процесс — ровно это и происходило при разворачивании окна. Поэтому
+        target берём заново на каждый захват (обход списка стадий дёшев).
         """
-        tex = getattr(self, "_capture_tex", None)
-        if tex is not None:
-            return tex
-        if getattr(self, "_capture_tex_failed", False):
+        rp = getattr(self.panda_app, "render_pipeline", None)
+        if rp is None:
             return None
-
-        win = getattr(self.panda_app, "win", None)
-        if win is None:
+        stage = getattr(self, "_final_stage", None)
+        if stage is None:
+            try:
+                for s in rp.stage_mgr.stages:
+                    if type(s).__name__ == "FinalStage":
+                        stage = s
+                        self._final_stage = s
+                        break
+            except Exception as exc:
+                print(f"[Render] поиск FinalStage не удался: {exc}")
+                return None
+        if stage is None:
             return None
         try:
-            tex = Texture("frame_capture")
-            ok = win.add_render_texture(
+            return stage.target
+        except Exception:
+            return None
+
+    def _ensure_triggered_tex(self, buffer, attr):
+        """Повесить на буфер triggered-copy-текстуру (с кэшем ПО БУФЕРУ).
+
+        Кэш привязан к конкретному буферу: если RenderPipeline пересоздал
+        цель (изменился размер окна), буфер будет ДРУГИМ — тогда вешаем
+        текстуру заново, а не используем висячую.
+
+        RTM_triggered_copy_ram копирует содержимое внутри end_frame() — после
+        отрисовки и до flip'а — и только по явному запросу, поэтому в обычных
+        кадрах не стоит ничего.
+        """
+        if buffer is None:
+            return None
+        cache = getattr(self, "_trig_cache", None)
+        if cache is None:
+            cache = self._trig_cache = {}
+        key = (attr, id(buffer))
+        entry = cache.get(key)
+        if entry is not None:
+            return entry
+        try:
+            tex = Texture(attr)
+            ok = buffer.add_render_texture(
                 tex,
                 GraphicsOutput.RTM_triggered_copy_ram,
                 GraphicsOutput.RTP_color,
             )
-            # На этой сборке Panda add_render_texture возвращает None (а не
-            # True) при успехе — отказом считаем только явный False.
+            # На этой сборке Panda add_render_texture возвращает None при
+            # успехе — отказом считаем только явный False.
             if ok is False:
                 raise RuntimeError("add_render_texture отклонён")
         except Exception as exc:
-            print(f"[Render] triggered-copy недоступен: {exc}")
-            self._capture_tex_failed = True
+            print(f"[Render] triggered-copy недоступен ({attr}): {exc}")
             return None
-
-        self._capture_tex = tex
+        # Держим ссылку на буфер: пока запись жива, буфер не будет собран GC,
+        # т.е. id() не может быть переиспользован другим объектом.
+        cache[key] = tex
+        cache[("buf",) + key] = buffer
         return tex
 
+    def _read_triggered(self, buffer, tex, img, *, settle=0, tries=20):
+        """Снять кадр буфера через triggered-copy. False, если копия не пришла.
+
+        Отсутствие копии означает, что буфер не рисовался, т.е. изображение
+        было бы устаревшим — тогда честный отказ, а не тихая порча датасета.
+        """
+        if settle:
+            self._step_frames(settle)
+        tex.clear_ram_image()          # иначе примем копию прошлого захвата
+        buffer.trigger_copy()
+        self._step_frames(1)
+        for _ in range(tries):
+            if tex.has_ram_image():
+                break
+            self._step_frames(1)
+        if not tex.has_ram_image():
+            return False
+        return bool(tex.store(img))
+
     def _step_frames(self, count):
-        """`count` РЕАЛЬНЫХ кадров пайплайна (taskMgr.step, а не голый
-        render_frame): RenderPipeline делает всю пофреймовую работу в тасках
+        """`count` РЕАЛЬНЫХ кадров пайплайна.
+
+        RenderPipeline делает всю пофреймовую работу в тасках
         (RP_UpdateManagers sort=10, RP_Plugin_BeforeRender sort=12,
         RP_UpdateInputsAndStages sort=18) — именно там обновляются матрицы
         камеры и продвигаются ping-pong индексы темпоральных стадий (TAA).
         igLoop (draw+flip) идёт ПОСЛЕ них, sort=50. Голый render_frame()
-        выполняет только draw+flip и эти таски НЕ гоняет."""
+        выполняет только draw+flip и эти таски НЕ гоняет.
+
+        Шаг идёт через frame_pump приложения, если он есть: это единственная
+        точка, где крутится taskMgr, и она защищена от повторного входа.
+        Иначе Qt-таймер и наш settle пересекаются, Panda ругается «Ignoring
+        recursive poll() within another task» и ПРОПУСКАЕТ кадр.
+        """
+        pump = getattr(self.panda_app, "frame_pump", None)
+        if pump is not None:
+            pump.step(count)
+            return
         tm = getattr(self.panda_app, "taskMgr", None)
         for _ in range(max(1, int(count))):
             if tm is not None:
@@ -1230,79 +1287,167 @@ class RendererUtils:
             else:
                 self.panda_app.graphicsEngine.render_frame()
 
-    def _grab_window_screenshot(self, img, *, steps=2):
-        """Снять кадр окна ГАРАНТИРОВАННО актуальным, иначе честно отказать.
+    def capture_scene_color(self, img, *, steps=2):
+        """Цветной кадр сцены со ВСЕЙ постобработкой, БЕЗ чтения окна.
 
-        Возвращает False, если актуальность кадра подтвердить не удалось.
-        Вызывающий код обязан трактовать False как «сэмпл не снят» — лучше
-        потерять кадр, чем записать в датасет цветную картинку от предыдущего
-        сэмпла (её потом не отличить от корректной).
-
-        ВАЖНО: тут НЕЛЬЗЯ трогать свойства окна (request_properties). Окно
-        Panda встроено ДОЧЕРНИМ HWND в Qt-виджет (main_window: winId() +
-        SetWindowPos по _panda_hwnd), и requestProperties используется только
-        для origin/size. Запрос смены minimized на встроенном окне заставляет
-        Panda переконфигурировать/пересоздать окно — оно отваливается от
-        Qt-родителя и всплывает отдельным окном верхнего уровня, после чего
-        рендер в виджет прекращается. Детектору манипуляции окном и не нужны:
-        отсутствие triggered-copy само по себе означает «кадр не рисовался».
+        Основной путь — цель FinalStage RenderPipeline: обычный offscreen-FBO,
+        на который состояние окна не влияет (проверено при свёрнутом окне).
+        Для пресета 'performance' (RenderPipeline выключен) FinalStage нет —
+        тогда падаем на triggered-copy самого окна: оно всё ещё лучше
+        get_screenshot (копия делается до flip'а и её отсутствие детектирует
+        неактуальность), но требует видимого окна.
         """
+        target = self._rp_final_target()
+        if target is not None:
+            try:
+                buf = target.internal_buffer
+                tex = self._ensure_triggered_tex(buf, "_final_tex")
+                if tex is not None:
+                    if self._read_triggered(buf, tex, img, settle=steps):
+                        return True
+                    print("[Render] FinalStage не отдал копию кадра")
+            except Exception as exc:
+                print(f"[Render] чтение FinalStage не удалось: {exc}")
+
+        # --- запасной путь: окно (только без RenderPipeline) ---------------
         win = getattr(self.panda_app, "win", None)
         if win is None:
             return False
-
-        tex = self._ensure_capture_texture()
+        tex = self._ensure_triggered_tex(win, "_win_tex")
         if tex is None:
-            # Драйвер не умеет triggered-copy — проверить актуальность нечем.
-            # Работаем как раньше (кадр может оказаться устаревшим), но громко
-            # предупреждаем один раз.
-            if not getattr(self, "_capture_warned", False):
-                print("[Render] ВНИМАНИЕ: triggered-copy недоступен, "
-                      "актуальность кадра НЕ проверяется — возможен захват "
-                      "кадра предыдущего сэмпла.")
-                self._capture_warned = True
+            print("[Render] ВНИМАНИЕ: triggered-copy недоступен — читаю окно "
+                  "напрямую, кадр может быть неактуален.")
             self._step_frames(steps)
             return win.getScreenshot(img)
-
-        # Settle ДО триггера: копируемый кадр должен быть уже сошедшимся
-        # (TAA/каскадные тени/ленивая загрузка ресурсов на GPU).
-        self._step_frames(steps)
-
-        # Несколько попыток: окно могло не рисоваться временно (пользователь
-        # свернул/переключился). Ждём его возвращения, но БЕЗ вмешательства.
         for attempt in range(3):
-            # Сбрасываем прошлую копию — иначе has_ram_image() ниже мог бы
-            # подтвердиться копией от ПРЕДЫДУЩЕГО захвата, и детектор
-            # устаревания молча пропустил бы устаревший кадр.
-            tex.clear_ram_image()
-
-            # trigger_copy() = «скопировать в конце СЛЕДУЮЩЕГО кадра».
-            win.trigger_copy()
-            self._step_frames(1)
-            for _ in range(20):
-                if tex.has_ram_image():
-                    break
-                self._step_frames(1)
-
-            if tex.has_ram_image():
-                if tex.store(img):
-                    # Ориентацию Texture.store() берёт на себя: проверено —
-                    # белая полоса, нарисованная СВЕРХУ, оказывается сверху и
-                    # в PNMImage. Ручной flip не нужен (та же схема, что и в
-                    # SegmentationRenderer.capture()).
-                    return True
-                print("[Render] tex.store() не удался.")
-                return False
-
-            # Копии нет => кадр не рисовался => он устарел.
+            if self._read_triggered(win, tex, img, settle=steps if not attempt else 1):
+                return True
             print(f"[Render] окно не рисуется (копия не пришла), "
-                  f"жду... попытка {attempt + 1}/3")
-
-        print("[Render] ОТКАЗ: окно не рисуется (свёрнуто?) — АКТУАЛЬНЫЙ кадр "
-              "получить нельзя. Сэмпл пропущен намеренно: запись устаревшего "
-              "кадра испортила бы датасет. Разверните окно приложения.")
+                  f"попытка {attempt + 1}/3")
+        print("[Render] ОТКАЗ: актуальный кадр получить не удалось. Сэмпл "
+              "пропущен намеренно — запись устаревшего кадра испортила бы "
+              "датасет.")
         return False
 
+    # Совместимость: старое имя. Весь код датасета должен звать
+    # capture_scene_color — окно больше не является источником кадра.
+    def _grab_window_screenshot(self, img, *, steps=2):
+        return self.capture_scene_color(img, steps=steps)
+
+    # ------------------------------------------------------------------
+    # Offscreen-колорайзер карты глубины.
+    #
+    # DepthMapRenderer раскрашивает глубину картой-оверлеем на render2d, а
+    # render2d рисуется ОКНОМ (мимо стадий RenderPipeline) — то есть снять её
+    # можно было только чтением окна, со всеми его проблемами. Здесь тот же
+    # самый узел-оверлей временно переносится в собственный offscreen-буфер с
+    # ортокамерой и снимается оттуда. Переиспользуем ИМЕННО узел оверлея, а не
+    # копию шейдера, — тогда все входы (near/far, gradientStart/End,
+    # grayscale) гарантированно те же, что выставил DepthMapRenderer.
+    # ------------------------------------------------------------------
+    # Размер ФИКСИРОВАН и равен размеру depth-текстуры (DepthMapRenderer
+    # создаёт её как 1920x1080). Привязывать буфер к размеру окна нельзя:
+    # у свёрнутого окна размер бессмысленный, а при разворачивании он меняется
+    # — и буфер пересоздавался бы (remove_window + make_output) прямо посреди
+    # съёмки, что роняло процесс. Колорайзер лишь рисует полноэкранную карту,
+    # сэмплящую depth-текстуру, поэтому размер окна ему не нужен вовсе.
+    DEPTH_COLORIZER_SIZE = (1920, 1080)
+
+    def _ensure_depth_colorizer(self):
+        state = getattr(self, "_depth_colorizer", None)
+        if state is not None:
+            return state
+        if getattr(self, "_depth_colorizer_failed", False):
+            return None
+
+        w, h = self.DEPTH_COLORIZER_SIZE
+        app = self.panda_app
+        try:
+            fb = FrameBufferProperties()
+            fb.set_rgba_bits(8, 8, 8, 8)
+            fb.set_srgb_color(False)
+            fb.set_depth_bits(0)
+            fb.set_multisamples(0)
+
+            buf = app.graphicsEngine.make_output(
+                app.pipe, "depth_colorize_buffer", -20, fb,
+                WindowProperties.size(w, h),
+                GraphicsPipe.BF_refuse_window,
+                app.win.get_gsg(), app.win)
+            if buf is None:
+                raise RuntimeError("make_output вернул None")
+
+            buf.set_clear_color_active(True)
+            buf.set_clear_color(LColor(0, 0, 0, 1))
+
+            root = NodePath("depth_colorize_root")
+            lens = OrthographicLens()
+            lens.set_film_size(2, 2)
+            lens.set_near_far(-10, 10)
+            cam = Camera("depth_colorize_cam", lens)
+            cam_np = root.attach_new_node(cam)
+            cam_np.set_pos(0, -1, 0)
+            cam_np.look_at(0, 0, 0)
+
+            dr = buf.make_display_region(0, 1, 0, 1)
+            dr.set_camera(cam_np)
+            dr.set_clear_color_active(True)
+            dr.set_clear_color(LColor(0, 0, 0, 1))
+
+            buf.set_active(False)
+            state = {"buffer": buf, "root": root, "cam": cam_np,
+                     "size": (w, h)}
+            self._depth_colorizer = state
+            return state
+        except Exception as exc:
+            print(f"[Render] offscreen-колорайзер глубины недоступен: {exc}")
+            self._depth_colorizer_failed = True
+            return None
+
+    def capture_depth_color(self, img):
+        """Снять РАСКРАШЕННУЮ карту глубины из offscreen-буфера.
+
+        Возвращает False, если снять не удалось — вызывающий решает, что
+        делать (для датасета это отказ от сэмпла).
+        """
+        app = self.panda_app
+        dr = getattr(app, "depth_renderer", None)
+        if dr is None:
+            return False
+        overlay = getattr(dr, "overlay_node", None)
+        if overlay is None or overlay.is_empty():
+            return False
+
+        # Карта глубины под ТЕКУЩУЮ позу камеры.
+        try:
+            dr.update_depth_texture()
+        except Exception as exc:
+            print(f"[Render] update_depth_texture не удался: {exc}")
+
+        state = self._ensure_depth_colorizer()
+        if state is None:
+            return False
+
+        buf = state["buffer"]
+        tex = self._ensure_triggered_tex(buf, "_depth_color_tex")
+        if tex is None:
+            return False
+
+        parent = overlay.get_parent()
+        was_hidden = overlay.is_hidden()
+        try:
+            overlay.reparent_to(state["root"])
+            overlay.show()
+            overlay.set_pos(0, 0, 0)
+            buf.set_active(True)
+            ok = self._read_triggered(buf, tex, img, settle=1)
+        finally:
+            buf.set_active(False)
+            overlay.reparent_to(parent)
+            overlay.set_pos(0, 0, 0)
+            if was_hidden:
+                overlay.hide()
+        return ok
     def _get_gemini_processor(self):
         """Ленивое создание процессора постобработки (провайдер из config).
         None, если недоступен (нет ключа/токена, отключён и т.п.)."""
@@ -1440,14 +1585,14 @@ class RendererUtils:
 
         self.settle_render(frames=30)
 
-        # Цветной кадр. _grab_window_screenshot возвращает False, если не смог
-        # ПОДТВЕРДИТЬ актуальность кадра (окно не рисовалось) — тогда сэмпл
-        # пропускается целиком. Именно здесь раньше в датасет утекал цветной
-        # кадр от предыдущего сэмпла: он молча снимался со свёрнутого окна и
-        # затем вырезался по АКТУАЛЬНОЙ маске.
+        # Цветной кадр — из offscreen-цели FinalStage, окно НЕ читается.
+        # Именно здесь раньше в датасет попадал чужой кадр: чтение встроенного
+        # дочернего HWND возвращало пиксели рабочего стола (посторонние окна)
+        # либо кадр предыдущего сэмпла, который затем вырезался по АКТУАЛЬНОЙ
+        # маске. False => сэмпл пропускается целиком.
         img = PNMImage()
         self.settle_render(frames=30)
-        if not self._grab_window_screenshot(img):
+        if not self.capture_scene_color(img):
             self.panda_app.depth_renderer.set_overlay_visibility(False)
             return False
 
@@ -1487,57 +1632,41 @@ class RendererUtils:
                 return False
 
             # Дополнительная карта глубины рядом с маской сегментации.
-            # Снимается тем же путём, что и в depth-режиме, но с явной
-            # синхронизацией кадра (иначе в буфер попадает обычный 3D-рендер,
-            # а не depth-overlay — «застывший» кадр до применения изменений):
-            #   1) включаем depth overlay;
-            #   2) обновляем карту глубины под ТЕКУЩУЮ позу камеры
-            #      (update_depth_texture рендерит depth-буфер depth-камерой);
-            #   3) settle_render — реальные кадры пайплайна с видимым overlay;
-            #   4) _grab_window_screenshot — читает кадр только после того, как
-            #      подтвердил, что он реально нарисован (triggered copy), т.е.
-            #      кадр гарантированно С overlay, а не предыдущий рендер.
+            # capture_depth_color рисует узел-оверлей глубины в СВОЙ
+            # offscreen-буфер, поэтому окно не читается и его состояние
+            # (свёрнуто/перекрыто/встроено в Qt) ни на что не влияет. Сам
+            # оверлей при этом остаётся скрытым в окне — переключать его
+            # видимость больше не нужно.
             if also_depth:
                 dr = self.panda_app.depth_renderer
-                dr.set_overlay_visibility(True)
                 # Ч/Б карта глубины — только для датасетов.
                 if hasattr(dr, "set_grayscale"):
                     dr.set_grayscale(True)
-                try:
-                    dr.update_depth_texture()
-                except Exception as exc:
-                    print(f"[Render] update_depth_texture failed: {exc}")
-                self.settle_render(frames=16)
                 depth_extra = PNMImage()
-                if not self._grab_window_screenshot(depth_extra):
+                if not self.capture_depth_color(depth_extra):
                     print("[Render] extra depth capture failed; "
                           "сохраняю только маску.")
                     depth_extra = None
-                dr.set_overlay_visibility(False)
                 # Вернуть цветной градиент для живого overlay в UI.
                 if hasattr(dr, "set_grayscale"):
                     dr.set_grayscale(False)
         else:
             dr = self.panda_app.depth_renderer
-            dr.set_overlay_visibility(True)
             # Ч/Б карта глубины — только для датасетов (у одиночного рендера
             # оставляем цветной градиент). Датасет распознаём по метаданным.
             is_dataset = bool(extra_metadata
                               and extra_metadata.get("render_type") == "dataset")
             if is_dataset and hasattr(dr, "set_grayscale"):
                 dr.set_grayscale(True)
-            self.settle_render(frames=16)
 
             depthImg = PNMImage()
-            if not self._grab_window_screenshot(depthImg):
-                dr.set_overlay_visibility(False)
-                if is_dataset and hasattr(dr, "set_grayscale"):
-                    dr.set_grayscale(False)
-                return False
+            ok_depth = self.capture_depth_color(depthImg)
 
-            dr.set_overlay_visibility(False)
             if is_dataset and hasattr(dr, "set_grayscale"):
                 dr.set_grayscale(False)
+            if not ok_depth:
+                print("[Render] depth capture failed.")
+                return False
 
         img = self.stretch_to_1920x1080(img)
         depthImg = self.stretch_to_1920x1080(depthImg, nearest=is_segmentation)

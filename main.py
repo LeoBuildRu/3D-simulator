@@ -57,6 +57,7 @@ from src.rendering.segmentation_renderer import SegmentationRenderer
 from src.rendering.cloth_simulator import ClothSimulator
 from src.rendering.perlin_mesh_generator import PerlinMeshGenerator
 from src.rendering.renderer_utils import RendererUtils
+from src.core.frame_pump import FramePump
 from src.rendering.mesh_reconstruction import MeshReconstruction
 from src.rendering.mesh_distribution import MeshDistributor
 from src.core.crash_reporter import TelegramCrashReporter
@@ -339,6 +340,12 @@ class MyApp(ShowBase):
         self.mesh_distributions = []
 
         self.tls_client = TLS_client(host=tls_host, port=tls_port, timeout=300.0)
+
+        # ЕДИНСТВЕННАЯ точка, где крутится taskMgr (см. src/core/frame_pump.py).
+        # И Qt-таймер, и settle-циклы датасета ходят через неё, поэтому
+        # повторный вход в шаг задач («Ignoring recursive poll() within another
+        # task», из-за которого кадры молча пропускались) невозможен.
+        self.frame_pump = FramePump(self)
 
         self.perlin_generator = PerlinMeshGenerator(self, tls_client=self.tls_client)
         self.renderer_utils = RendererUtils(self)
