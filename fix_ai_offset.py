@@ -40,6 +40,76 @@ import numpy as np
 MASK_DILATE_FRAC = 0.06   # grow truck mask by ~6% of image to cover the offset
 IDENTITY = np.array([[1, 0, 0], [0, 1, 0]], np.float32)
 
+# --- Correction guards -----------------------------------------------------
+# Cap on how large a correction we allow. If the estimated warp would move,
+# zoom or rotate the frame by more than this fraction, we do NOT correct the
+# shot at all (leave the AI frame untouched). "move"  = max corner displacement
+# relative to the shorter image side; "zoom" = |scale-1|; "rotate" is captured
+# by the corner-displacement measure.
+MAX_CORRECTION_FRAC = 0.20
+
+# Only shots whose filesystem creation time is strictly AFTER this reference
+# frame get corrected. Everything at or before it is left as-is (those shots
+# came from a different AI model that did not introduce the offset). The cutoff
+# is read from the reference file's own metadata, not from its name.
+CUTOFF_REFERENCE = "r0006_vol0007.53_random_20260723_141356_127246_ai.png"
+
+
+def _creation_time(path):
+    """Filesystem creation time (birth time on Windows) as a float, or None."""
+    try:
+        return os.path.getctime(path)
+    except OSError:
+        return None
+
+
+def _resolve_cutoff(any_target):
+    """Locate the reference file next to a target being processed and return its
+    creation time. Cached after the first successful lookup."""
+    if _resolve_cutoff.value is not None:
+        return _resolve_cutoff.value
+    folder = any_target if os.path.isdir(any_target) else os.path.dirname(any_target)
+    ref = os.path.join(folder or ".", CUTOFF_REFERENCE)
+    _resolve_cutoff.value = _creation_time(ref)
+    if _resolve_cutoff.value is None:
+        print(f"  WARN: cutoff reference not found: {ref} -- nothing will be corrected")
+    return _resolve_cutoff.value
+
+
+_resolve_cutoff.value = None
+
+
+def past_cutoff(path):
+    """True if this shot should be corrected (its creation time is strictly
+    after the cutoff reference's). Conservative (skip) if either is unknown."""
+    cutoff = _resolve_cutoff(path)
+    ct = _creation_time(path)
+    if cutoff is None or ct is None:
+        return False
+    return ct > cutoff
+
+
+def correction_too_large(M, flow, shape, frac=MAX_CORRECTION_FRAC):
+    """True if the composed correction (global warp M + optional residual flow)
+    moves, zooms or rotates the frame by more than `frac`. Such shots are left
+    uncorrected rather than partially fixed."""
+    h, w = shape
+    s, _rot, _tx, _ty = decompose(M)
+    if abs(s - 1.0) > frac:                       # zoom cap
+        return True
+    limit_px = frac * min(h, w)
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float32).reshape(-1, 1, 2)
+    out = cv2.perspectiveTransform(corners, to33(M).astype(np.float32)).reshape(-1, 2)
+    if np.linalg.norm(out - corners.reshape(-1, 2), axis=1).max() > limit_px:  # move/rotate cap
+        return True
+    if flow is not None:                          # residual non-rigid cap
+        _, mx, my = flow
+        xs, ys = np.meshgrid(np.arange(w, dtype=np.float32),
+                             np.arange(h, dtype=np.float32))
+        if np.hypot(mx - xs, my - ys).max() > limit_px:
+            return True
+    return False
+
 
 def truck_from_seg(seg_path, shape):
     """Tight binary mask (uint8 0/255) of the truck body (blue in the seg image),
@@ -574,6 +644,13 @@ def process(ai_path, save=True, verbose=True, diag=False, nonrigid=True):
     base = ai_path[:-len("_ai.png")]
     orig_path = base + ".png"
     seg_path = base + "_seg.png"
+
+    # Date gate: only correct shots created strictly after the cutoff reference.
+    if not past_cutoff(ai_path):
+        if verbose:
+            print(f"  SKIP (at/before cutoff): {os.path.basename(ai_path)}")
+        return None
+
     if not os.path.exists(orig_path):
         if verbose:
             print(f"  SKIP (no original): {os.path.basename(ai_path)}")
@@ -645,6 +722,16 @@ def process(ai_path, save=True, verbose=True, diag=False, nonrigid=True):
             if d_ncc > -0.012 and d_ch > -0.15 and d_ncc / 0.02 + d_ch / 0.5 > 1.0:
                 flow, best_tag = f, best_tag + "+flow"
                 best_score = new_ch if metric == "seg" else new_ncc
+
+    # Magnitude cap: if the correction would move/zoom/rotate the frame by more
+    # than MAX_CORRECTION_FRAC, don't correct this shot at all.
+    if apply_global or flow is not None:
+        if correction_too_large(best_M, flow, (oh, ow)):
+            if verbose:
+                print(f"  SKIP (>{int(MAX_CORRECTION_FRAC * 100)}% correction): "
+                      f"{os.path.basename(ai_path)}")
+            best_M, best_tag, best_score, flow = IDENTITY, "identity", id_score, None
+            apply_global = False
 
     # Compose global warp + flow into ONE remap so the AI image is resampled
     # exactly once.
