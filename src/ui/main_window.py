@@ -554,6 +554,71 @@ class MainWindow(QMainWindow):
                 "QSpinBox::up-button, QSpinBox::down-button { width: 0; }"
             )
 
+            _spin_css = (
+                "QSpinBox {"
+                "  background: rgba(255,255,255,4);"
+                f"  color: {_RCT};"
+                f"  border: 1px solid {_RCH};"
+                "  border-radius: 4px;"
+                "  padding: 1px 4px;"
+                f"  font-family: {_RFM};"
+                "  font-size: 11px;"
+                "}"
+                "QSpinBox::up-button, QSpinBox::down-button { width: 0; }"
+            )
+
+            # Распределение объёмов в случайном датасете: доля полностью
+            # гружёных кадров (95–100% потолка) и доля пустых (0). Остальные
+            # кадры — равномерно случайный объём, как и раньше.
+            self.spn_full_pct = _QSB()
+            self.spn_full_pct.setRange(0, 100)
+            self.spn_full_pct.setValue(0)
+            self.spn_full_pct.setSuffix("%")
+            self.spn_full_pct.setFixedHeight(22)
+            self.spn_full_pct.setFixedWidth(56)
+            self.spn_full_pct.setStyleSheet(_spin_css)
+            self.spn_full_pct.setToolTip(
+                "Доля кадров с полным кузовом: объём наполнения берётся "
+                "случайно из 95–100% текущего максимума (потолок = 125% от "
+                "паспортного max_volume)."
+            )
+
+            self.spn_empty_pct = _QSB()
+            self.spn_empty_pct.setRange(0, 100)
+            self.spn_empty_pct.setValue(0)
+            self.spn_empty_pct.setSuffix("%")
+            self.spn_empty_pct.setFixedHeight(22)
+            self.spn_empty_pct.setFixedWidth(56)
+            self.spn_empty_pct.setStyleSheet(_spin_css)
+            self.spn_empty_pct.setToolTip(
+                "Доля кадров с пустым кузовом (нулевой объём наполнения)."
+            )
+
+            lbl_full = _QL2("ПОЛНЫЙ")
+            lbl_empty = _QL2("ПУСТОЙ")
+            for _l in (lbl_full, lbl_empty):
+                _l.setStyleSheet(
+                    f"color: {_RCTM}; font-size: 10px;"
+                    f" letter-spacing: 0.6px; background: transparent;"
+                )
+
+            # Сумма долей не может превышать 100% — подрезаем соседа.
+            def _clamp_dist(changed, other, value):
+                try:
+                    if int(value) + int(other.value()) > 100:
+                        other.blockSignals(True)
+                        other.setValue(max(0, 100 - int(value)))
+                        other.blockSignals(False)
+                except Exception:
+                    pass
+
+            self.spn_full_pct.valueChanged.connect(
+                lambda v: _clamp_dist(self.spn_full_pct,
+                                      self.spn_empty_pct, v))
+            self.spn_empty_pct.valueChanged.connect(
+                lambda v: _clamp_dist(self.spn_empty_pct,
+                                      self.spn_full_pct, v))
+
             # Тип датасета: глубина (как раньше) или сегментация.
             self.cmb_dataset_type = _QCB2()
             self.cmb_dataset_type.addItem("Глубина", "depth")
@@ -688,6 +753,18 @@ class MainWindow(QMainWindow):
             sh_row1.addWidget(self.spn_render_count, 0, Qt.AlignmentFlag.AlignVCenter)
             sh_row1.addWidget(self.cmb_dataset_type, 1, Qt.AlignmentFlag.AlignVCenter)
 
+            # Строка распределения объёмов: доля полных / пустых кузовов.
+            sh_row_dist = _QHB2()
+            sh_row_dist.setContentsMargins(0, 0, 0, 0)
+            sh_row_dist.setSpacing(6)
+            sh_row_dist.addWidget(lbl_full, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_row_dist.addWidget(self.spn_full_pct, 0,
+                                  Qt.AlignmentFlag.AlignVCenter)
+            sh_row_dist.addWidget(lbl_empty, 0, Qt.AlignmentFlag.AlignVCenter)
+            sh_row_dist.addWidget(self.spn_empty_pct, 0,
+                                  Qt.AlignmentFlag.AlignVCenter)
+            sh_row_dist.addStretch(1)
+
             # Сетка опций 2x2: чекбоксы больше не соревнуются за ширину
             # с кнопкой сохранения и не обрезаются.
             sh_opts.addWidget(self.chk_random_bg, 0, 0)
@@ -697,6 +774,7 @@ class MainWindow(QMainWindow):
             sh_opts.setColumnStretch(1, 1)
 
             sh_lay.addLayout(sh_row1)
+            sh_lay.addLayout(sh_row_dist)
             sh_lay.addLayout(sh_opts)
             # Кнопка сохранения — отдельной строкой во всю ширину карточки.
             sh_lay.addWidget(self.btn_save_render)
@@ -2861,6 +2939,20 @@ class MainWindow(QMainWindow):
         chk_gem = getattr(self, "chk_gemini", None)
         gemini = bool(chk_gem.isChecked()) if chk_gem is not None else False
 
+        # Распределение объёмов: доли полностью гружёных и пустых кадров
+        # (в процентах). Остальное — случайный объём, как раньше.
+        def _pct_of(name):
+            w = getattr(self, name, None)
+            try:
+                return max(0.0, min(100.0, float(w.value()))) if w else 0.0
+            except Exception:
+                return 0.0
+
+        full_pct = _pct_of("spn_full_pct")
+        empty_pct = _pct_of("spn_empty_pct")
+        if full_pct + empty_pct > 100.0:
+            empty_pct = max(0.0, 100.0 - full_pct)
+
         # Ткань, свисающая с борта (отдельный класс маски).
         chk_cl = getattr(self, "chk_cloth", None)
         cloth = bool(chk_cl.isChecked()) if chk_cl is not None else False
@@ -2979,6 +3071,8 @@ class MainWindow(QMainWindow):
                     set_daytime=_set_daytime,
                     render_dataset_type=render_dataset_type,
                     ru=ru,
+                    full_pct=full_pct,
+                    empty_pct=empty_pct,
                 )
                 return
             for i in range(count):
@@ -3196,7 +3290,8 @@ class MainWindow(QMainWindow):
     def _run_random_seg_dataset(self, *, count, max_volume, model_key,
                                 texture_key, random_background, gemini,
                                 base_daytime_mins, set_daytime,
-                                render_dataset_type, ru, cloth=False) -> None:
+                                render_dataset_type, ru, cloth=False,
+                                full_pct=0.0, empty_pct=0.0) -> None:
         """Датасет сегментации со случайными кадрами.
 
         Каждый снимок — полностью новая сцена: новое случайное наполнение
@@ -3281,12 +3376,31 @@ class MainWindow(QMainWindow):
         rp = getattr(self, "right_panel", None)
         ok_count = 0
 
+        # Потолок объёма: 125% паспортного максимума (перегруз — валидный
+        # кейс для обучения). Он же считается «текущим максимумом» для доли
+        # полных кузовов.
+        VOLUME_CEILING_K = 1.25
+        try:
+            full_pct = max(0.0, min(100.0, float(full_pct)))
+            empty_pct = max(0.0, min(100.0, float(empty_pct)))
+        except (TypeError, ValueError):
+            full_pct = empty_pct = 0.0
+        if full_pct + empty_pct > 100.0:
+            empty_pct = max(0.0, 100.0 - full_pct)
+
         for i in range(count):
-            # Случайный объём наполнения: от 0% до 125% максимума грузовика
-            # (перегруз выше «паспортного» максимума — валидный кейс для
-            # обучения, поэтому верхняя граница 1.25·max_volume).
+            # Объём наполнения по заданному распределению: full_pct кадров —
+            # полный кузов (95–100% потолка), empty_pct — пустой, остальные —
+            # равномерно случайный объём от 0 до потолка.
             if max_volume is not None:
-                target = random.uniform(0.0, 1.25 * float(max_volume))
+                ceiling = VOLUME_CEILING_K * float(max_volume)
+                roll = random.uniform(0.0, 100.0)
+                if roll < full_pct:
+                    target = random.uniform(0.95, 1.0) * ceiling
+                elif roll < full_pct + empty_pct:
+                    target = 0.0
+                else:
+                    target = random.uniform(0.0, ceiling)
             else:
                 target = float(rp.current_target_volume()) if rp else 0.0
 
