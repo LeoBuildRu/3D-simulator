@@ -1059,10 +1059,14 @@ class MainWindow(QMainWindow):
         target_volume = float(payload.get("target_volume") or 0.0)
         model_key     = payload.get("model_key")
         texture_key   = payload.get("texture_key")
+        # Пустой кузов — отдельная ветка, а не «наполнение объёмом 0»:
+        # сервер объём 0 подобрать не может (см. _run_empty_body).
+        empty         = bool(payload.get("empty"))
 
         print("=" * 60)
         print(f"[Run] Pipeline start. target_volume={target_volume:.2f}  "
-              f"model_key={model_key!r}  texture_key={texture_key!r}")
+              f"model_key={model_key!r}  texture_key={texture_key!r}"
+              f"{'  EMPTY' if empty else ''}")
 
         # Resolve model + ground_plane_z BEFORE side-effects so we can
         # bail out early with a clear message.
@@ -1122,6 +1126,38 @@ class MainWindow(QMainWindow):
                     print(f"[Run] OK texture set '{texture_key}' applied")
                 except Exception as exc:
                     print(f"[Run] ERR set_texture_set: {exc}")
+
+        # 2.5) Пустой кузов: ни ландшафта, ни boolean — просто снимаем меш
+        # наполнения и уходим. Ground plane трогать нельзя (create_ground_plane
+        # создаёт ВИДИМУЮ зелёную плоскость, а прячет её только удачный
+        # perform_AABB_plane) — вместо этого прячем то, что есть.
+        if empty:
+            gen = getattr(self.panda_app, "perlin_generator", None)
+            if gen is not None and hasattr(gen, "clear_fill_mesh"):
+                try:
+                    gen.clear_fill_mesh()
+                    # Прокси-габарит наполнителя обычно прячет сам Perlin-этап;
+                    # без него на свежезагруженном наборе в кадр попал бы
+                    # сплошной блок вместо пустого кузова.
+                    gen.hide_napolnitel_proxy()
+                    print("[Run] OK пустой кузов: меш наполнения снят")
+                except Exception as exc:
+                    print(f"[Run] ERR clear_fill_mesh: {exc}")
+            else:
+                print("[Run] ERR perlin_generator не подключён — меш "
+                      "наполнения снять нечем, кадр НЕ будет пустым.")
+            try:
+                gp = getattr(self.panda_app, "ground_plane", None)
+                if gp is not None and not gp.is_empty():
+                    gp.hide()
+            except Exception as exc:
+                print(f"[Run] WARN ground_plane.hide: {exc}")
+            try:
+                self.panda_app.update_overlay_info(volume=0.0)
+            except Exception:
+                pass
+            print("=" * 60)
+            return
 
         # 3) Ground plane (GREEN constant, then position)
         if hasattr(self.panda_app, "create_ground_plane"):
@@ -3379,7 +3415,7 @@ class MainWindow(QMainWindow):
         # Потолок объёма: 125% паспортного максимума (перегруз — валидный
         # кейс для обучения). Он же считается «текущим максимумом» для доли
         # полных кузовов.
-        VOLUME_CEILING_K = 1.25
+        VOLUME_CEILING_K = 1.35
         try:
             full_pct = max(0.0, min(100.0, float(full_pct)))
             empty_pct = max(0.0, min(100.0, float(empty_pct)))
@@ -3388,31 +3424,48 @@ class MainWindow(QMainWindow):
         if full_pct + empty_pct > 100.0:
             empty_pct = max(0.0, 100.0 - full_pct)
 
+        # Минимальный объём для «случайной» доли. РОВНО 0 просить у сервера
+        # нельзя: TLS_client кладёт target_volume в payload только при значении
+        # > 0, поэтому 0 доезжает как «объём не задан», Z ландшафта берётся из
+        # fallback landscape_offset_z=1.9375 и получается обычный (каждый раз
+        # разный из-за случайного seed) НЕПУСТОЙ кузов с ярлыком vol0000.00.
+        # Пустой кузов делается отдельной веткой (empty=True), без сервера.
+        MIN_FRACTION = 0.02
+
         for i in range(count):
             # Объём наполнения по заданному распределению: full_pct кадров —
             # полный кузов (95–100% потолка), empty_pct — пустой, остальные —
             # равномерно случайный объём от 0 до потолка.
+            fill_class = "random"
             if max_volume is not None:
                 ceiling = VOLUME_CEILING_K * float(max_volume)
                 roll = random.uniform(0.0, 100.0)
                 if roll < full_pct:
+                    fill_class = "full"
                     target = random.uniform(0.95, 1.0) * ceiling
                 elif roll < full_pct + empty_pct:
+                    fill_class = "empty"
                     target = 0.0
                 else:
-                    target = random.uniform(0.0, ceiling)
+                    # Нижняя граница строго > 0: ровно 0 ушёл бы в fallback и
+                    # дал бы наполненный кузов с ярлыком «0».
+                    target = random.uniform(MIN_FRACTION * ceiling, ceiling)
             else:
                 target = float(rp.current_target_volume()) if rp else 0.0
+                fill_class = "empty" if target <= 0.0 else "random"
+            is_empty = (fill_class == "empty")
 
             self.btn_save_render.setText(f"{i+1}/{count}")
             QApplication.processEvents()
 
-            # Новое наполнение для этой итерации.
+            # Новое наполнение для этой итерации (для пустого кузова — снятие
+            # старого меша наполнения без обращения к серверу).
             try:
                 self._on_run_simulation({
                     "model_key":     model_key,
                     "texture_key":   texture_key,
                     "target_volume": float(target),
+                    "empty":         is_empty,
                 })
             except Exception as exc:
                 print(f"[SaveRender/rand] pipeline {i+1} failed: {exc}")
@@ -3480,11 +3533,19 @@ class MainWindow(QMainWindow):
                 "base_daytime_minutes": int(base_daytime_mins),
                 "applied_daytime_minutes": int(base_daytime_mins),
                 "target_volume": float(target),
+                "fill_class":  fill_class,
+                "max_volume":  (float(max_volume)
+                                if max_volume is not None else None),
                 "model_key":   model_key,
                 "texture_key": texture_key,
             }
+            if is_empty:
+                # В сцене нет final_model, поэтому save_single_render посчитать
+                # объём не может и записал бы null. Для пустого кузова это
+                # именно 0, а не «неизвестно».
+                extra_meta["actual_volume"] = 0.0
 
-            prefix = f"r{i:04d}_vol{target:07.2f}_random"
+            prefix = f"r{i:04d}_vol{target:07.2f}_{fill_class}"
             out_dir = "renders/dataset_segmentation_random"
             try:
                 ok = ru.save_single_render(

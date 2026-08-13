@@ -284,11 +284,16 @@ class PerlinMeshGenerator:
     # /generate_landscape). Дальше — только текстуры, позиционирование
     # и расчёт объёма. Никаких локальных trimesh-операций больше нет.
     # ------------------------------------------------------------------
-    def generate_perlin_mesh_from_csg(self):
-        if self.gui:
-            self.gui.log_message("⏳ Запуск Perlin mesh...")
+    def clear_fill_mesh(self):
+        """Убрать меш наполнения из сцены (кузов остаётся пустым).
 
-        # --- очистка старых объектов ---
+        Снимает узлы со сцены, вычищает их из loaded_models и обнуляет
+        panda_app.final_model / final_mesh_node. Обнулять ОБЯЗАТЕЛЬНО:
+        по этому атрибуту segmentation_renderer вешает класс "cargo",
+        cloth_simulator берёт габарит груза, а renderer_utils считает
+        actual_volume — оставленный «мёртвый» NodePath дал бы груз в
+        маске и в метаданных при пустом кадре.
+        """
         for attr in ("final_mesh_node", "final_model"):
             obj = getattr(self.panda_app, attr, None)
             if obj is not None:
@@ -297,6 +302,34 @@ class PerlinMeshGenerator:
                     self.panda_app.loaded_models.remove(obj)
                 obj.removeNode()
                 setattr(self.panda_app, attr, None)
+
+    def hide_napolnitel_proxy(self):
+        """Спрятать модель-габарит наполнителя (Target_Napolnitel).
+
+        В обычном пайплайне её прячет generate_perlin_mesh_from_csg ПОСЛЕ
+        успешной генерации (target_model.hide()). Пустому кузову эта ветка не
+        нужна, но прокси остаётся видимым сплошным блоком, если набор моделей
+        только что загружен, — поэтому прячем его отдельно. Возвращает True,
+        если прокси найден.
+        """
+        target_napolnitel = getattr(self.panda_app, "Target_Napolnitel", None)
+        if not target_napolnitel:
+            return False
+        model_paths = getattr(self.panda_app, "model_paths", {}) or {}
+        for model in (getattr(self.panda_app, "loaded_models", []) or []):
+            path = model_paths.get(id(model))
+            if path and target_napolnitel in path:
+                if not model.is_empty():
+                    model.hide()
+                return True
+        return False
+
+    def generate_perlin_mesh_from_csg(self):
+        if self.gui:
+            self.gui.log_message("⏳ Запуск Perlin mesh...")
+
+        # --- очистка старых объектов ---
+        self.clear_fill_mesh()
 
         # --- поиск target-модели в сцене (нужен только для последующего
         # hide(); сама геометрия для boolean берётся сервером с диска) ---
@@ -336,6 +369,15 @@ class PerlinMeshGenerator:
         target_volume = float(
             getattr(self.panda_app, "Target_Volume", 0.0) or 0.0
         )
+        if target_volume <= 0:
+            # Сервер принимает только target_volume > 0; при 0 объём из
+            # payload выпадает и Z ландшафта берётся из landscape_offset_z —
+            # кузов выходит наполненным «по умолчанию», хотя запрошен пустой.
+            # Молча это не проглатываем: датасет иначе получает кадры с
+            # ярлыком vol=0 и реальным наполнением.
+            print(f"[Perlin] WARNING: Target_Volume={target_volume:.3f} <= 0 — "
+                  f"сервер объём подбирать не будет, ландшафт встанет на "
+                  f"fallback Z=1.9375 (кузов НЕ будет пустым).")
         try:
             final_np = self.generate_perlin_mesh(
                 grid_size=48,
