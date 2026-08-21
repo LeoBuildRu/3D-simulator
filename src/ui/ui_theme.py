@@ -346,9 +346,12 @@ QCheckBox, QRadioButton {{
     spacing: 8px;
     color: {COLOR_TEXT};
 }}
+/* Размеры задаются с учётом рамки: Qt считает width/height по содержимому,
+   поэтому у каждого состояния свои значения, чтобы внешний габарит
+   индикатора всегда оставался 16x16 и метки не прыгали. */
 QCheckBox::indicator, QRadioButton::indicator {{
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     border: 1px solid {COLOR_HAIRLINE_HOVER};
     background-color: {COLOR_SURFACE};
 }}
@@ -358,13 +361,29 @@ QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
     border-color: {COLOR_ACCENT};
 }}
 QCheckBox::indicator:checked {{
+    width: 14px;
+    height: 14px;
     background-color: {COLOR_ACCENT};
-    border-color: {COLOR_ACCENT};
+    border: 1px solid {COLOR_ACCENT};
     image: none;
 }}
 QRadioButton::indicator:checked {{
+    width: 8px;
+    height: 8px;
     background-color: {COLOR_BG};
     border: 4px solid {COLOR_ACCENT};
+}}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+    border-color: {COLOR_HAIRLINE};
+    background-color: {COLOR_BG};
+}}
+QCheckBox::indicator:checked:disabled {{
+    background-color: {COLOR_TEXT_DIM};
+    border-color: {COLOR_TEXT_DIM};
+}}
+QRadioButton::indicator:checked:disabled {{
+    background-color: {COLOR_BG};
+    border-color: {COLOR_TEXT_DIM};
 }}
 
 /* ===== Sliders ===== */

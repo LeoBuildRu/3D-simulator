@@ -13,6 +13,10 @@ env/
 # shared between machines or the Intel auto-fallback won't trigger)
 config/graphics.json
 
+# Настройки съёмки датасета (правятся в диалоге, у каждого свои;
+# умолчания лежат в src/ui/dataset_config.py)
+config/dataset.json
+
 # Логи и отчеты об ошибках
 *.log
 

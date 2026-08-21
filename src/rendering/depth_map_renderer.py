@@ -34,6 +34,59 @@ class DepthMapRenderer:
             self.overlay_node.setShaderInput(
                 "grayscale", 1.0 if self.grayscale else 0.0)
 
+    # ------------------------------------------------------------------
+    # Пакетное чтение/применение настроек карты глубины.
+    #
+    # Датасет снимается со СВОИМИ параметрами глубины (диапазон, палитра),
+    # которые могут отличаться от того, что пользователь выкрутил для живого
+    # оверлея. Поэтому нужен снимок текущего состояния и его восстановление
+    # после съёмки — иначе прогон датасета молча переписал бы настройки UI.
+    # ------------------------------------------------------------------
+    SETTING_KEYS = ("near", "far", "grad_start", "grad_end", "grayscale")
+
+    def capture_settings(self):
+        """Текущие параметры глубины как dict (см. SETTING_KEYS)."""
+        return {
+            "near":       float(self.min_depth),
+            "far":        float(self.max_depth),
+            "grad_start": float(self.gradient_start),
+            "grad_end":   float(self.gradient_end),
+            "grayscale":  bool(self.grayscale),
+        }
+
+    def apply_settings(self, settings):
+        """Применить параметры из dict; отсутствующие/None ключи игнорируются.
+
+        near/far правим ОДНОЙ операцией set_near_far: у линзы near всегда
+        должен остаться меньше far, а поочерёдная установка даёт промежуточное
+        состояние, где это не так.
+        """
+        if not settings:
+            return
+        near = settings.get("near")
+        far = settings.get("far")
+        if near is not None or far is not None:
+            near = float(near) if near is not None else float(self.min_depth)
+            far = float(far) if far is not None else float(self.max_depth)
+            if far <= near:
+                far = near + 1e-3
+            self.min_depth = near
+            self.max_depth = far
+            if self.depth_camera_np is not None:
+                lens = self.depth_camera_np.node().get_lens()
+                if lens is not None:
+                    lens.set_near_far(near, far)
+            if self.overlay_node:
+                self.overlay_node.setShaderInput("near", near)
+                self.overlay_node.setShaderInput("far", far)
+
+        if settings.get("grad_start") is not None:
+            self.set_gradient_start(float(settings["grad_start"]))
+        if settings.get("grad_end") is not None:
+            self.set_gradient_end(float(settings["grad_end"]))
+        if settings.get("grayscale") is not None:
+            self.set_grayscale(bool(settings["grayscale"]))
+
     def setup_depth_render(self):
         win_width = 1920
         win_height = 1080

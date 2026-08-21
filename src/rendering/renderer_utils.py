@@ -657,21 +657,44 @@ class RendererUtils:
 
         return stretched_img
     
-    def _process_render_image(self, img, depthImg=None, camera_fov_x=None, camera_fov_y=None, output_dir="renders",
+    def _process_render_image(self, img=None, camera_fov_x=None, camera_fov_y=None, output_dir="renders",
                          filename_prefix="render", metadata=None, dataset_type="depth",
                          seg_mask=None, bg_path=None, gemini_processor=None,
-                         shadow_band=False, depth_extra=None):
-        # dataset_type: "depth" — depthImg это карта глубины (суффикс _depth);
-        #               "segmentation" — depthImg это маска сегментации
-        #               (суффикс _seg, масштабирование ближайшим соседом,
-        #                чтобы не размывать границы классов).
+                         shadow_band=False, depth_img=None, seg_img=None,
+                         outputs=None, lidar_scan=None, lidar_settings=None):
+        # img / depth_img / seg_img — три независимых кадра одного сэмпла.
+        # Какие из них лягут на диск, решает `outputs` (см. resolve_outputs);
+        # None вместо кадра означает «не снимали». Все три проходят ОДНИ И ТЕ
+        # ЖЕ дисторсию/кроп/растяжение, поэтому совпадают попиксельно.
+        #
         # seg_mask + bg_path: заменить фон на цветном кадре (только на нём!)
         #               случайной картинкой bg_path. seg_mask (1920x1080)
         #               проходит ту же дисторсию и используется как вырез
         #               переднего плана (кузов + груз).
-        is_segmentation = (dataset_type == "segmentation")
-        orig_width = img.getXSize()
-        orig_height = img.getYSize()
+        outputs = self.resolve_outputs(outputs, dataset_type,
+                                       depth_img is not None)
+        want_color = "color" in outputs and img is not None
+        want_depth = "depth" in outputs and depth_img is not None
+        want_seg = "segmentation" in outputs and seg_img is not None
+        want_lidar = "lidar" in outputs and lidar_scan is not None
+        want_json = "json" in outputs
+
+        # Геометрия кадра берётся с любого снятого изображения — все они
+        # выходят из одного и того же окна и имеют один размер.
+        size_ref = img if img is not None else (depth_img or seg_img)
+        if size_ref is None and not want_lidar:
+            print("[Render] нечего сохранять: ни одного кадра не снято.")
+            return None
+        # Облако точек может быть ЕДИНСТВЕННЫМ выходом кадра: оно не растр и
+        # размеров не имеет. Геометрию кадра тогда берём с окна — она нужна
+        # только для интринсик в json.
+        if size_ref is not None:
+            orig_width = size_ref.getXSize()
+            orig_height = size_ref.getYSize()
+        else:
+            win = getattr(self.panda_app, "win", None)
+            orig_width = int(win.get_x_size()) if win is not None else 1920
+            orig_height = int(win.get_y_size()) if win is not None else 1080
         
         fx = fy = cx = cy = None
         lens = self.panda_app.cam.node().getLens() if hasattr(self.panda_app, 'cam') else None
@@ -749,13 +772,17 @@ class RendererUtils:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{filename_prefix}_{timestamp}.png"
         output_path = os.path.join(output_dir, filename)
-        second_suffix = "_seg" if is_segmentation else "_depth"
-        filenameDepth = f"{filename_prefix}_{timestamp}{second_suffix}.png"
-        output_path_depth = os.path.join(output_dir, filenameDepth)
-        # Доп. карта глубины (режим сегментации + also_depth) — отдельный файл
-        # с суффиксом _depth рядом с маской _seg.
-        filenameDepthExtra = f"{filename_prefix}_{timestamp}_depth.png"
-        output_path_depth_extra = os.path.join(output_dir, filenameDepthExtra)
+        # Суффиксы фиксированы и не зависят от режима: _depth — всегда карта
+        # глубины, _seg — всегда маска. Раньше «второй файл» назывался то
+        # так, то эдак в зависимости от типа датасета.
+        output_path_depth = os.path.join(
+            output_dir, f"{filename_prefix}_{timestamp}_depth.png")
+        output_path_seg = os.path.join(
+            output_dir, f"{filename_prefix}_{timestamp}_seg.png")
+        output_path_json = os.path.join(
+            output_dir, f"{filename_prefix}_{timestamp}.json")
+        output_path_lidar = os.path.join(
+            output_dir, f"{filename_prefix}_{timestamp}_lidar.ply")
 
         # Параметры преобразований
         k1 = 0.04
@@ -771,9 +798,11 @@ class RendererUtils:
         crop_bottom = final_height - crop_top
         
         # Создаем копии изображения для каждого этапа преобразования
-        img_distorted = self.barrel_distortion(img, k1=k1, k2=k2)
-        img_cropped = self.crop_image(img_distorted, left=crop_left, top=crop_top, right=crop_right, bottom=crop_bottom)
-        img_final = self.stretch_to_1920x1080(img_cropped)
+        img_final = None
+        if img is not None:
+            img_distorted = self.barrel_distortion(img, k1=k1, k2=k2)
+            img_cropped = self.crop_image(img_distorted, left=crop_left, top=crop_top, right=crop_right, bottom=crop_bottom)
+            img_final = self.stretch_to_1920x1080(img_cropped)
 
         # Маску сегментации (если передана) прогоняем через те же
         # дисторсию/кроп/растяжение — она нужна для: (а) замены фона случайной
@@ -794,6 +823,12 @@ class RendererUtils:
         gemini_meta = None
         openai_active = (gemini_processor is not None
                          and hasattr(gemini_processor, "edit_whole"))
+        if img_final is None:
+            # Цветного кадра нет (снимаем только разметку) — подменять в нём
+            # нечего.
+            openai_active = False
+            gemini_processor = None
+            bg_path = None
         if openai_active:
             # OpenAI: редактируем ВЕСЬ кадр одним запросом (без маски и без
             # матирования — силуэт может слегка сместиться, GT не строгий).
@@ -820,7 +855,8 @@ class RendererUtils:
 
         # Теневая полоса «рассекает пополам» кузов+груз (только цветной кадр,
         # GT не трогается). Для OpenAI тень уже в промпте — локальную не даём.
-        if shadow_band and mask_final is not None and not openai_active:
+        if (shadow_band and img_final is not None and mask_final is not None
+                and not openai_active):
             shadowed = self._apply_shadow_band(img_final, mask_final)
             if shadowed is not None:
                 img_final = shadowed
@@ -829,30 +865,23 @@ class RendererUtils:
         # ИЛИ маска сегментации), чтобы он попиксельно совпадал с цветным.
         # Для сегментации финальный stretch — ближайшим соседом, иначе
         # билинейная интерполяция размыла бы границы классов.
-        depth_final = None
-        if depthImg is not None:
-            depth_distorted = self.barrel_distortion(depthImg, k1=k1, k2=k2)
-            depth_cropped = self.crop_image(
-                depth_distorted, left=crop_left, top=crop_top,
+        def _warp_like_color(source, nearest):
+            """Те же дисторсия/кроп/растяжение, что и у цветного кадра."""
+            distorted = self.barrel_distortion(source, k1=k1, k2=k2)
+            cropped = self.crop_image(
+                distorted, left=crop_left, top=crop_top,
                 right=crop_right, bottom=crop_bottom,
             )
-            depth_final = self.stretch_to_1920x1080(
-                depth_cropped, nearest=is_segmentation)
-            depth_final = self.fix_alpha_to_opaque(depth_final)
+            warped = self.stretch_to_1920x1080(cropped, nearest=nearest)
+            return self.fix_alpha_to_opaque(warped)
 
-        # Доп. карта глубины проходит ту же дисторсию/кроп/растяжение, что и
-        # цветной кадр и маска — билинейно (глубина — непрерывная величина).
-        depth_extra_final = None
-        if depth_extra is not None:
-            depth_extra_distorted = self.barrel_distortion(
-                depth_extra, k1=k1, k2=k2)
-            depth_extra_cropped = self.crop_image(
-                depth_extra_distorted, left=crop_left, top=crop_top,
-                right=crop_right, bottom=crop_bottom,
-            )
-            depth_extra_final = self.stretch_to_1920x1080(
-                depth_extra_cropped, nearest=False)
-            depth_extra_final = self.fix_alpha_to_opaque(depth_extra_final)
+        # Глубина — величина непрерывная, поэтому билинейно. Маска — набор
+        # классов, поэтому ближайшим соседом: интерполяция породила бы на
+        # границах цвета несуществующих классов.
+        depth_final = (_warp_like_color(depth_img, nearest=False)
+                       if want_depth else None)
+        seg_final = (_warp_like_color(seg_img, nearest=True)
+                     if want_seg else None)
 
         # Преобразуем 2D точки с учетом всех примененных трансформаций
         transformed_points_2d = []
@@ -969,31 +998,69 @@ class RendererUtils:
             except Exception as e:
                 print(f"Warning: Error while drawing circles: {e}")
         
-        # Сохраняем финальное изображение
-        img_final.write(Filename.from_os_specific(output_path))
+        # Сохраняем ровно те файлы, которые запрошены.
+        saved_color = saved_depth = saved_seg = None
+        if want_color and img_final is not None:
+            img_final.write(Filename.from_os_specific(output_path))
+            saved_color = output_path
         if depth_final is not None:
             depth_final.write(Filename.from_os_specific(output_path_depth))
-        if depth_extra_final is not None:
-            depth_extra_final.write(
-                Filename.from_os_specific(output_path_depth_extra))
+            saved_depth = output_path_depth
+        if seg_final is not None:
+            seg_final.write(Filename.from_os_specific(output_path_seg))
+            saved_seg = output_path_seg
+
+        saved_lidar = None
+        if want_lidar:
+            cfg_lidar = lidar_settings or {}
+            try:
+                lidar_scan.write_ply(
+                    output_path_lidar,
+                    binary=bool(cfg_lidar.get("binary", True)),
+                    with_color=bool(cfg_lidar.get("color", True)),
+                )
+                saved_lidar = output_path_lidar
+            except Exception as exc:
+                print(f"[Lidar] .ply не записан: {exc}")
         
         # Формируем render_metadata только с необходимыми данными
         render_metadata = {}
 
-        # Тип датасета (depth / segmentation) + легенда цветов для масок.
-        render_metadata["dataset_type"] = dataset_type
+        # dataset_type остался ради уже собранных датасетов и их
+        # разборщиков. Он больше не приходит извне как режим — выводим его
+        # из того, что реально легло на диск.
+        render_metadata["dataset_type"] = (
+            "segmentation" if saved_seg
+            else "depth" if saved_depth
+            else "color" if saved_color
+            else "lidar" if saved_lidar
+            else "color"
+        )
         render_metadata["random_background"] = background_name
         render_metadata["shadow_band"] = bool(shadow_band)
         if gemini_meta:
             render_metadata["gemini"] = gemini_meta
-        render_metadata["second_image"] = (
-            os.path.basename(output_path_depth) if depth_final is not None else None
-        )
+        # Имена файлов кадра. second_image оставлен для обратной
+        # совместимости с уже собранными датасетами и разборщиками: там он
+        # означал «второй кадр» — маску, если она есть, иначе глубину.
+        render_metadata["outputs"] = sorted(outputs)
+        render_metadata["color_image"] = (
+            os.path.basename(saved_color) if saved_color else None)
         render_metadata["depth_image"] = (
-            os.path.basename(output_path_depth_extra)
-            if depth_extra_final is not None else None
+            os.path.basename(saved_depth) if saved_depth else None)
+        render_metadata["segmentation_image"] = (
+            os.path.basename(saved_seg) if saved_seg else None)
+        render_metadata["lidar_cloud"] = (
+            os.path.basename(saved_lidar) if saved_lidar else None)
+        if saved_lidar:
+            # Полный паспорт съёмки облака: поза сенсора, развёртка, шум и
+            # раскладка точек по классам. Без него .ply — просто координаты.
+            render_metadata["lidar"] = lidar_scan.meta
+        render_metadata["second_image"] = (
+            render_metadata["segmentation_image"]
+            or render_metadata["depth_image"]
         )
-        if is_segmentation:
+        if saved_seg:
             try:
                 from src.rendering.segmentation_renderer import (
                     SEG_COLORS, SEG_BACKGROUND,
@@ -1073,11 +1140,14 @@ class RendererUtils:
                 else:
                     render_metadata[f"extra_{k}"] = v
 
-        json_path = output_path.replace(".png", ".json")
-        with open(json_path, 'w') as f:
-            json.dump(render_metadata, f, indent=2)
+        if want_json:
+            with open(output_path_json, 'w', encoding='utf-8') as f:
+                json.dump(render_metadata, f, indent=2, ensure_ascii=False)
 
-        return output_path
+        # Возвращаем «главный» файл кадра — цветной, а если его не снимали,
+        # то любой сохранённый: вызывающий логирует именно его.
+        return saved_color or saved_seg or saved_depth or saved_lidar or (
+            output_path_json if want_json else None)
     
     def create_video_from_frames(self, output_dir="renders/datasets_metric_/", video_name="camera_rotation.mp4", fps=20):
         search_pattern = os.path.join(output_dir, "render_*_frame_*.png")
@@ -1465,6 +1535,53 @@ class RendererUtils:
             return None
         return proc if proc.available() else None
 
+    def _get_lidar_scanner(self):
+        """Сканер лидара; None, если трассировать нечем.
+
+        Создаётся лениво и живёт на panda_app: BVH и разбор геометрии сцены
+        кэшируются между кадрами, поэтому пересоздавать сканер на каждый
+        сэмпл — значит выбрасывать этот кэш.
+        """
+        scanner = getattr(self.panda_app, "lidar_scanner", None)
+        if scanner is False:
+            return None
+        if scanner is None:
+            try:
+                from src.rendering.lidar_scanner import LidarScanner
+                scanner = LidarScanner(self.panda_app)
+                if not scanner.available():
+                    raise RuntimeError("нет ни Warp, ни Embree")
+            except Exception as exc:
+                print(f"[Lidar] сканер недоступен: {exc}")
+                self.panda_app.lidar_scanner = False
+                return None
+            self.panda_app.lidar_scanner = scanner
+        return scanner
+
+    # Что именно кадр оставляет на диске. Раньше это было зашито в
+    # dataset_type ("depth" -> цвет+глубина, "segmentation" -> цвет+маска),
+    # и снять, скажем, одну маску без цветного кадра было нельзя. Теперь
+    # набор файлов приходит отдельным параметром, а dataset_type остался
+    # только как способ задать его по-старому (им пользуется cli.py).
+    OUTPUT_KEYS = ("color", "depth", "segmentation", "lidar", "json")
+
+    @staticmethod
+    def resolve_outputs(outputs=None, dataset_type="depth", also_depth=False):
+        """Нормализовать набор выходов; None => старое поведение по типу."""
+        if outputs is None:
+            resolved = {"color", "json"}
+            if dataset_type == "segmentation":
+                resolved.add("segmentation")
+                if also_depth:
+                    resolved.add("depth")
+            else:
+                resolved.add("depth")
+            return resolved
+        if isinstance(outputs, dict):
+            outputs = [k for k, v in outputs.items() if v]
+        return {str(k) for k in outputs
+                if str(k) in RendererUtils.OUTPUT_KEYS}
+
     def save_single_render(self, output_dir="renders/single",
                            filename_prefix="single_render",
                            extra_metadata=None,
@@ -1476,7 +1593,10 @@ class RendererUtils:
                            cloth=False,
                            cloth_probability=0.8,
                            cloth_seed=None,
-                           cloth_placement=None):
+                           cloth_placement=None,
+                           outputs=None,
+                           depth_settings=None,
+                           lidar_settings=None):
         """Обёртка: ткань живёт ровно один кадр.
 
         Полотно симулируется под ТЕКУЩУЮ сцену (кузов уже загружен, груз уже
@@ -1515,6 +1635,9 @@ class RendererUtils:
                 gemini=gemini,
                 shadow_band=shadow_band,
                 also_depth=also_depth,
+                outputs=outputs,
+                depth_settings=depth_settings,
+                lidar_settings=lidar_settings,
             )
         finally:
             sim = getattr(self.panda_app, "cloth_simulator", None)
@@ -1528,23 +1651,72 @@ class RendererUtils:
                             random_background=False,
                             gemini=False,
                             shadow_band=False,
-                            also_depth=False):
-        # dataset_type: "depth" (снимок + карта глубины, как раньше) или
-        # "segmentation" (снимок + маска сегментации). Цветной кадр снимается
-        # одинаково; меняется только второй кадр.
+                            also_depth=False,
+                            outputs=None,
+                            depth_settings=None,
+                            lidar_settings=None):
+        # dataset_type / also_depth — СТАРЫЙ способ задать набор файлов; им
+        # ещё пользуется cli.py. Новый код передаёт `outputs` напрямую, см.
+        # resolve_outputs.
         #
-        # also_depth: в режиме сегментации ДОПОЛНИТЕЛЬНО снять и сохранить
-        # карту глубины (файл с суффиксом _depth) рядом с маской _seg. Она
-        # проходит ту же barrel distortion / crop / stretch, что и остальные
-        # файлы этого кадра, поэтому попиксельно совпадает с ними.
+        # depth_settings: параметры карты глубины именно этого прогона
+        # (диапазон, ч/б или радуга). Применяются на время съёмки и
+        # возвращаются обратно.
         #
         # random_background: на ОБЫЧНОМ цветном рендере (после дисторсии) фон
         # сцены/неба заменяется случайной картинкой из assets/backgrounds;
         # передний план (кузов + груз) остаётся. Карта глубины и маска
         # сегментации при этом НЕ меняются — маска используется только чтобы
         # вырезать передний план.
-        is_segmentation = (dataset_type == "segmentation")
+        outputs = self.resolve_outputs(outputs, dataset_type, also_depth)
+        want_color = "color" in outputs
+        want_depth = "depth" in outputs
+        want_seg = "segmentation" in outputs
+        want_lidar = "lidar" in outputs
 
+        # Параметры глубины на время съёмки — свои (диапазон, ч/б или радуга).
+        # Снимок прежних значений возвращаем в finally: прогон датасета не
+        # должен молча переписать то, что пользователь выкрутил для оверлея.
+        depth_prev = None
+        dr_settings = self.panda_app.depth_renderer
+        if want_depth and depth_settings and hasattr(dr_settings,
+                                                     "apply_settings"):
+            try:
+                depth_prev = dr_settings.capture_settings()
+                dr_settings.apply_settings(depth_settings)
+            except Exception as exc:
+                print(f"[Render] параметры глубины не применены: {exc}")
+                depth_prev = None
+        try:
+            return self._capture_and_write(
+                output_dir=output_dir,
+                filename_prefix=filename_prefix,
+                extra_metadata=extra_metadata,
+                dataset_type=dataset_type,
+                random_background=random_background,
+                gemini=gemini,
+                shadow_band=shadow_band,
+                outputs=outputs,
+                want_color=want_color,
+                want_depth=want_depth,
+                want_seg=want_seg,
+                want_lidar=want_lidar,
+                depth_settings=depth_settings,
+                lidar_settings=lidar_settings,
+            )
+        finally:
+            if depth_prev is not None:
+                try:
+                    dr_settings.apply_settings(depth_prev)
+                except Exception as exc:
+                    print(f"[Render] параметры глубины не возвращены: {exc}")
+
+    def _capture_and_write(self, *, output_dir, filename_prefix,
+                           extra_metadata, dataset_type, random_background,
+                           gemini, shadow_band, outputs, want_color,
+                           want_depth, want_seg, want_lidar=False,
+                           depth_settings=None, lidar_settings=None):
+        """Снять кадры (цвет / глубина / маска) и отдать их на запись."""
         lens = self.panda_app.cam.node().getLens()
         if isinstance(lens, PerspectiveLens):
             fov = lens.getFov()
@@ -1590,11 +1762,16 @@ class RendererUtils:
         # дочернего HWND возвращало пиксели рабочего стола (посторонние окна)
         # либо кадр предыдущего сэмпла, который затем вырезался по АКТУАЛЬНОЙ
         # маске. False => сэмпл пропускается целиком.
-        img = PNMImage()
+        img = None
         self.settle_render(frames=30)
-        if not self.capture_scene_color(img):
-            self.panda_app.depth_renderer.set_overlay_visibility(False)
-            return False
+        if want_color:
+            # Кадр читается ТОЛЬКО когда цветной файл нужен: без него вся
+            # цветная ветка (дисторсия, замена фона, теневая полоса) — это
+            # работа впустую.
+            img = PNMImage()
+            if not self.capture_scene_color(img):
+                self.panda_app.depth_renderer.set_overlay_visibility(False)
+                return False
 
         # Gemini доступен? (нужно знать заранее — от этого зависит, снимать ли
         # маску сегментации). Недоступность => тихий откат.
@@ -1613,70 +1790,76 @@ class RendererUtils:
         need_mask = random_background or gemini_needs_mask or (
             shadow_band and not openai_active)
         seg_mask_raw = None
-        if need_mask:
+        if need_mask or want_seg:
             seg_mask_raw = self.panda_app.segmentation_renderer.capture()
             if seg_mask_raw is None:
                 print("[Render] seg mask capture failed; "
-                      "сохраняю без замены фона/Gemini/тени.")
+                      "сохраняю без замены фона/тени.")
 
-        depth_extra = None
-        if is_segmentation:
-            # Маска сегментации рендерится в отдельный offscreen-буфер
-            # (плоские цвета, без постобработки). Overlay глубины не нужен.
-            if seg_mask_raw is not None:
-                depthImg = PNMImage(seg_mask_raw)   # переиспользуем захват
-            else:
-                depthImg = self.panda_app.segmentation_renderer.capture()
-            if depthImg is None:
+        # Маска сегментации как ВЫХОДНОЙ файл. Рендерится в отдельный
+        # offscreen-буфер (плоские цвета, без постобработки), поэтому тот же
+        # захват годится и для выреза переднего плана.
+        seg_img = None
+        if want_seg:
+            if seg_mask_raw is None:
                 print("[Render] segmentation capture failed.")
                 return False
+            seg_img = PNMImage(seg_mask_raw)
 
-            # Дополнительная карта глубины рядом с маской сегментации.
-            # capture_depth_color рисует узел-оверлей глубины в СВОЙ
-            # offscreen-буфер, поэтому окно не читается и его состояние
-            # (свёрнуто/перекрыто/встроено в Qt) ни на что не влияет. Сам
-            # оверлей при этом остаётся скрытым в окне — переключать его
-            # видимость больше не нужно.
-            if also_depth:
-                dr = self.panda_app.depth_renderer
-                # Ч/Б карта глубины — только для датасетов.
-                if hasattr(dr, "set_grayscale"):
-                    dr.set_grayscale(True)
-                depth_extra = PNMImage()
-                if not self.capture_depth_color(depth_extra):
-                    print("[Render] extra depth capture failed; "
-                          "сохраняю только маску.")
-                    depth_extra = None
-                # Вернуть цветной градиент для живого overlay в UI.
-                if hasattr(dr, "set_grayscale"):
-                    dr.set_grayscale(False)
-        else:
+        # Карта глубины. capture_depth_color рисует узел-оверлей глубины в
+        # СВОЙ offscreen-буфер, поэтому окно не читается и его состояние
+        # (свёрнуто/перекрыто/встроено в Qt) ни на что не влияет.
+        depth_img = None
+        if want_depth:
             dr = self.panda_app.depth_renderer
-            # Ч/Б карта глубины — только для датасетов (у одиночного рендера
-            # оставляем цветной градиент). Датасет распознаём по метаданным.
-            is_dataset = bool(extra_metadata
-                              and extra_metadata.get("render_type") == "dataset")
-            if is_dataset and hasattr(dr, "set_grayscale"):
-                dr.set_grayscale(True)
+            # Палитра карты: явные настройки датасета уже применены выше;
+            # иначе — старое поведение (ч/б только для датасета).
+            forced_gray = None
+            if depth_settings is None:
+                is_dataset = bool(
+                    extra_metadata
+                    and extra_metadata.get("render_type") == "dataset")
+                if is_dataset and hasattr(dr, "set_grayscale"):
+                    forced_gray = bool(getattr(dr, "grayscale", False))
+                    dr.set_grayscale(True)
 
-            depthImg = PNMImage()
-            ok_depth = self.capture_depth_color(depthImg)
+            depth_img = PNMImage()
+            ok_depth = self.capture_depth_color(depth_img)
 
-            if is_dataset and hasattr(dr, "set_grayscale"):
-                dr.set_grayscale(False)
+            if forced_gray is not None:
+                dr.set_grayscale(forced_gray)
             if not ok_depth:
                 print("[Render] depth capture failed.")
+                if want_color or want_seg:
+                    depth_img = None
+                else:
+                    return False
+
+        # Облако точек лидара. Оно НЕ растровое и через дисторсию/кроп не
+        # проходит, поэтому снимается отдельно от кадров — но с той же позы
+        # камеры и по той же сцене (ткань уже висит, груз уже сгенерирован),
+        # так что кадр и облако описывают ровно одно состояние.
+        lidar_scan = None
+        if want_lidar:
+            scanner = self._get_lidar_scanner()
+            if scanner is not None:
+                try:
+                    lidar_scan = scanner.scan(lidar_settings)
+                except Exception as exc:
+                    print(f"[Lidar] съёмка не удалась: {exc}")
+            if lidar_scan is None and not (want_color or want_depth
+                                           or want_seg):
+                # Кроме облака ничего не просили — сохранять нечего.
                 return False
 
-        img = self.stretch_to_1920x1080(img)
-        depthImg = self.stretch_to_1920x1080(depthImg, nearest=is_segmentation)
-        depthImg = self.fix_alpha_to_opaque(depthImg)
-
-        # Доп. карта глубины (режим сегментации + also_depth): та же
-        # нормализация, что и у depth-режима (билинейно, alpha->opaque).
-        if depth_extra is not None:
-            depth_extra = self.stretch_to_1920x1080(depth_extra, nearest=False)
-            depth_extra = self.fix_alpha_to_opaque(depth_extra)
+        if img is not None:
+            img = self.stretch_to_1920x1080(img)
+        if seg_img is not None:
+            seg_img = self.stretch_to_1920x1080(seg_img, nearest=True)
+            seg_img = self.fix_alpha_to_opaque(seg_img)
+        if depth_img is not None:
+            depth_img = self.stretch_to_1920x1080(depth_img, nearest=False)
+            depth_img = self.fix_alpha_to_opaque(depth_img)
 
         # Маску под вырезание приводим к 1920x1080 тем же ближайшим соседом
         # (как img/depth), чтобы геометрия совпала.
@@ -1730,7 +1913,6 @@ class RendererUtils:
 
         output_path = self._process_render_image(
             img,
-            depthImg,
             camera_fov_x=camera_fov_x,
             camera_fov_y=camera_fov_y,
             output_dir=output_dir,
@@ -1741,7 +1923,11 @@ class RendererUtils:
             bg_path=bg_path,
             gemini_processor=gemini_processor,
             shadow_band=shadow_band,
-            depth_extra=depth_extra,
+            depth_img=depth_img,
+            seg_img=seg_img,
+            outputs=outputs,
+            lidar_scan=lidar_scan,
+            lidar_settings=lidar_settings,
         )
 
         return True

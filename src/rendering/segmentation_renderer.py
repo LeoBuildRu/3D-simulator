@@ -55,6 +55,20 @@ SEG_COLORS = {
     "cloth":  (255, 128, 0),
 }
 
+# Заводские цвета — по ним диалог настроек умеет откатывать палитру, даже
+# когда SEG_COLORS уже переопределён пользовательским конфигом.
+DEFAULT_SEG_BACKGROUND = SEG_BACKGROUND
+DEFAULT_SEG_COLORS = dict(SEG_COLORS)
+
+# Человекочитаемые подписи классов для UI (диалог настроек датасета).
+SEG_LABELS = {
+    "cargo":  ("Груз", "Сгенерированное наполнение кузова"),
+    "cuzov":  ("Кузов", "Борта и дно самосвала"),
+    "other":  ("Окружение", "Насыпь и прочая геометрия сцены"),
+    "ground": ("Земля", "Вспомогательная плоскость (обычно скрыта)"),
+    "cloth":  ("Ткань", "Тент/полог, свисающий с борта"),
+}
+
 # Доп. палитра для будущей раскраски РАЗНЫХ бортов кузова разными цветами.
 # Пока не используется (по ТЗ — опционально), оставлено как справочник.
 CUZOV_SIDE_COLORS = [
@@ -100,6 +114,7 @@ class SegmentationRenderer:
         self.seg_cam = None        # Camera node
         self.seg_cam_np = None     # NodePath
         self.seg_lens = None
+        self.display_region = None
         self._size = (0, 0)
 
         # Плоский шейдер.
@@ -120,6 +135,63 @@ class SegmentationRenderer:
         attrib = ShaderAttrib.make(self.flat_shader)
         attrib = attrib.set_shader_input(ShaderInput("segColor", _to_unit(rgb)))
         return RenderState.make(attrib, override)
+
+    # ------------------------------------------------------------------
+    # Палитра классов: чтение и правка на лету.
+    #
+    # Цвета живут в модуле (SEG_COLORS / SEG_BACKGROUND), потому что их
+    # читает и renderer_utils — он разбирает готовую маску по цветам, чтобы
+    # вырезать передний план. Поэтому правим словарь НА МЕСТЕ, а не
+    # подменяем его: иначе у renderer_utils остался бы старый объект и
+    # вырез переднего плана поехал бы после первой же смены цвета.
+    # ------------------------------------------------------------------
+    def get_palette(self):
+        """Текущая палитра: {"background": (r,g,b), "<класс>": (r,g,b), ...}."""
+        palette = {"background": tuple(SEG_BACKGROUND)}
+        palette.update({k: tuple(v) for k, v in SEG_COLORS.items()})
+        return palette
+
+    def set_class_color(self, class_name, rgb):
+        """Сменить цвет одного класса (0..255). Пересобирает tag-state."""
+        rgb = tuple(int(max(0, min(255, c))) for c in rgb)
+        if class_name == "background":
+            return self.set_background_color(rgb)
+        if class_name not in SEG_COLORS:
+            return False
+        SEG_COLORS[class_name] = rgb
+        state = self._make_flat_state(rgb, 20000)
+        self._tag_states[class_name] = state
+        if self.seg_cam is not None:
+            self.seg_cam.set_tag_state(class_name, state)
+        return True
+
+    def set_background_color(self, rgb):
+        """Цвет фона маски: initial-state камеры + clear-цвет буфера."""
+        global SEG_BACKGROUND
+        rgb = tuple(int(max(0, min(255, c))) for c in rgb)
+        SEG_BACKGROUND = rgb
+        self._bg_state = self._make_flat_state(rgb, 10000)
+        if self.seg_cam is not None:
+            self.seg_cam.set_initial_state(self._bg_state)
+        color = LColor(rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0)
+        for target in (self.buffer, self.display_region):
+            if target is not None:
+                try:
+                    target.set_clear_color_active(True)
+                    target.set_clear_color(color)
+                except Exception:
+                    pass
+        return True
+
+    def apply_palette(self, palette):
+        """Применить палитру целиком; неизвестные ключи игнорируются."""
+        for name, rgb in (palette or {}).items():
+            if rgb is None:
+                continue
+            try:
+                self.set_class_color(name, rgb)
+            except Exception as exc:
+                print(f"[Segmentation] цвет класса {name!r} не применён: {exc}")
 
     # ------------------------------------------------------------------
     # Ленивое создание GL-буфера (на момент первого вызова окно гарантированно
@@ -195,6 +267,7 @@ class SegmentationRenderer:
         dr.set_camera(self.seg_cam_np)
         dr.set_clear_color_active(True)
         dr.set_clear_color(bg)
+        self.display_region = dr
 
         # По умолчанию буфер не активен — включаем только на момент захвата.
         self.buffer.set_active(False)
@@ -211,6 +284,7 @@ class SegmentationRenderer:
             self.buffer = None
         self.seg_tex = None
         self.seg_lens = None
+        self.display_region = None
         self._size = (0, 0)
 
     # ------------------------------------------------------------------

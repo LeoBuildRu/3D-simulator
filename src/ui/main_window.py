@@ -20,6 +20,8 @@ from src.ui.overlay_widgets import (
     SceneOverlay, DepthMapOverlay, CameraReferenceOverlay,
 )
 from src.ui.right_panel import RightPanel
+from src.ui import dataset_config
+from src.ui.depth_preview import depth_to_qimage
 import os
 import json
 import math
@@ -64,6 +66,10 @@ class MainWindow(QMainWindow):
 
         self.panda_app = None
         self._panda_hwnd: int | None = None
+
+        # Настройки съёмки датасета живут в config/dataset.json и правятся
+        # в отдельном диалоге (кнопка «Настроить…» в карточке камеры).
+        self._dataset_cfg = dataset_config.load()
 
         self.setWindowTitle("IQoko · 3D Симулятор")
         self.resize(1920, 1080)
@@ -490,18 +496,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             print(f"[MainWindow] camera preset buttons init failed: {exc}")
 
-        # ---- Save-render row (count + button) ----------------------
+        # ---- Dataset row (настроить + снять) -----------------------
+        # Раньше здесь жил весь пульт съёмки: спинбоксы, выпадающий список
+        # типов и чекбоксы, ужатые в 240 пикселей ширины. Настройки уехали в
+        # отдельный диалог (src/ui/dataset_dialog.py), здесь осталась пара
+        # кнопок и строка-итог.
         try:
             from PyQt6.QtWidgets import (
-                QSpinBox as _QSB,
                 QPushButton as _QPB2,
                 QHBoxLayout as _QHB2,
                 QVBoxLayout as _QVB2,
                 QLabel as _QL2,
                 QFrame as _QFr2,
-                QComboBox as _QCB2,
-                QCheckBox as _QCk2,
-                QGridLayout as _QGr2,
             )
             from src.ui.ui_theme import (
                 COLOR_TEXT as _RCT,
@@ -514,215 +520,54 @@ class MainWindow(QMainWindow):
             save_holder.setStyleSheet(
                 "QFrame { background: transparent; border: none; }"
             )
-            # Три блока: 1) подпись + кол-во + тип датасета; 2) сетка
-            # опций 2x2 (случ. фон / ИИ-обработка / ткань); 3) кнопка
-            # сохранения во всю ширину. Так ничего не сжимается и не
-            # вылезает за края карточки.
             sh_lay = _QVB2(save_holder)
             sh_lay.setContentsMargins(0, 6, 0, 0)
             sh_lay.setSpacing(6)
 
-            sh_row1 = _QHB2()
-            sh_row1.setContentsMargins(0, 0, 0, 0)
-            sh_row1.setSpacing(6)
-            sh_opts = _QGr2()
-            sh_opts.setContentsMargins(0, 0, 0, 0)
-            sh_opts.setHorizontalSpacing(10)
-            sh_opts.setVerticalSpacing(4)
-
-            sr_label = _QL2("СНИМОК")
+            sr_label = _QL2("ДАТАСЕТ")
             sr_label.setStyleSheet(
                 f"color: {_RCTM}; font-size: 10px;"
                 f" letter-spacing: 0.6px; background: transparent;"
             )
 
-            self.spn_render_count = _QSB()
-            self.spn_render_count.setRange(1, 5000)
-            self.spn_render_count.setValue(1)
-            self.spn_render_count.setFixedHeight(22)
-            self.spn_render_count.setFixedWidth(56)
-            self.spn_render_count.setStyleSheet(
-                "QSpinBox {"
-                "  background: rgba(255,255,255,4);"
+            self.lbl_dataset_summary = _QL2("")
+            self.lbl_dataset_summary.setWordWrap(True)
+            self.lbl_dataset_summary.setStyleSheet(
+                f"color: {_RCTM}; font-size: 10px;"
+                f" font-family: {_RFM}; background: transparent;"
+            )
+
+            _quiet_btn_css = (
+                "QPushButton {"
+                "  background: rgba(255,255,255,6);"
                 f"  color: {_RCT};"
                 f"  border: 1px solid {_RCH};"
-                "  border-radius: 4px;"
-                "  padding: 1px 4px;"
-                f"  font-family: {_RFM};"
-                "  font-size: 11px;"
+                "  border-radius: 5px;"
+                "  padding: 2px 10px;"
+                "  font-size: 10px;"
+                "  letter-spacing: 0.4px;"
                 "}"
-                "QSpinBox::up-button, QSpinBox::down-button { width: 0; }"
+                "QPushButton:hover { background: rgba(255,255,255,16); }"
+                "QPushButton:disabled {"
+                f"  color: {_RCTM}; border: 1px solid {_RCH}; }}"
             )
 
-            _spin_css = (
-                "QSpinBox {"
-                "  background: rgba(255,255,255,4);"
-                f"  color: {_RCT};"
-                f"  border: 1px solid {_RCH};"
-                "  border-radius: 4px;"
-                "  padding: 1px 4px;"
-                f"  font-family: {_RFM};"
-                "  font-size: 11px;"
-                "}"
-                "QSpinBox::up-button, QSpinBox::down-button { width: 0; }"
+            self.btn_dataset_setup = _QPB2("Настроить…")
+            self.btn_dataset_setup.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_dataset_setup.setFixedHeight(22)
+            self.btn_dataset_setup.setToolTip(
+                "Открыть настройки съёмки: что сохранять, куда, как "
+                "варьировать наполнение, камеру и свет"
             )
+            self.btn_dataset_setup.setStyleSheet(_quiet_btn_css)
+            self.btn_dataset_setup.clicked.connect(
+                self._on_dataset_settings_clicked)
 
-            # Распределение объёмов в случайном датасете: доля полностью
-            # гружёных кадров (95–100% потолка) и доля пустых (0). Остальные
-            # кадры — равномерно случайный объём, как и раньше.
-            self.spn_full_pct = _QSB()
-            self.spn_full_pct.setRange(0, 100)
-            self.spn_full_pct.setValue(0)
-            self.spn_full_pct.setSuffix("%")
-            self.spn_full_pct.setFixedHeight(22)
-            self.spn_full_pct.setFixedWidth(56)
-            self.spn_full_pct.setStyleSheet(_spin_css)
-            self.spn_full_pct.setToolTip(
-                "Доля кадров с полным кузовом: объём наполнения берётся "
-                "случайно из 95–100% текущего максимума (потолок = 125% от "
-                "паспортного max_volume)."
-            )
-
-            self.spn_empty_pct = _QSB()
-            self.spn_empty_pct.setRange(0, 100)
-            self.spn_empty_pct.setValue(0)
-            self.spn_empty_pct.setSuffix("%")
-            self.spn_empty_pct.setFixedHeight(22)
-            self.spn_empty_pct.setFixedWidth(56)
-            self.spn_empty_pct.setStyleSheet(_spin_css)
-            self.spn_empty_pct.setToolTip(
-                "Доля кадров с пустым кузовом (нулевой объём наполнения)."
-            )
-
-            lbl_full = _QL2("ПОЛНЫЙ")
-            lbl_empty = _QL2("ПУСТОЙ")
-            for _l in (lbl_full, lbl_empty):
-                _l.setStyleSheet(
-                    f"color: {_RCTM}; font-size: 10px;"
-                    f" letter-spacing: 0.6px; background: transparent;"
-                )
-
-            # Сумма долей не может превышать 100% — подрезаем соседа.
-            def _clamp_dist(changed, other, value):
-                try:
-                    if int(value) + int(other.value()) > 100:
-                        other.blockSignals(True)
-                        other.setValue(max(0, 100 - int(value)))
-                        other.blockSignals(False)
-                except Exception:
-                    pass
-
-            self.spn_full_pct.valueChanged.connect(
-                lambda v: _clamp_dist(self.spn_full_pct,
-                                      self.spn_empty_pct, v))
-            self.spn_empty_pct.valueChanged.connect(
-                lambda v: _clamp_dist(self.spn_empty_pct,
-                                      self.spn_full_pct, v))
-
-            # Тип датасета: глубина (как раньше) или сегментация.
-            self.cmb_dataset_type = _QCB2()
-            self.cmb_dataset_type.addItem("Глубина", "depth")
-            self.cmb_dataset_type.addItem("Сегментация", "segmentation")
-            self.cmb_dataset_type.addItem(
-                "Сегментация (случайная)", "segmentation_random")
-            self.cmb_dataset_type.setCurrentIndex(0)
-            self.cmb_dataset_type.setFixedHeight(22)
-            self.cmb_dataset_type.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.cmb_dataset_type.setStyleSheet(
-                "QComboBox {"
-                "  background: rgba(255,255,255,4);"
-                f"  color: {_RCT};"
-                f"  border: 1px solid {_RCH};"
-                "  border-radius: 4px;"
-                "  padding: 1px 6px;"
-                f"  font-family: {_RFM};"
-                "  font-size: 11px;"
-                "}"
-                "QComboBox::drop-down { border: none; width: 14px; }"
-                "QComboBox QAbstractItemView {"
-                f"  background: #1b1b1b;"
-                f"  color: {_RCT};"
-                f"  selection-background-color: rgba(0,255,136,40);"
-                f"  border: 1px solid {_RCH};"
-                "}"
-            )
-
-            # Случайный фон: на цветном рендере фон сцены/неба заменяется
-            # случайной картинкой из assets/backgrounds (кузов+груз остаются).
-            self.chk_random_bg = _QCk2("Случ. фон")
-            self.chk_random_bg.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.chk_random_bg.setToolTip(
-                "Заменять фон сцены/неба случайной картинкой из "
-                "assets/backgrounds (после дисторсии, только на цветном "
-                "кадре). Передний план — кузов и груз — сохраняется.\n"
-                "Цветовая температура переднего плана и яркость фоновой "
-                "картинки подгоняются под рендер кузова."
-            )
-            self.chk_random_bg.setStyleSheet(
-                f"QCheckBox {{ color: {_RCT}; font-size: 10px;"
-                f" letter-spacing: 0.3px; background: transparent; }}"
-                "QCheckBox::indicator { width: 12px; height: 12px; }"
-                "QCheckBox::indicator:unchecked {"
-                f"  border: 1px solid {_RCH}; border-radius: 3px;"
-                "  background: rgba(255,255,255,4); }"
-                "QCheckBox::indicator:checked {"
-                "  border: 1px solid #00FF88; border-radius: 3px;"
-                "  background: #00FF88; }"
-            )
-
-            # Gemini-постобработка: новый фон + выветривание кузова/груза
-            # (ржавчина, вмятины, кабели, разнофракционный груз). Силуэт
-            # переднего плана сохраняется (GT совпадает). Требует ключ в
-            # config/gemini.json.
-            self.chk_gemini = _QCk2("ИИ-обработка")
-            self.chk_gemini.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.chk_gemini.setToolTip(
-                "Постобработка кадра через Google Gemini: генерируется новый "
-                "фон и выветривается поверхность кузова и груза (ржавчина, "
-                "вмятины, кабели, разнофракционный груз). Силуэт переднего "
-                "плана строго сохраняется, поэтому карта глубины/маска "
-                "(ground truth) остаются точными.\n"
-                "Нужен API-ключ в config/gemini.json (или env GEMINI_API_KEY)."
-            )
-            self.chk_gemini.setStyleSheet(
-                f"QCheckBox {{ color: {_RCT}; font-size: 10px;"
-                f" letter-spacing: 0.3px; background: transparent; }}"
-                "QCheckBox::indicator { width: 12px; height: 12px; }"
-                "QCheckBox::indicator:unchecked {"
-                f"  border: 1px solid {_RCH}; border-radius: 3px;"
-                "  background: rgba(255,255,255,4); }"
-                "QCheckBox::indicator:checked {"
-                "  border: 1px solid #00FF88; border-radius: 3px;"
-                "  background: #00FF88; }"
-            )
-
-            # Ткань: тент, свисающий с борта (симуляция ClothSimulator).
-            # В маске сегментации — отдельный ярко-оранжевый класс "cloth".
-            self.chk_cloth = _QCk2("Ткань")
-            self.chk_cloth.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.chk_cloth.setToolTip(
-                "Добавить в кадр тент/полог, свисающий с борта: физическая "
-                "симуляция провиса, складок и полоскания на ветру. Место "
-                "крепления, размер, сборка, сила ветра и степень укладки "
-                "случайны от кадра к кадру; иногда полотно закрывает весь "
-                "кадр. В маске сегментации ткань размечена отдельным ярко-"
-                "оранжевым классом. Часть кадров (~20%) остаётся без ткани."
-            )
-            self.chk_cloth.setStyleSheet(
-                f"QCheckBox {{ color: {_RCT}; font-size: 10px;"
-                f" letter-spacing: 0.3px; background: transparent; }}"
-                "QCheckBox::indicator { width: 12px; height: 12px; }"
-                "QCheckBox::indicator:unchecked {"
-                f"  border: 1px solid {_RCH}; border-radius: 3px;"
-                "  background: rgba(255,255,255,4); }"
-                "QCheckBox::indicator:checked {"
-                "  border: 1px solid #00FF88; border-radius: 3px;"
-                "  background: #00FF88; }"
-            )
-
-            self.btn_save_render = _QPB2("Сохранить")
+            self.btn_save_render = _QPB2("Снять")
             self.btn_save_render.setCursor(Qt.CursorShape.PointingHandCursor)
             self.btn_save_render.setFixedHeight(22)
+            self.btn_save_render.setToolTip(
+                "Запустить съёмку с текущими настройками")
             self.btn_save_render.setStyleSheet(
                 "QPushButton {"
                 "  background-color: rgba(0, 255, 136, 30);"
@@ -748,40 +593,22 @@ class MainWindow(QMainWindow):
             )
             self.btn_save_render.clicked.connect(self._on_save_render_clicked)
 
-            # Строка 1: подпись + количество снимков + тип датасета.
+            sh_row1 = _QHB2()
+            sh_row1.setContentsMargins(0, 0, 0, 0)
+            sh_row1.setSpacing(6)
             sh_row1.addWidget(sr_label, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_row1.addWidget(self.spn_render_count, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_row1.addWidget(self.cmb_dataset_type, 1, Qt.AlignmentFlag.AlignVCenter)
-
-            # Строка распределения объёмов: доля полных / пустых кузовов.
-            sh_row_dist = _QHB2()
-            sh_row_dist.setContentsMargins(0, 0, 0, 0)
-            sh_row_dist.setSpacing(6)
-            sh_row_dist.addWidget(lbl_full, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_row_dist.addWidget(self.spn_full_pct, 0,
-                                  Qt.AlignmentFlag.AlignVCenter)
-            sh_row_dist.addWidget(lbl_empty, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_row_dist.addWidget(self.spn_empty_pct, 0,
-                                  Qt.AlignmentFlag.AlignVCenter)
-            sh_row_dist.addStretch(1)
-
-            # Сетка опций 2x2: чекбоксы больше не соревнуются за ширину
-            # с кнопкой сохранения и не обрезаются.
-            sh_opts.addWidget(self.chk_random_bg, 0, 0)
-            sh_opts.addWidget(self.chk_gemini,    0, 1)
-            sh_opts.addWidget(self.chk_cloth,     1, 0)
-            sh_opts.setColumnStretch(0, 1)
-            sh_opts.setColumnStretch(1, 1)
+            sh_row1.addWidget(self.btn_dataset_setup, 1,
+                              Qt.AlignmentFlag.AlignVCenter)
+            sh_row1.addWidget(self.btn_save_render, 0,
+                              Qt.AlignmentFlag.AlignVCenter)
 
             sh_lay.addLayout(sh_row1)
-            sh_lay.addLayout(sh_row_dist)
-            sh_lay.addLayout(sh_opts)
-            # Кнопка сохранения — отдельной строкой во всю ширину карточки.
-            sh_lay.addWidget(self.btn_save_render)
+            sh_lay.addWidget(self.lbl_dataset_summary)
 
+            self._refresh_dataset_summary()
             self.telemetry.attach_extra(save_holder)
         except Exception as exc:
-            print(f"[MainWindow] save-render row init failed: {exc}")
+            print(f"[MainWindow] dataset row init failed: {exc}")
 
         self.controls = SceneOverlay(
             "Управление",
@@ -846,6 +673,12 @@ class MainWindow(QMainWindow):
         # first depth tick where depth_renderer becomes available - see
         # `_sync_depth_camera_once`.
         self._depth_synced = False
+
+        # Палитра классов сегментации из config/dataset.json: применяем один
+        # раз при подключении рендера, чтобы маска и легенда в json совпадали
+        # с тем, что выбрано в диалоге, ещё до первой съёмки.
+        self._apply_dataset_palette(self._dataset_cfg)
+
         self.right_panel.runRequested.connect(self._on_run_simulation)
         # When the user picks a model from the combo we have to download
         # the cuzov/napolnitel/other .bam files into the temp cache and
@@ -1680,110 +1513,15 @@ class MainWindow(QMainWindow):
         # don't reach it automatically. Cheap, and covers every FOV source.
         self._mirror_depth_camera_fov(dr)
 
-        try:
-            import numpy as np
-            from PyQt6.QtGui import QImage
-
-            tex = dr.depth_texture
-            if not tex.has_ram_image():
-                return
-            ram = tex.get_ram_image_as("D")
-            if ram is None:
-                return
-            buf = memoryview(ram).tobytes()
-            if not buf:
-                return
-            tw = tex.get_x_size()
-            th = tex.get_y_size()
-            if tw * th * 4 != len(buf):
-                return
-
-            depth = np.frombuffer(buf, dtype=np.float32).reshape(th, tw)
-
-            # Linearise non-linear z-buffer using the same formula as
-            # depth_renderer's overlay shader:
-            #   linear = (2 * near) / (far + near - depth*(far-near))
-            near = float(getattr(dr, "min_depth", 0.1))
-            far  = float(getattr(dr, "max_depth", 100.0))
-            den = (far + near) - depth * (far - near)
-            den = np.where(np.abs(den) < 1e-6, 1e-6, den)
-            linear = (2.0 * near) / den
-
-            # Map linear depth into the gradient window using the same
-            # gradientStart / gradientEnd that the overlay shader uses.
-            gs = float(getattr(dr, "gradient_start", 0.2))
-            ge = float(getattr(dr, "gradient_end",   0.4))
-            if abs(ge - gs) < 1e-6:
-                ge = gs + 1.0
-            n = np.clip((linear - gs) / (ge - gs), 0.0, 1.0)
-            t = 1.0 - n   # close = "hot" colours (red), far = blue
-
-            # Stride downscale to preview resolution.
-            tw_out = self._depth_capture_w
-            th_out = self._depth_capture_h
-            sx = max(1, tw // tw_out)
-            sy = max(1, th // th_out)
-            t_small = t[::sy, ::sx]
-            if t_small.shape[0] > th_out:
-                t_small = t_small[:th_out, :]
-            if t_small.shape[1] > tw_out:
-                t_small = t_small[:, :tw_out]
-            sh, sw = t_small.shape
-
-            # Build / reuse the rainbow LUT (256 entries, RGBA u8).
-            lut = self._get_rainbow_lut()
-            idx = (np.clip(t_small, 0.0, 1.0) * 255.0).astype(np.uint8)
-            rgba = lut[idx]   # (sh, sw, 4)
-            rgba = np.ascontiguousarray(rgba)
-
-            data = rgba.tobytes()
-            img = QImage(data, sw, sh, sw * 4,
-                         QImage.Format.Format_RGBA8888)
-            img = img.mirrored(False, True)
-            img = img.copy()
+        # Раскраска — в src/ui/depth_preview: тот же код кормит превью в
+        # диалоге настроек датасета, поэтому картинки гарантированно
+        # совпадают.
+        img = depth_to_qimage(
+            dr, self._depth_capture_w, self._depth_capture_h,
+            grayscale=bool(getattr(dr, "grayscale", False)),
+        )
+        if img is not None:
             self.depth_overlay.set_image(img)
-        except Exception as exc:
-            print(f"[Depth] tick failed: {exc}")
-
-    @staticmethod
-    def _get_rainbow_lut():
-        """
-        256-entry RGBA LUT mirroring depth_renderer's overlay shader
-        gradient (red -> orange -> yellow -> emerald -> blue -> dark blue).
-        Cached on the class for cheap repeated lookups.
-        """
-        import numpy as np
-        cls = MainWindow
-        lut = getattr(cls, "_rainbow_lut", None)
-        if lut is not None:
-            return lut
-
-        out = np.zeros((256, 4), dtype=np.uint8)
-        # Stop list mirrors the shader segments exactly.
-        # t in [0..1]; format: (t_low, color_low_rgb, t_high, color_high_rgb)
-        stops = [
-            (0.00, (0.0, 0.0, 0.3), 0.10, (0.0, 0.0, 1.0)),     # dark blue -> blue
-            (0.10, (0.0, 0.0, 1.0), 0.30, (0.1, 0.7, 0.4)),     # blue -> emerald
-            (0.30, (0.1, 0.7, 0.4), 0.50, (1.0, 1.0, 0.0)),     # emerald -> yellow
-            (0.50, (1.0, 1.0, 0.0), 0.70, (1.0, 0.5, 0.0)),     # yellow -> orange
-            (0.70, (1.0, 0.5, 0.0), 0.90, (1.0, 0.0, 0.0)),     # orange -> red
-            (0.90, (1.0, 0.0, 0.0), 1.01, (0.5, 0.0, 0.0)),     # red -> dark red
-        ]
-        for i in range(256):
-            t = i / 255.0
-            for tl, cl, th, ch in stops:
-                if tl <= t < th:
-                    a = (t - tl) / (th - tl)
-                    r = cl[0] + (ch[0] - cl[0]) * a
-                    g = cl[1] + (ch[1] - cl[1]) * a
-                    b = cl[2] + (ch[2] - cl[2]) * a
-                    out[i, 0] = int(np.clip(r * 255.0, 0, 255))
-                    out[i, 1] = int(np.clip(g * 255.0, 0, 255))
-                    out[i, 2] = int(np.clip(b * 255.0, 0, 255))
-                    out[i, 3] = 255
-                    break
-        cls._rainbow_lut = out
-        return out
 
     def _tick_color_mirror(self) -> None:
         """
@@ -2915,15 +2653,112 @@ class MainWindow(QMainWindow):
             print("[DepthRecon] реконструкция не выполнена.")
 
     # ==================================================================
-    # Save-render handler
+    # Съёмка датасета
     # ==================================================================
+    # Раньше здесь было два почти одинаковых прогона — «обычный» датасет и
+    # «случайная сегментация», — которые расходились ровно в трёх местах: как
+    # выбирается объём, как двигается камера и как ставится свет. Всё
+    # остальное они дублировали, и любое исправление приходилось вносить
+    # дважды. Теперь прогон один, а эти три решения приходят из конфига
+    # (src/ui/dataset_config.py) независимыми осями.
+
+    # Окна времени суток для типов освещения (минуты от полуночи).
+    _DATASET_DAY_WINDOW = (600, 960)                    # 10:00–16:00
+    _DATASET_DUSK_WINDOWS = ((300, 375), (1170, 1275))  # утро / вечер
+
+    def _on_dataset_settings_clicked(self) -> None:
+        """Открыть диалог настроек; «Начать съёмку» запускает прогон."""
+        try:
+            from src.ui.dataset_dialog import DatasetSettingsDialog
+        except Exception as exc:
+            print(f"[Dataset] диалог настроек недоступен: {exc}")
+            return
+
+        # HUD-карточки — это отдельные окна Qt.Tool поверх главного окна, и
+        # без этого они всплыли бы поверх модального диалога.
+        self._hide_huds_for_modal()
+        try:
+            dlg = DatasetSettingsDialog(
+                self._dataset_cfg,
+                parent=self.window(),
+                panda_app=self.panda_app,
+            )
+            dlg.exec()
+        finally:
+            self._restore_huds_after_modal()
+
+        if dlg.action is None:
+            return
+
+        self._dataset_cfg = dlg.config
+        dataset_config.save(self._dataset_cfg)
+        self._apply_dataset_palette(self._dataset_cfg)
+        self._refresh_dataset_summary()
+
+        if dlg.action == "start":
+            # Через таймер, чтобы диалог успел закрыться: съёмка блокирует
+            # цикл событий на всё время прогона.
+            QTimer.singleShot(0, self._on_save_render_clicked)
+
+    def _hide_huds_for_modal(self) -> None:
+        self._modal_hidden_huds = []
+        for name in ("telemetry", "controls", "depth_overlay", "right_panel"):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                if widget.isVisible():
+                    widget.hide()
+                    self._modal_hidden_huds.append(widget)
+            except Exception:
+                pass
+
+    def _restore_huds_after_modal(self) -> None:
+        for widget in getattr(self, "_modal_hidden_huds", []) or []:
+            try:
+                widget.show()
+                widget.raise_()
+            except Exception:
+                pass
+        self._modal_hidden_huds = []
+
+    def _apply_dataset_palette(self, cfg) -> None:
+        """Отдать палитру классов рендереру сегментации."""
+        palette = (cfg.get("segmentation") or {}).get("palette") or {}
+        if not palette:
+            return
+        seg = (getattr(self.panda_app, "segmentation_renderer", None)
+               if self.panda_app is not None else None)
+        if seg is None or not hasattr(seg, "apply_palette"):
+            return
+        try:
+            seg.apply_palette(palette)
+        except Exception as exc:
+            print(f"[Dataset] палитра сегментации не применена: {exc}")
+
+    def _refresh_dataset_summary(self) -> None:
+        """Строка-итог под кнопками: сколько кадров и что именно сохранится."""
+        label = getattr(self, "lbl_dataset_summary", None)
+        if label is None:
+            return
+        try:
+            cfg = dataset_config.normalize(self._dataset_cfg)
+            total = dataset_config.total_frames(cfg)
+            per_fill = dataset_config.frames_per_fill(cfg)
+            names = {"color": "цвет", "depth": "глубина",
+                     "segmentation": "маска", "lidar": "лидар",
+                     "json": "json"}
+            files = ", ".join(names[k]
+                              for k in dataset_config.output_list(cfg))
+            label.setText(
+                f"{cfg['count']}×{per_fill} = {total} кадров · {files}\n"
+                f"{cfg['output_dir']}"
+            )
+        except Exception as exc:
+            label.setText(f"настройки не прочитаны: {exc}")
+
     def _on_save_render_clicked(self) -> None:
-        """
-        Walk the filling from `step` -> `max_volume` in N evenly-spaced
-        target_volume steps, run the full pipeline at each step and
-        save a render. Step formula matches the user's spec: for N=10
-        and max_volume=20 -> targets [2, 4, 6, 8, 10, 12, 14, 16, 18, 20].
-        """
+        """Запустить съёмку датасета с текущим конфигом."""
         if self.panda_app is None:
             return
 
@@ -2936,108 +2771,171 @@ class MainWindow(QMainWindow):
         # событий, уже вне кадра).
         pump = getattr(self.panda_app, "frame_pump", None)
         if pump is not None and pump.busy:
-            print("[SaveRender] запуск изнутри кадра — откладываю на "
+            print("[Dataset] запуск изнутри кадра — откладываю на "
                   "следующий цикл событий.")
             QTimer.singleShot(0, self._on_save_render_clicked)
             return
 
         ru = getattr(self.panda_app, "renderer_utils", None)
         if ru is None or not hasattr(ru, "save_single_render"):
-            print("[SaveRender] renderer_utils.save_single_render missing.")
+            print("[Dataset] renderer_utils.save_single_render missing.")
             return
-        try:
-            count = int(self.spn_render_count.value())
-        except Exception:
-            count = 1
-        count = max(1, count)
 
-        # Тип датасета из выпадающего списка: "depth", "segmentation" или
-        # "segmentation_random".
-        dataset_type = "depth"
-        cmb = getattr(self, "cmb_dataset_type", None)
-        if cmb is not None:
-            data = cmb.currentData()
-            if data:
-                dataset_type = str(data)
+        self._run_dataset(dataset_config.normalize(self._dataset_cfg), ru)
 
-        # "segmentation_random" — это сегментационный датасет, но каждый кадр —
-        # полностью новая сцена: новое случайное наполнение случайного объёма
-        # (0..max), случайная поза камеры (в текущих рамках) и всегда полдень
-        # (солнце вертикально сверху). Для сохранения это обычная сегментация.
-        is_random_seg = (dataset_type == "segmentation_random")
-        render_dataset_type = "segmentation" if is_random_seg else dataset_type
+    # ------------------------------------------------------------------
+    # План кадров: поза камеры и объём наполнения
+    # ------------------------------------------------------------------
+    def _dataset_camera_plan(self, cfg, lights) -> list:
+        """Список кадров, снимаемых с ОДНОГО наполнения.
 
-        # Замена фона случайной картинкой (assets/backgrounds).
-        chk_bg = getattr(self, "chk_random_bg", None)
-        random_background = bool(chk_bg.isChecked()) if chk_bg is not None else False
+        Каждый элемент — dict с именем варианта и отклонениями от базовой
+        позы (dh/dp — рысканье/тангаж в градусах, lat/vert — смещения в
+        метрах). Ключ "light" задаёт освещение принудительно; без него тип
+        света назначается по кругу уже на этапе съёмки.
+        """
+        cam = cfg["camera"]
+        mode = cam["mode"]
+        ang = float(cam["angle_deg"])
+        off = float(cam["offset_m"])
 
-        # Gemini-постобработка (новый фон + выветривание кузова/груза).
-        chk_gem = getattr(self, "chk_gemini", None)
-        gemini = bool(chk_gem.isChecked()) if chk_gem is not None else False
+        if mode == "fixed":
+            return [{"name": "base"}]
 
-        # Распределение объёмов: доли полностью гружёных и пустых кадров
-        # (в процентах). Остальное — случайный объём, как раньше.
-        def _pct_of(name):
-            w = getattr(self, name, None)
-            try:
-                return max(0.0, min(100.0, float(w.value()))) if w else 0.0
-            except Exception:
-                return 0.0
+        if mode == "random":
+            # Конкретные значения берутся в момент съёмки — иначе все
+            # наполнения получили бы один и тот же набор «случайных» поз.
+            return [{"name": "random", "randomize": True}
+                    for _ in range(int(cam["samples"]))]
 
-        full_pct = _pct_of("spn_full_pct")
-        empty_pct = _pct_of("spn_empty_pct")
-        if full_pct + empty_pct > 100.0:
-            empty_pct = max(0.0, 100.0 - full_pct)
+        variants = cam["variants"]
+        plan: list = []
+        if variants.get("originals"):
+            # Базовая поза — по кадру на каждый тип света, чтобы «эталон»
+            # был представлен в каждом освещении.
+            for light in lights:
+                plan.append({"name": f"{light}_orig", "light": light})
+        if variants.get("angles"):
+            plan += [
+                {"name": "h_plus",  "dh": +ang},
+                {"name": "h_minus", "dh": -ang},
+                {"name": "p_plus",  "dp": +ang},
+                {"name": "p_minus", "dp": -ang},
+            ]
+        if variants.get("offsets"):
+            plan += [
+                {"name": "lat_plus",   "lat":  +off},
+                {"name": "lat_minus",  "lat":  -off},
+                {"name": "vert_plus",  "vert": +off},
+                {"name": "vert_minus", "vert": -off},
+            ]
+        if variants.get("random_combined"):
+            plan.append({"name": "random_combined", "randomize": True})
+        return plan or [{"name": "base"}]
 
-        # Ткань, свисающая с борта (отдельный класс маски).
-        chk_cl = getattr(self, "chk_cloth", None)
-        cloth = bool(chk_cl.isChecked()) if chk_cl is not None else False
+    def _dataset_volume_for(self, cfg, index, count, max_volume):
+        """Объём наполнения для итерации: (target, класс кадра)."""
+        vol = cfg["volume"]
+        if max_volume is None:
+            rp = getattr(self, "right_panel", None)
+            target = (float(rp.current_target_volume())
+                      if rp is not None else 0.0)
+            return target, ("empty" if target <= 0.0 else "random")
 
-        # Resolve current model + texture from the right panel and pull
-        # max_volume from the model's YAML config.
+        if vol["mode"] == "ramp":
+            # Объём равномерно растёт: шаг = max_volume / count.
+            return (float(max_volume) / count) * (index + 1), "ramp"
+
+        ceiling = float(vol["ceiling_k"]) * float(max_volume)
+        roll = random.uniform(0.0, 100.0)
+        if roll < vol["full_pct"]:
+            return random.uniform(0.95, 1.0) * ceiling, "full"
+        if roll < vol["full_pct"] + vol["empty_pct"]:
+            return 0.0, "empty"
+        # Нижняя граница строго > 0: ровно 0 доезжает до сервера как «объём
+        # не задан», и вместо пустого кузова получается случайный НЕпустой с
+        # ярлыком vol0000.00. Пустой кузов делается отдельной веткой.
+        MIN_FRACTION = 0.02
+        return random.uniform(MIN_FRACTION * ceiling, ceiling), "random"
+
+    def _dataset_daytime_for(self, light_mode) -> int:
+        if light_mode == "dusk":
+            lo, hi = random.choice(self._DATASET_DUSK_WINDOWS)
+            return random.randint(lo, hi)
+        return random.randint(*self._DATASET_DAY_WINDOW)
+
+    # ------------------------------------------------------------------
+    # Сам прогон
+    # ------------------------------------------------------------------
+    def _run_dataset(self, cfg, ru) -> None:
+        from PyQt6.QtWidgets import QApplication
+
+        count = int(cfg["count"])
+        outputs = set(dataset_config.output_list(cfg))
+        depth_settings = dict(cfg["depth"]) if "depth" in outputs else None
+        lidar_settings = dict(cfg["lidar"]) if "lidar" in outputs else None
+        scene = cfg["scene"]
+        lights = dataset_config.enabled_lights(cfg)
+        plan = self._dataset_camera_plan(cfg, lights)
+        cam_cfg = cfg["camera"]
+        ang = float(cam_cfg["angle_deg"])
+        off = float(cam_cfg["offset_m"])
+
+        out_dir = cfg["output_dir"]
+        if not os.path.isabs(out_dir):
+            out_dir = os.path.join(PROJECT_ROOT, out_dir)
+
+        # Палитра классов могла измениться в диалоге или приехать с диска при
+        # старте — применяем её прямо перед съёмкой.
+        self._apply_dataset_palette(cfg)
+
+        # Текущая модель + текстура из правой панели; max_volume — из YAML.
         rp = getattr(self, "right_panel", None)
-        model_key   = rp.current_model_key()   if rp is not None else None
+        model_key = rp.current_model_key() if rp is not None else None
         texture_key = rp.current_texture_key() if rp is not None else None
-        max_volume  = None
+        max_volume = None
         if model_key:
-            cfg = get_model_set_config(str(model_key))
-            if cfg and cfg.get("max_volume") is not None:
+            mc = get_model_set_config(str(model_key))
+            if mc and mc.get("max_volume") is not None:
                 try:
-                    max_volume = float(cfg["max_volume"])
+                    max_volume = float(mc["max_volume"])
                 except (TypeError, ValueError):
                     max_volume = None
         # Локальные наборы в YAML не хранят max_volume — берём эффективный
-        # (унаследованный от донора) max_volume, который load_model_set
-        # положил в panda_app.current_max_volume (тот же источник использует
-        # perlin_mesh_generator). Без этого max_volume оставался None и
-        # объём наполнения фиксировался значением спинбокса.
-        if (max_volume is None or max_volume <= 0):
-            stored_mv = getattr(self.panda_app, "current_max_volume", None)
-            if stored_mv:
-                try:
-                    max_volume = float(stored_mv)
-                except (TypeError, ValueError):
-                    max_volume = None
-        if max_volume is None or max_volume <= 0:
-            print("[SaveRender] max_volume not available for current "
-                  "model set - falling back to spinbox-only count loop.")
+        # (унаследованный от донора), который load_model_set положил в
+        # panda_app.current_max_volume. Без этого объём наполнения
+        # фиксировался бы значением из панели.
+        if not max_volume:
+            try:
+                max_volume = float(
+                    getattr(self.panda_app, "current_max_volume", 0) or 0)
+            except (TypeError, ValueError):
+                max_volume = None
+        if not max_volume:
+            print("[Dataset] max_volume недоступен для текущего набора — "
+                  "объём берётся из панели.")
             max_volume = None
 
-        from PyQt6.QtWidgets import QApplication
+        total = count * len(plan)
+        print(f"[Dataset] старт: {count} наполнений x {len(plan)} кадров = "
+              f"{total}; выходы={sorted(outputs)}; каталог={out_dir}")
+
         self.btn_save_render.setEnabled(False)
+        btn_setup = getattr(self, "btn_dataset_setup", None)
+        if btn_setup is not None:
+            btn_setup.setEnabled(False)
         original_text = self.btn_save_render.text()
         ok_count = 0
 
-        # Freeze fly-cam for the whole dataset run, чтобы наши setPos /
-        # setHpr на каждом варианте не сбивались тиком fly_cam.
-        fc = getattr(self.panda_app, "fly_cam", None)
+        # Замораживаем fly-cam на весь прогон, чтобы наши setPos / setHpr на
+        # каждом варианте не сбивались его тиком.
+        fly_cam = getattr(self.panda_app, "fly_cam", None)
         prev_frozen = None
-        if fc is not None and hasattr(fc, "set_frozen"):
+        if fly_cam is not None and hasattr(fly_cam, "set_frozen"):
             try:
-                prev_frozen = (
-                    fc.is_frozen() if hasattr(fc, "is_frozen") else None
-                )
-                fc.set_frozen(True)
+                prev_frozen = (fly_cam.is_frozen()
+                               if hasattr(fly_cam, "is_frozen") else None)
+                fly_cam.set_frozen(True)
             except Exception:
                 prev_frozen = None
 
@@ -3048,536 +2946,263 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        def _set_daytime(mins: int) -> None:
+        def _set_daytime(mins) -> None:
             mins = int(mins) % 1440
-            hh, mm = mins // 60, mins % 60
-            txt = f"{hh:02d}:{mm:02d}"
             try:
-                rp = getattr(self.panda_app, "render_pipeline", None)
-                dt_mgr = getattr(rp, "daytime_mgr", None) if rp else None
-                if dt_mgr is not None:
-                    dt_mgr.time = txt
+                pipeline = getattr(self.panda_app, "render_pipeline", None)
+                mgr = (getattr(pipeline, "daytime_mgr", None)
+                       if pipeline else None)
+                if mgr is not None:
+                    mgr.time = f"{mins // 60:02d}:{mins % 60:02d}"
             except Exception as exc:
-                print(f"[SaveRender] daytime set failed: {exc}")
+                print(f"[Dataset] время суток не выставлено: {exc}")
 
-        # На время съёмки датасета ОСТАНАВЛИВАЕМ Qt-таймеры, которые сами
-        # крутят taskMgr.step()/рендер. Иначе наши ручные settle/step внутри
-        # цикла пересекаются с тиком _panda_timer (через QApplication.
-        # processEvents) — Panda ругается «Ignoring recursive poll() within
-        # another task», часть шагов ИГНОРИРУЕТСЯ, счётчик кадров сбивается, и
-        # цветной снимок рассинхронизируется с маской (лаг на целую итерацию:
-        # «маска 1 = цвет 2», «4 наполнения на 3 кадра»). Дальше весь рендер
-        # гоним вручную (settle_render / _settle_wait), таймеры возвращаем в
-        # finally.
-        _paused_timers = []
-        for _tname in ("_panda_timer", "_depth_timer", "_telemetry_timer"):
-            _t = getattr(self, _tname, None)
+        def _set_sun_overhead(enable=True) -> None:
+            """Солнце жёстко в зенит — не временем суток, а направлением."""
+            app = self.panda_app
+            if app is not None and hasattr(app, "set_sun_overhead"):
+                try:
+                    app.set_sun_overhead(enable)
+                except Exception as exc:
+                    print(f"[Dataset] солнце в зените не выставлено: {exc}")
+
+        # На время съёмки ОСТАНАВЛИВАЕМ Qt-таймеры, которые сами крутят
+        # taskMgr.step()/рендер. Иначе наши ручные settle-шаги пересекаются с
+        # тиком _panda_timer (он доезжает через QApplication.processEvents),
+        # Panda ругается «Ignoring recursive poll()», часть шагов ИГНОРИРУЕТСЯ,
+        # счётчик кадров сбивается — и цветной кадр рассинхронизируется с
+        # маской. Таймеры возвращаем в finally.
+        paused_timers = []
+        for name in ("_panda_timer", "_depth_timer", "_telemetry_timer"):
+            timer = getattr(self, name, None)
             try:
-                if _t is not None and _t.isActive():
-                    _t.stop()
-                    _paused_timers.append(_t)
+                if timer is not None and timer.isActive():
+                    timer.stop()
+                    paused_timers.append(timer)
             except Exception:
                 pass
 
-        # Три типа освещения (по ТЗ): день, сумерки, «тень рассекает пополам».
-        # Внутри day/dusk время слегка рандомится для разнообразия. shadow
-        # использует дневной свет + постобработочную теневую полосу (флаг
-        # shadow_band в renderer_utils, ставится по маске переднего плана).
-        def _daytime_for(mode: str) -> int:
-            if mode == "dusk":
-                # сумерки: утренние либо вечерние
-                return random.choice([
-                    random.randint(300, 375),      # 05:00–06:15
-                    random.randint(1170, 1275),     # 19:30–21:15
-                ])
-            # day и shadow — дневной свет
-            return random.randint(600, 960)         # 10:00–16:00
+        # Ожидание сходимости сцены: ждём по ОБОИМ условиям — не меньше
+        # WAIT_FRAMES реально выполненных кадров И не меньше WAIT_SECONDS
+        # секунд. Свежий меш наполнения и его 8K-текстуры доезжают до GPU
+        # лениво, а голый sleep кадры НЕ гонит.
+        WAIT_FRAMES = 60
+        WAIT_SECONDS = 1.0
 
-        try:
-            if is_random_seg:
-                self._run_random_seg_dataset(
-                    count=count,
-                    max_volume=max_volume,
-                    model_key=model_key,
-                    texture_key=texture_key,
-                    random_background=random_background,
-                    gemini=gemini,
-                    cloth=cloth,
-                    base_daytime_mins=base_daytime_mins,
-                    set_daytime=_set_daytime,
-                    render_dataset_type=render_dataset_type,
-                    ru=ru,
-                    full_pct=full_pct,
-                    empty_pct=empty_pct,
-                )
-                return
-            for i in range(count):
-                # Target ramp: step = max_volume/N, target = step*(i+1).
-                # Чем больше N (текущий индекс), тем больше объём
-                # наполнения — та же логика, что и раньше.
-                if max_volume is not None:
-                    target = (max_volume / count) * (i + 1)
+        def _settle_wait(frames=WAIT_FRAMES, seconds=WAIT_SECONDS):
+            """Прокрутить кадры до сходимости сцены.
+
+            Кадры считаем по фактически ВЫПОЛНЕННЫМ (pump.step возвращает их
+            число): часть шагов Panda молча игнорирует как рекурсивные.
+
+            КРИТИЧНО: у цикла ОБЯЗАН быть выход, не зависящий от числа
+            выполненных кадров. Если мы сами оказались внутри кадра (насос
+            подавляет повторный вход и возвращает 0), кадры отсюда не
+            продвинутся НИКОГДА — и цикл висел бы вечно. Поэтому есть и
+            детектор простоя, и жёсткий дедлайн: лучше выйти рано и дать
+            захвату честно отказаться, чем повесить приложение.
+            """
+            pump = getattr(self.panda_app, "frame_pump", None)
+            start = time.perf_counter()
+            deadline = start + max(seconds * 4.0, seconds + 15.0)
+            done_frames = 0
+            stalled = 0
+            while True:
+                if pump is not None:
+                    done = pump.step(1)
+                    done_frames += done
+                    stalled = 0 if done else stalled + 1
                 else:
-                    target = float(rp.current_target_volume()) if rp else 0.0
-
-                self.btn_save_render.setText(f"{i+1}/{count}")
+                    self.panda_app.taskMgr.step()
+                    done_frames += 1
                 QApplication.processEvents()
 
-                # Сгенерировать новое наполнение для этой итерации.
+                now = time.perf_counter()
+                if done_frames >= frames and (now - start) >= seconds:
+                    break
+                if stalled >= 50:
+                    print("[Dataset] кадры не продвигаются (вызов изнутри "
+                          "кадра); выхожу из ожидания, чтобы не зависнуть.")
+                    break
+                if now >= deadline:
+                    print(f"[Dataset] дедлайн ожидания: {done_frames} из "
+                          f"{frames} кадров за {now - start:.1f} c — иду "
+                          f"дальше.")
+                    break
+                time.sleep(0.005)
+
+        frame_no = 0
+        try:
+            for i in range(count):
+                target, fill_class = self._dataset_volume_for(
+                    cfg, i, count, max_volume)
+                is_empty = (fill_class == "empty")
+
+                self.btn_save_render.setText(f"{i + 1}/{count}")
+                QApplication.processEvents()
+
+                # Новое наполнение для этой итерации (для пустого кузова —
+                # снятие старого меша без обращения к серверу).
                 try:
                     self._on_run_simulation({
                         "model_key":     model_key,
                         "texture_key":   texture_key,
                         "target_volume": float(target),
+                        "empty":         is_empty,
                     })
                 except Exception as exc:
-                    print(f"[SaveRender] pipeline {i+1} failed: {exc}")
+                    print(f"[Dataset] пайплайн {i + 1} упал: {exc}")
                     QApplication.processEvents()
                     continue
 
-                # Подождать, пока финальные кадры пайплайна успеют
-                # отрисоваться.
-                for _ in range(4):
-                    QApplication.processEvents()
-                    time.sleep(0.05)
+                _settle_wait()
 
-                # Базовое состояние камеры — то, что выбрал пользователь
-                # (free / stationary / onboard уже выставил позицию).
                 cam = self.panda_app.camera
                 base_pos = cam.getPos()
                 base_hpr = cam.getHpr()
-                base_pos_t = (float(base_pos.x),
-                              float(base_pos.y),
+                base_pos_t = (float(base_pos.x), float(base_pos.y),
                               float(base_pos.z))
-                base_hpr_t = (float(base_hpr.x),
-                              float(base_hpr.y),
+                base_hpr_t = (float(base_hpr.x), float(base_hpr.y),
                               float(base_hpr.z))
 
-                # 5 см → 0.05 единицы Panda (проект работает в метрах).
-                OFFSET_M = 0.05
-                ANG_DEG = 10.0
+                for v_idx, variant in enumerate(plan):
+                    # --- поза камеры ------------------------------------
+                    if variant.get("randomize"):
+                        dh = random.uniform(-ang, ang)
+                        dp = random.uniform(-ang, ang)
+                        lat = random.uniform(-off, off)
+                        vert = random.uniform(-off, off)
+                    else:
+                        dh = float(variant.get("dh", 0.0))
+                        dp = float(variant.get("dp", 0.0))
+                        lat = float(variant.get("lat", 0.0))
+                        vert = float(variant.get("vert", 0.0))
 
-                # Три типа освещения по ТЗ. "light" в params задаёт режим;
-                # renderer получает shadow_band=True для режима "shadow".
-                LIGHTS = ("day", "dusk", "shadow")
-
-                # Три «эталонных» кадра при базовой позе — по одному на каждый
-                # тип освещения, чтобы все три были представлены.
-                variants: list[tuple[str, dict]] = [
-                    ("day_orig",    {"light": "day"}),
-                    ("dusk_orig",   {"light": "dusk"}),
-                    ("shadow_orig", {"light": "shadow"}),
-                ]
-
-                # Позные вариации (геометрия — ценна для обучения). Каждой
-                # присваиваем один из 3 типов освещения по кругу, чтобы не
-                # раздувать число кадров (важно для квоты Gemini).
-                pose_defs = [
-                    ("h_plus10",      {"dh":  +ANG_DEG}),
-                    ("h_minus10",     {"dh":  -ANG_DEG}),
-                    ("p_plus10",      {"dp":  +ANG_DEG}),
-                    ("p_minus10",     {"dp":  -ANG_DEG}),
-                    ("lat_plus5cm",   {"lat": +OFFSET_M}),
-                    ("lat_minus5cm",  {"lat": -OFFSET_M}),
-                    ("vert_plus5cm",  {"vert": +OFFSET_M}),
-                    ("vert_minus5cm", {"vert": -OFFSET_M}),
-                    ("random_combined", {
-                        "dh":   random.uniform(-ANG_DEG,  ANG_DEG),
-                        "dp":   random.uniform(-ANG_DEG,  ANG_DEG),
-                        "lat":  random.uniform(-OFFSET_M, OFFSET_M),
-                        "vert": random.uniform(-OFFSET_M, OFFSET_M),
-                    }),
-                ]
-                for k, (pname, pp) in enumerate(pose_defs):
-                    pp = dict(pp)
-                    pp["light"] = LIGHTS[k % len(LIGHTS)]
-                    variants.append((pname, pp))
-
-                for v_idx, (v_name, p) in enumerate(variants):
-                    # 1) Восстанавливаем базовую позу
                     cam.setPos(*base_pos_t)
-                    cam.setHpr(*base_hpr_t)
-
-                    # 2) Угловые отклонения (heading = горизонталь,
-                    #    pitch = вертикаль).
-                    dh = float(p.get("dh", 0.0))
-                    dp = float(p.get("dp", 0.0))
-                    if dh or dp:
-                        cam.setHpr(
-                            base_hpr_t[0] + dh,
-                            base_hpr_t[1] + dp,
-                            base_hpr_t[2],
-                        )
-
-                    # 3) Смещения в локальном фрейме камеры:
-                    #    +X — вправо, +Z — вверх.
-                    lat = float(p.get("lat", 0.0))
-                    vert = float(p.get("vert", 0.0))
+                    cam.setHpr(base_hpr_t[0] + dh,
+                               base_hpr_t[1] + dp,
+                               base_hpr_t[2])
                     if lat or vert:
+                        # Смещения в локальном фрейме камеры: +X вправо,
+                        # +Z вверх.
                         cam.setPos(cam, lat, 0.0, vert)
 
-                    # 4) Освещение: один из 3 типов (day/dusk/shadow).
-                    light_mode = str(p.get("light", "day"))
+                    # --- освещение --------------------------------------
+                    light_mode = (variant.get("light")
+                                  or lights[frame_no % len(lights)])
                     shadow_band = (light_mode == "shadow")
-                    applied_time = _daytime_for(light_mode)
-                    _set_daytime(applied_time)
+                    applied_time = int(base_daytime_mins)
+                    if light_mode == "overhead":
+                        _set_sun_overhead(True)
+                    elif light_mode != "current":
+                        applied_time = self._dataset_daytime_for(light_mode)
+                        _set_daytime(applied_time)
 
-                    # Дать UI/Panda обработать setPos/setHpr и обновлённое
-                    # освещение перед тем как звать save_single_render
-                    # (внутри он сам делает дополнительные ручные тики
-                    # против motion blur).
-                    for _ in range(3):
-                        QApplication.processEvents()
-                        time.sleep(0.05)
+                    _settle_wait()
 
-                    self.btn_save_render.setText(
-                        f"{i+1}/{count} · {v_idx+1}/{len(variants)}"
-                    )
+                    frame_no += 1
+                    self.btn_save_render.setText(f"{frame_no}/{total}")
                     QApplication.processEvents()
 
                     extra_meta = {
                         "render_type": "dataset",
-                        "dataset_type": dataset_type,
-                        "random_background": random_background,
-                        "gemini": gemini,
+                        "dataset_config": {
+                            "outputs": sorted(outputs),
+                            "volume_mode": cfg["volume"]["mode"],
+                            "camera_plan": cam_cfg["mode"],
+                            "lighting_mode": cfg["lighting"]["mode"],
+                        },
+                        "random_background": scene["random_background"],
                         "light_mode": light_mode,
                         "shadow_band": shadow_band,
+                        "sun_overhead": (light_mode == "overhead"),
                         "iteration": i,
                         "iteration_total": count,
-                        "variant": v_name,
+                        "variant": variant["name"],
                         "variant_index": v_idx,
-                        "variant_params": p,
+                        "variant_params": {"dh": dh, "dp": dp,
+                                           "lat": lat, "vert": vert},
                         "camera_mode": getattr(self, "_camera_mode", None),
                         "base_camera_position": {
-                            "x": base_pos_t[0],
-                            "y": base_pos_t[1],
+                            "x": base_pos_t[0], "y": base_pos_t[1],
                             "z": base_pos_t[2],
                         },
                         "base_camera_rotation": {
-                            "h": base_hpr_t[0],
-                            "p": base_hpr_t[1],
+                            "h": base_hpr_t[0], "p": base_hpr_t[1],
                             "r": base_hpr_t[2],
                         },
                         "base_daytime_minutes": int(base_daytime_mins),
-                        "applied_daytime_minutes": applied_time,
+                        "applied_daytime_minutes": int(applied_time),
                         "target_volume": float(target),
+                        "fill_class": fill_class,
+                        "max_volume": (float(max_volume)
+                                       if max_volume is not None else None),
                         "model_key":   model_key,
                         "texture_key": texture_key,
                     }
+                    if depth_settings is not None:
+                        extra_meta["depth_settings"] = dict(depth_settings)
+                    if lidar_settings is not None:
+                        extra_meta["lidar_settings"] = dict(lidar_settings)
+                    if is_empty:
+                        # В сцене нет final_model, поэтому save_single_render
+                        # объём посчитать не может и записал бы null. Для
+                        # пустого кузова это именно 0, а не «неизвестно».
+                        extra_meta["actual_volume"] = 0.0
 
-                    prefix = (
-                        f"i{i:03d}_vol{target:07.2f}_"
-                        f"v{v_idx:02d}_{v_name}"
-                    )
-
-                    out_dir = (
-                        "renders/dataset_segmentation"
-                        if dataset_type == "segmentation"
-                        else "renders/dataset"
-                    )
+                    prefix = (f"i{i:04d}_vol{target:07.2f}_"
+                              f"v{v_idx:02d}_{variant['name']}")
                     try:
                         ok = ru.save_single_render(
                             output_dir=out_dir,
                             filename_prefix=prefix,
                             extra_metadata=extra_meta,
-                            dataset_type=dataset_type,
-                            random_background=random_background,
-                            gemini=gemini,
+                            outputs=outputs,
+                            depth_settings=depth_settings,
+                            lidar_settings=lidar_settings,
+                            random_background=scene["random_background"],
+                            gemini=False,
                             shadow_band=shadow_band,
-                            cloth=cloth,
+                            cloth=scene["cloth"],
+                            cloth_probability=scene["cloth_probability"],
                         )
                         if ok:
                             ok_count += 1
-                            print(f"[SaveRender] {i+1}/{count} "
-                                  f"v={v_name} target={target:.2f} saved")
                         else:
-                            print(f"[SaveRender] {i+1}/{count} "
-                                  f"v={v_name} returned False")
+                            print(f"[Dataset] {frame_no}/{total} "
+                                  f"({variant['name']}) кадр не подтверждён")
                     except Exception as exc:
-                        print(f"[SaveRender] {i+1}/{count} "
-                              f"v={v_name} save failed: {exc}")
+                        print(f"[Dataset] {frame_no}/{total} "
+                              f"({variant['name']}) не сохранён: {exc}")
                     QApplication.processEvents()
 
-                # Восстановить базовую позу и время после всех вариантов
-                # текущей итерации, чтобы следующий _on_run_simulation
-                # стартовал с того же состояния, что и пользователь видит.
+                # Вернуть базовую позу, чтобы следующее наполнение стартовало
+                # из того же состояния, что видит пользователь.
                 cam.setPos(*base_pos_t)
                 cam.setHpr(*base_hpr_t)
-                _set_daytime(base_daytime_mins)
         finally:
-            # Вернуть Qt-таймеры (taskMgr.step/рендер/телеметрия) — .start()
-            # без аргумента повторно использует прежний интервал.
-            for _t in _paused_timers:
+            _set_sun_overhead(False)
+            _set_daytime(base_daytime_mins)
+            # Вернуть Qt-таймеры — .start() без аргумента переиспользует
+            # прежний интервал.
+            for timer in paused_timers:
                 try:
-                    _t.start()
+                    timer.start()
                 except Exception:
                     pass
-            # Вернуть fly_cam в его прежнее состояние.
-            if fc is not None and hasattr(fc, "set_frozen") and prev_frozen is not None:
+            if (fly_cam is not None and hasattr(fly_cam, "set_frozen")
+                    and prev_frozen is not None):
                 try:
-                    fc.set_frozen(bool(prev_frozen))
+                    fly_cam.set_frozen(bool(prev_frozen))
                 except Exception:
                     pass
             self.btn_save_render.setText(original_text)
             self.btn_save_render.setEnabled(True)
-        print(f"[SaveRender] saved {ok_count} render(s) across "
-              f"{count} iteration(s); max_volume={max_volume}")
+            if btn_setup is not None:
+                btn_setup.setEnabled(True)
 
-    def _run_random_seg_dataset(self, *, count, max_volume, model_key,
-                                texture_key, random_background, gemini,
-                                base_daytime_mins, set_daytime,
-                                render_dataset_type, ru, cloth=False,
-                                full_pct=0.0, empty_pct=0.0) -> None:
-        """Датасет сегментации со случайными кадрами.
-
-        Каждый снимок — полностью новая сцена: новое случайное наполнение
-        случайного объёма (0..125% max_volume), случайная поза камеры в текущих
-        рамках (± ANG_DEG по heading/pitch, ± OFFSET_M по горизонтали/
-        вертикали). Освещение переопределяется: солнце ЖЁСТКО ставится в
-        зенит (светит вертикально сверху) через set_sun_overhead — не через
-        время суток, а прямым переопределением направления солнца. Теневой
-        полосы нет. Маска сегментации и json сохраняются как в обычном
-        сегментационном датасете.
-        """
-        from PyQt6.QtWidgets import QApplication
-
-        def _set_sun_overhead(enable=True):
-            """Пин солнца в зенит (или снятие) на активном рендерере."""
-            app = getattr(self, "panda_app", None)
-            if app is not None and hasattr(app, "set_sun_overhead"):
-                try:
-                    app.set_sun_overhead(enable)
-                except Exception as exc:
-                    print(f"[SaveRender/rand] sun overhead failed: {exc}")
-
-        # Те же рамки, что и у обычного датасета.
-        OFFSET_M = 0.05
-        ANG_DEG = 10.0
-        # Ожидание после генерации ландшафта и перед снятием рендера: ждём
-        # по ОБОИМ условиям — не меньше WAIT_FRAMES реальных кадров пайплайна
-        # И не меньше WAIT_SECONDS секунд. Свежий меш наполнения + его 8K-
-        # текстуры доезжают до GPU лениво; голый time.sleep НЕ гонит кадры
-        # (он лишь блокирует QTimer, который и делает taskMgr.step), поэтому
-        # ждём именно кадрами, а секунды — запас для медленной загрузки.
-        WAIT_FRAMES = 60
-        WAIT_SECONDS = 1.0
-
-        def _settle_wait(frames=WAIT_FRAMES, seconds=WAIT_SECONDS):
-            """Ждём по ОБОИМ условиям: не меньше `frames` РЕАЛЬНО выполненных
-            кадров и не меньше `seconds` секунд.
-
-            Кадры считаем по фактически ВЫПОЛНЕННЫМ (pump.step возвращает их
-            число): если считать попытки, часть шагов Panda молча игнорирует
-            как рекурсивные, и «60 кадров» означают сильно меньше — сцена не
-            успевает сойтись к моменту снимка.
-
-            КРИТИЧНО: у цикла ОБЯЗАН быть выход, не зависящий от числа
-            выполненных кадров. Если мы сами оказались внутри кадра (насос
-            подавляет повторный вход и возвращает 0), кадры отсюда не
-            продвинутся НИКОГДА — и `while n < frames` висел бы вечно, ровно
-            как «после пайплайна ничего не происходит». Поэтому есть и
-            детектор простоя, и жёсткий дедлайн: лучше выйти рано и дать
-            захвату честно отказаться, чем повесить приложение."""
-            pump = getattr(self.panda_app, "frame_pump", None)
-            start = time.perf_counter()
-            deadline = start + max(seconds * 4.0, seconds + 15.0)
-            n = 0
-            stalled = 0
-            while True:
-                if pump is not None:
-                    done = pump.step(1)
-                    n += done
-                    stalled = 0 if done else stalled + 1
-                else:
-                    self.panda_app.taskMgr.step()
-                    n += 1
-                # processEvents держит UI живым; тик _panda_timer, доехавший
-                # отсюда, отсекается защитой насоса от повторного входа.
-                QApplication.processEvents()
-
-                now = time.perf_counter()
-                if n >= frames and (now - start) >= seconds:
-                    break
-                if stalled >= 50:
-                    print("[SaveRender] кадры не продвигаются (вызов изнутри "
-                          "кадра); выхожу из ожидания, чтобы не зависнуть.")
-                    break
-                if now >= deadline:
-                    print(f"[SaveRender] дедлайн ожидания: выполнено {n} из "
-                          f"{frames} кадров за {now - start:.1f} c — иду "
-                          f"дальше.")
-                    break
-                time.sleep(0.005)                   # мягкая пауза, без простоя
-
-        rp = getattr(self, "right_panel", None)
-        ok_count = 0
-
-        # Потолок объёма: 125% паспортного максимума (перегруз — валидный
-        # кейс для обучения). Он же считается «текущим максимумом» для доли
-        # полных кузовов.
-        VOLUME_CEILING_K = 1.35
-        try:
-            full_pct = max(0.0, min(100.0, float(full_pct)))
-            empty_pct = max(0.0, min(100.0, float(empty_pct)))
-        except (TypeError, ValueError):
-            full_pct = empty_pct = 0.0
-        if full_pct + empty_pct > 100.0:
-            empty_pct = max(0.0, 100.0 - full_pct)
-
-        # Минимальный объём для «случайной» доли. РОВНО 0 просить у сервера
-        # нельзя: TLS_client кладёт target_volume в payload только при значении
-        # > 0, поэтому 0 доезжает как «объём не задан», Z ландшафта берётся из
-        # fallback landscape_offset_z=1.9375 и получается обычный (каждый раз
-        # разный из-за случайного seed) НЕПУСТОЙ кузов с ярлыком vol0000.00.
-        # Пустой кузов делается отдельной веткой (empty=True), без сервера.
-        MIN_FRACTION = 0.02
-
-        for i in range(count):
-            # Объём наполнения по заданному распределению: full_pct кадров —
-            # полный кузов (95–100% потолка), empty_pct — пустой, остальные —
-            # равномерно случайный объём от 0 до потолка.
-            fill_class = "random"
-            if max_volume is not None:
-                ceiling = VOLUME_CEILING_K * float(max_volume)
-                roll = random.uniform(0.0, 100.0)
-                if roll < full_pct:
-                    fill_class = "full"
-                    target = random.uniform(0.95, 1.0) * ceiling
-                elif roll < full_pct + empty_pct:
-                    fill_class = "empty"
-                    target = 0.0
-                else:
-                    # Нижняя граница строго > 0: ровно 0 ушёл бы в fallback и
-                    # дал бы наполненный кузов с ярлыком «0».
-                    target = random.uniform(MIN_FRACTION * ceiling, ceiling)
-            else:
-                target = float(rp.current_target_volume()) if rp else 0.0
-                fill_class = "empty" if target <= 0.0 else "random"
-            is_empty = (fill_class == "empty")
-
-            self.btn_save_render.setText(f"{i+1}/{count}")
-            QApplication.processEvents()
-
-            # Новое наполнение для этой итерации (для пустого кузова — снятие
-            # старого меша наполнения без обращения к серверу).
-            try:
-                self._on_run_simulation({
-                    "model_key":     model_key,
-                    "texture_key":   texture_key,
-                    "target_volume": float(target),
-                    "empty":         is_empty,
-                })
-            except Exception as exc:
-                print(f"[SaveRender/rand] pipeline {i+1} failed: {exc}")
-                QApplication.processEvents()
-                continue
-
-            # Дать финальным кадрам пайплайна отрисоваться (свежий меш +
-            # текстуры доезжают до GPU): ждём 60 кадров И ≥1 c.
-            _settle_wait()
-
-            cam = self.panda_app.camera
-            base_pos = cam.getPos()
-            base_hpr = cam.getHpr()
-            base_pos_t = (float(base_pos.x), float(base_pos.y),
-                          float(base_pos.z))
-            base_hpr_t = (float(base_hpr.x), float(base_hpr.y),
-                          float(base_hpr.z))
-
-            # Случайная поза камеры в текущих рамках.
-            dh = random.uniform(-ANG_DEG, ANG_DEG)
-            dp = random.uniform(-ANG_DEG, ANG_DEG)
-            lat = random.uniform(-OFFSET_M, OFFSET_M)
-            vert = random.uniform(-OFFSET_M, OFFSET_M)
-
-            cam.setPos(*base_pos_t)
-            cam.setHpr(base_hpr_t[0] + dh, base_hpr_t[1] + dp, base_hpr_t[2])
-            cam.setPos(cam, lat, 0.0, vert)
-
-            # Освещение: солнце жёстко в зенит (вертикально сверху) —
-            # переопределяем направление солнца напрямую, а не через время.
-            _set_sun_overhead(True)
-
-            # Дать Panda обработать новую позу/освещение перед снимком:
-            # снова ждём 60 кадров И ≥1 c (PSSM/TAA сходятся, ресурсы на GPU).
-            _settle_wait()
-
-            self.btn_save_render.setText(f"{i+1}/{count}")
-            QApplication.processEvents()
-
-            variant_params = {
-                "dh": dh, "dp": dp, "lat": lat, "vert": vert,
-                "light": "overhead",
-            }
-            extra_meta = {
-                "render_type": "dataset",
-                "dataset_type": render_dataset_type,
-                "dataset_mode": "segmentation_random",
-                "random_background": random_background,
-                "gemini": gemini,
-                "light_mode": "overhead",
-                "sun_overhead": True,
-                "shadow_band": False,
-                "iteration": i,
-                "iteration_total": count,
-                "variant": "random",
-                "variant_index": 0,
-                "variant_params": variant_params,
-                "camera_mode": getattr(self, "_camera_mode", None),
-                "base_camera_position": {
-                    "x": base_pos_t[0], "y": base_pos_t[1], "z": base_pos_t[2],
-                },
-                "base_camera_rotation": {
-                    "h": base_hpr_t[0], "p": base_hpr_t[1], "r": base_hpr_t[2],
-                },
-                "base_daytime_minutes": int(base_daytime_mins),
-                "applied_daytime_minutes": int(base_daytime_mins),
-                "target_volume": float(target),
-                "fill_class":  fill_class,
-                "max_volume":  (float(max_volume)
-                                if max_volume is not None else None),
-                "model_key":   model_key,
-                "texture_key": texture_key,
-            }
-            if is_empty:
-                # В сцене нет final_model, поэтому save_single_render посчитать
-                # объём не может и записал бы null. Для пустого кузова это
-                # именно 0, а не «неизвестно».
-                extra_meta["actual_volume"] = 0.0
-
-            prefix = f"r{i:04d}_vol{target:07.2f}_{fill_class}"
-            out_dir = "renders/dataset_segmentation_random"
-            try:
-                ok = ru.save_single_render(
-                    output_dir=out_dir,
-                    filename_prefix=prefix,
-                    extra_metadata=extra_meta,
-                    dataset_type=render_dataset_type,
-                    random_background=random_background,
-                    gemini=gemini,
-                    shadow_band=False,
-                    also_depth=True,
-                    cloth=cloth,
-                )
-                if ok:
-                    ok_count += 1
-                    print(f"[SaveRender/rand] {i+1}/{count} "
-                          f"target={target:.2f} saved")
-                else:
-                    print(f"[SaveRender/rand] {i+1}/{count} returned False")
-            except Exception as exc:
-                print(f"[SaveRender/rand] {i+1}/{count} save failed: {exc}")
-
-            # Вернуть базовую позу для следующей итерации.
-            cam.setPos(*base_pos_t)
-            cam.setHpr(*base_hpr_t)
-            QApplication.processEvents()
-
-        # Снять переопределение солнца и вернуть время суток из UI.
-        _set_sun_overhead(False)
-        set_daytime(base_daytime_mins)
-        print(f"[SaveRender/rand] saved {ok_count} random-seg render(s) "
-              f"across {count} iteration(s); max_volume={max_volume}")
+        print(f"[Dataset] готово: сохранено {ok_count} из {total} кадров; "
+              f"каталог {out_dir}")
 
     def _update_telemetry(self) -> None:
         if self.panda_app is None:
