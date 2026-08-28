@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QDialog, QWidget, QFrame, QLabel, QPushButton, QCheckBox, QRadioButton,
     QButtonGroup, QSpinBox, QDoubleSpinBox, QLineEdit, QVBoxLayout,
     QHBoxLayout, QGridLayout, QScrollArea, QSizePolicy, QFileDialog,
-    QColorDialog, QGraphicsDropShadowEffect,
+    QColorDialog, QGraphicsDropShadowEffect, QStackedWidget,
 )
 
 from src.ui.ui_theme import (
@@ -257,12 +257,189 @@ class _Section(QFrame):
         row.setSpacing(8)
         row.addWidget(_label(title, size=12), 0, Qt.AlignmentFlag.AlignVCenter)
         row.addStretch(1)
+        # Диапазон «от … до» рядом с подписью требует под 450 px минимума и
+        # в одиночку решает, сколько колонок влезет в окно. Такие поля уходят
+        # на свою строку под подписью.
+        if len(widgets) >= 3:
+            wrap.addLayout(row)
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addStretch(1)
         for widget in widgets:
             row.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
         wrap.addLayout(row)
         if hint_text:
             wrap.addWidget(_hint(hint_text))
         self.body.addLayout(wrap)
+
+
+class _Columns(QWidget):
+    """Раскладка разделов в N колонок, где N зависит от ширины окна.
+
+    Раньше страница была жёстко трёхколоночной с минимумом 310 px на
+    колонку: на развёрнутом во весь экран окне половина ширины пустовала,
+    а всё содержимое всё равно приходилось прокручивать. Здесь число
+    колонок пересчитывается на каждом изменении ширины, а разделы
+    раскладываются жадно — очередной уходит в самую короткую колонку,
+    поэтому низ страницы получается ровным и прокручивать почти нечего.
+    """
+
+    def __init__(self, min_col=340, max_col=560, max_cols=4, spacing=12):
+        super().__init__()
+        self.setStyleSheet("background: transparent;")
+        self._items: list[QWidget] = []
+        self._cols = 0
+        self._cw = 0
+        self._min_col = int(min_col)
+        self._min_cache = None
+        self._max_col = int(max_col)
+        self._max_cols = int(max_cols)
+        self._spacing = int(spacing)
+        self._row = QHBoxLayout(self)
+        # Справа оставлен зазор под полосу прокрутки страницы.
+        self._row.setContentsMargins(0, 2, 10, 2)
+        self._row.setSpacing(spacing)
+
+    def add(self, widget):
+        self._items.append(widget)
+        self._min_cache = None
+        self._cols = 0            # заставить перестроить на ближайшем показе
+        return widget
+
+    def _eff_min(self):
+        """Колонка не может быть уже самого широкого поля в разделах."""
+        if self._min_cache is None:
+            widest = max([w.minimumSizeHint().width() for w in self._items]
+                         or [0])
+            self._min_cache = max(self._min_col, widest)
+        return self._min_cache
+
+    def _usable(self, width):
+        margins = self._row.contentsMargins()
+        return max(1, int(width) - margins.left() - margins.right())
+
+    def _wanted(self, width):
+        if not self._items:
+            return 1
+        free = self._usable(width) + self._spacing
+        fit = free // (self._eff_min() + self._spacing)
+        return max(1, min(self._max_cols, len(self._items), int(fit)))
+
+    @staticmethod
+    def _item_height(widget, width):
+        # У разделов внутри есть переносимые подписи, поэтому высота зависит
+        # от ширины колонки — sizeHint по текущей ширине тут врёт.
+        if widget.hasHeightForWidth():
+            return max(1, widget.heightForWidth(width))
+        return max(1, widget.sizeHint().height())
+
+    def col_width(self, width):
+        cols = self._wanted(width)
+        free = self._usable(width) - (cols - 1) * self._spacing
+        return max(self._eff_min(), min(self._max_col, free // cols))
+
+    def ideal_height(self, width):
+        """Высота, при которой странице не понадобится прокрутка."""
+        cols = self._wanted(width)
+        cw = self.col_width(width)
+        heights = [0] * cols
+        for widget in self._items:
+            idx = heights.index(min(heights))
+            heights[idx] += self._item_height(widget, cw) + self._spacing
+        top, _, bottom = (self._row.contentsMargins().top(), 0,
+                          self._row.contentsMargins().bottom())
+        return max(heights or [0]) + top + bottom
+
+    def _relayout(self, cols):
+        # Сначала вынимаем разделы из старых колонок, иначе deleteLater
+        # унесёт их с собой.
+        for widget in self._items:
+            widget.setParent(None)
+        while self._row.count():
+            item = self._row.takeAt(0)
+            holder = item.widget()
+            if holder is not None:
+                holder.deleteLater()
+
+        cw = self.col_width(self.width())
+        lays, heights = [], []
+        for _ in range(cols):
+            holder = QWidget()
+            holder.setStyleSheet("background: transparent;")
+            lay = QVBoxLayout(holder)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(self._spacing)
+            # Без потолка одинокий раздел растягивался бы на всю ширину
+            # экрана, и строка подписи уезжала от своего поля на метр.
+            holder.setFixedWidth(cw)
+            lays.append(lay)
+            heights.append(0)
+            self._row.addWidget(holder, 1)
+        self._row.addStretch(1)
+
+        for widget in self._items:
+            idx = heights.index(min(heights))
+            lays[idx].addWidget(widget)
+            widget.setVisible(True)   # setParent(None) выставил скрытие явно
+            heights[idx] += self._item_height(widget, cw)
+        # Колонку с растягивающимся разделом (превью глубины) распорка снизу
+        # прижала бы к верху и оставила бы превью крошечным.
+        for lay in lays:
+            grows = any(
+                lay.itemAt(i).widget() is not None
+                and lay.itemAt(i).widget().sizePolicy().verticalPolicy()
+                == QSizePolicy.Policy.Expanding
+                for i in range(lay.count())
+            )
+            if not grows:
+                lay.addStretch(1)
+        self._cols = cols
+        self._cw = cw
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cols = self._wanted(self.width())
+        if cols != self._cols or self.col_width(self.width()) != self._cw:
+            self._relayout(cols)
+
+
+class _NavButton(QPushButton):
+    """Пункт бокового списка страниц: заголовок, подпись и метка состояния."""
+
+    def __init__(self, title, subtitle):
+        super().__init__()
+        self._title = title
+        self._subtitle = subtitle
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(46)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(
+            "QPushButton {"
+            "  text-align: left; padding: 6px 10px;"
+            "  background: transparent;"
+            "  border: 1px solid transparent; border-radius: 6px;"
+            f"  color: {COLOR_TEXT_MUTED}; font-size: 12px;"
+            "}"
+            "QPushButton:hover { background: rgba(255,255,255,10); }"
+            "QPushButton:checked {"
+            "  background: rgba(0, 255, 136, 22);"
+            f"  border: 1px solid {COLOR_ACCENT};"
+            f"  color: {COLOR_TEXT}; font-weight: 600;"
+            "}"
+        )
+        self._render()
+
+    def set_subtitle(self, text):
+        if text != self._subtitle:
+            self._subtitle = text
+            self._render()
+
+    def _render(self):
+        self.setText("\n".join([self._title, self._subtitle])
+                     if self._subtitle else self._title)
+        self.setToolTip(self._subtitle)
 
 
 class _Swatch(QPushButton):
@@ -319,7 +496,10 @@ class DatasetSettingsDialog(QDialog):
     Актуальный конфиг всегда в `config` (нормализованный).
     """
 
-    CARD_MAX = (1080, 780)
+    # Потолок нужен только чтобы на 4K диалог не растянулся на два
+    # метра текста; во всём остальном он занимает почти всё окно.
+    CARD_MAX = (2200, 1500)
+    CARD_MARGIN = (72, 56)
 
     def __init__(self, config, parent=None, panda_app=None):
         super().__init__(parent)
@@ -365,7 +545,7 @@ class DatasetSettingsDialog(QDialog):
         card_lay.setSpacing(12)
         card_lay.addLayout(self._build_header())
         card_lay.addWidget(_hairline())
-        card_lay.addWidget(self._build_scroll(), 1)
+        card_lay.addLayout(self._build_body(), 1)
         card_lay.addWidget(_hairline())
         card_lay.addLayout(self._build_footer())
 
@@ -442,10 +622,93 @@ class DatasetSettingsDialog(QDialog):
     # ------------------------------------------------------------------
     # Содержимое
     # ------------------------------------------------------------------
-    def _build_scroll(self):
+    def _build_body(self):
+        """Боковой список страниц + стек самих страниц.
+
+        Всё содержимое раньше жило в одной прокрутке из трёх колонок: даже
+        на весь экран приходилось листать, а лидар с его двумя десятками
+        полей выталкивал остальное далеко вниз. Теперь разделы разложены по
+        страницам, каждая страница сама раскладывается в столько колонок,
+        сколько влезает по ширине, и почти всегда помещается целиком.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(14)
+
+        self.stack = QStackedWidget()
+        self.stack.setStyleSheet("background: transparent;")
+
+        self._nav_buttons = {}
+        self.grp_nav = QButtonGroup(self)
+        self.grp_nav.setExclusive(True)
+
+        nav_holder = QWidget()
+        nav_holder.setStyleSheet("background: transparent;")
+        nav_holder.setFixedWidth(206)
+        nav = QVBoxLayout(nav_holder)
+        nav.setContentsMargins(0, 0, 0, 0)
+        nav.setSpacing(4)
+        nav.addWidget(_label("РАЗДЕЛЫ", size=10, color=COLOR_TEXT_MUTED,
+                             bold=True))
+        nav.addSpacing(2)
+
+        pages = [
+            ("scope", "Съёмка", "объём, выходы, наполнение",
+             [self._section_scope(), self._section_outputs(),
+              self._section_volume()]),
+            ("capture", "Камера и сцена", "поза, свет, усложнения",
+             [self._section_camera(), self._section_lighting(),
+              self._section_scene()]),
+            ("depth", "Глубина", "превью и диапазон",
+             [self._section_depth_preview(), self._section_depth_range()]),
+            ("segmentation", "Сегментация", "палитра классов",
+             [self._section_segmentation()]),
+            ("lidar", "Лидар", "сенсор, развёртка, вывод",
+             [self._section_lidar_sensor(), self._section_lidar_pattern(),
+              self._section_lidar_output()]),
+        ]
+
+        for index, (key, title, subtitle, sections) in enumerate(pages):
+            btn = _NavButton(title, subtitle)
+            btn.clicked.connect(
+                lambda _=False, i=index: self._go_page(i))
+            if key == "depth":
+                self._depth_page = index
+            self.grp_nav.addButton(btn, index)
+            self._nav_buttons[key] = btn
+            nav.addWidget(btn)
+            self.stack.addWidget(self._build_page(sections))
+
+        nav.addStretch(1)
+        self._nav_subtitles = {k: b._subtitle
+                               for k, b in self._nav_buttons.items()}
+        self.grp_nav.button(0).setChecked(True)
+
+        row.addWidget(nav_holder, 0)
+        divider = QFrame()
+        divider.setFixedWidth(1)
+        divider.setStyleSheet(f"background-color: {COLOR_HAIRLINE};")
+        row.addWidget(divider, 0)
+        row.addWidget(self.stack, 1)
+        return row
+
+    def _go_page(self, index):
+        index = max(0, min(self.stack.count() - 1, int(index)))
+        self.stack.setCurrentIndex(index)
+        btn = self.grp_nav.button(index)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+        # Превью глубины считается только на своей странице, поэтому при
+        # переходе его надо разбудить сразу, не дожидаясь тика таймера.
+        if index == getattr(self, "_depth_page", -1):
+            QTimer.singleShot(0, self._tick_preview)
+
+    def _build_page(self, sections):
+        """Одна страница: прокрутка на случай низкого окна + авто-колонки."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
             "QScrollBar:vertical { background: transparent; width: 8px; }"
@@ -454,43 +717,10 @@ class DatasetSettingsDialog(QDialog):
             "  min-height: 40px; }"
             "QScrollBar::add-line, QScrollBar::sub-line { height: 0; }"
         )
-
-        inner = QWidget()
-        inner.setStyleSheet("background: transparent;")
-        columns = QHBoxLayout(inner)
-        columns.setContentsMargins(2, 2, 8, 2)
-        columns.setSpacing(14)
-
-        left = QVBoxLayout()
-        left.setSpacing(12)
-        left.addWidget(self._section_scope())
-        left.addWidget(self._section_outputs())
-        left.addWidget(self._section_volume())
-        left.addStretch(1)
-
-        middle = QVBoxLayout()
-        middle.setSpacing(12)
-        middle.addWidget(self._section_camera())
-        middle.addWidget(self._section_lighting())
-        middle.addWidget(self._section_scene())
-        middle.addStretch(1)
-
-        right = QVBoxLayout()
-        right.setSpacing(12)
-        right.addWidget(self._section_depth())
-        right.addWidget(self._section_segmentation())
-        right.addWidget(self._section_lidar())
-        right.addStretch(1)
-
-        for col, stretch in ((left, 1), (middle, 1), (right, 1)):
-            holder = QWidget()
-            holder.setStyleSheet("background: transparent;")
-            holder.setLayout(col)
-            holder.setMinimumWidth(310)
-            columns.addWidget(holder, stretch)
-
-        scroll.setWidget(inner)
-        scroll.setMinimumHeight(430)
+        columns = _Columns()
+        for section in sections:
+            columns.add(section)
+        scroll.setWidget(columns)
         return scroll
 
     # -- Объём съёмки ---------------------------------------------------
@@ -509,7 +739,10 @@ class DatasetSettingsDialog(QDialog):
             self.spn_count,
         )
 
-        self.lbl_frames = _label("", size=11, color=COLOR_ACCENT, mono=True)
+        # wrap=True: строка длинная, а без переноса она задаёт минимальную
+        # ширину всей колонки и ломает раскладку на узком окне.
+        self.lbl_frames = _label("", size=11, color=COLOR_ACCENT, mono=True,
+                                 wrap=True)
         sec.add(self.lbl_frames)
 
         path_row = QHBoxLayout()
@@ -767,19 +1000,24 @@ class DatasetSettingsDialog(QDialog):
         return sec
 
     # -- Глубина --------------------------------------------------------
-    def _section_depth(self):
+    def _section_depth_preview(self):
         sec = _Section(
-            "Глубина",
-            "Параметры карты глубины в сохраняемых файлах. Живой оверлей в "
-            "углу экрана они не трогают.",
+            "Глубина · превью",
+            "Живой кадр из того же буфера, что кормит оверлей в углу окна, "
+            "но раскрашенный ПАРАМЕТРАМИ ДАТАСЕТА. Сам оверлей эти "
+            "настройки не трогают.",
         )
+        # Превью тянется по высоте: на широком окне карточка выше самой
+        # длинной страницы, и пустое место логично отдать картинке.
+        sec.setSizePolicy(QSizePolicy.Policy.Preferred,
+                          QSizePolicy.Policy.Expanding)
         depth = self.config["depth"]
 
         self.depth_canvas = QLabel()
-        self.depth_canvas.setFixedHeight(160)
+        self.depth_canvas.setMinimumHeight(200)
         self.depth_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.depth_canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
-                                        QSizePolicy.Policy.Fixed)
+                                        QSizePolicy.Policy.Expanding)
         self.depth_canvas.setStyleSheet(
             "background-color: #050505; border-radius: 6px;"
             f"color: {COLOR_TEXT_MUTED}; font-size: 11px;"
@@ -812,6 +1050,14 @@ class DatasetSettingsDialog(QDialog):
         sec.add_option(self.rb_depth_rainbow,
                        "Радужный градиент: читается глазом, но как обучающий "
                        "сигнал хуже.")
+        return sec
+
+    def _section_depth_range(self):
+        sec = _Section(
+            "Глубина · диапазон",
+            "Что именно попадает в шкалу сохраняемой карты.",
+        )
+        depth = self.config["depth"]
 
         # Границы шкалы заданы ДОЛЕЙ дальней плоскости, а не метрами: шейдер
         # линеаризует z как (2*near) / (far + near - z*(far - near)), то есть
@@ -832,7 +1078,7 @@ class DatasetSettingsDialog(QDialog):
                       "разрешение по глубине внутри кузова.",
                       self.spn_grad_b)
         self.lbl_grad_meters = _label("", size=11, color=COLOR_ACCENT,
-                                      mono=True)
+                                      mono=True, wrap=True)
         sec.add(self.lbl_grad_meters)
 
         self.spn_near = _spin((0.001, 1000.0), depth["near"], 0.01,
@@ -913,9 +1159,9 @@ class DatasetSettingsDialog(QDialog):
         return sec
 
     # -- Лидар ----------------------------------------------------------
-    def _section_lidar(self):
+    def _section_lidar_sensor(self):
         sec = _Section(
-            "Лидар",
+            "Лидар · сенсор",
             "Виртуальный 3D-лидар стоит В КАМЕРЕ и наклоняется вместе с ней, "
             "но поле зрения у него СВОЁ — по умолчанию 360°×90°, как у "
             "Unitree 4D LiDAR L2. Он видит и то, что позади камеры, и бьёт "
@@ -982,6 +1228,27 @@ class DatasetSettingsDialog(QDialog):
             self.spn_lid_fov_v,
         )
 
+        self.spn_lid_rmin = _spin((0.0, 1000.0), lid["min_range_m"], 0.05,
+                                  decimals=2, suffix=" м", width=88)
+        self.spn_lid_rmax = _spin((0.1, 10000.0), lid["max_range_m"], 5.0,
+                                  decimals=1, suffix=" м", width=88)
+        sec.add_field(
+            "Дальность",
+            "Ближе минимума и дальше максимума возвратов нет. Максимум "
+            "заодно отсекает небосвод и дальнюю бутафорию сцены.",
+            self.spn_lid_rmin, _label("…", size=12, color=COLOR_TEXT_MUTED),
+            self.spn_lid_rmax,
+        )
+        return sec
+
+    def _section_lidar_pattern(self):
+        sec = _Section(
+            "Лидар · развёртка",
+            "Как луч обходит поле зрения. Часть полей принадлежит только "
+            "одной механике — лишние гаснут сами.",
+        )
+        lid = self.config["lidar"]
+
         self.grp_lid_pattern = QButtonGroup(self)
         self.rb_lid_rosette = _radio("Розетка", lid["pattern"] != "spin")
         self.rb_lid_spin = _radio("Вращение (как у L2)",
@@ -1001,18 +1268,6 @@ class DatasetSettingsDialog(QDialog):
                        "оборот, через 9.25° по азимуту. Единственная "
                        "развёртка, дающая круговой обзор 360°×90°.")
 
-        self.spn_lid_rmin = _spin((0.0, 1000.0), lid["min_range_m"], 0.05,
-                                  decimals=2, suffix=" м", width=88)
-        self.spn_lid_rmax = _spin((0.1, 10000.0), lid["max_range_m"], 5.0,
-                                  decimals=1, suffix=" м", width=88)
-        sec.add_field(
-            "Дальность",
-            "Ближе минимума и дальше максимума возвратов нет. Максимум "
-            "заодно отсекает небосвод и дальнюю бутафорию сцены.",
-            self.spn_lid_rmin, _label("…", size=12, color=COLOR_TEXT_MUTED),
-            self.spn_lid_rmax,
-        )
-
         self.spn_lid_bias = _spin((0.05, 8.0), lid["center_bias"], 0.05,
                                   decimals=2, width=88)
         sec.add_field(
@@ -1025,26 +1280,6 @@ class DatasetSettingsDialog(QDialog):
             self.spn_lid_bias,
         )
 
-        self.spn_lid_jit = _spin((0.0, 5.0), lid["jitter_deg"], 0.01,
-                                 decimals=3, suffix="°", width=88)
-        sec.add_field(
-            "Дрожание луча",
-            "Угловая неровность развёртки: люфт привода и дрожание клиньев. "
-            "Без неё траектория идеально гладкая, и сеть выучивает саму "
-            "развёртку вместо формы груза.",
-            self.spn_lid_jit,
-        )
-
-        self.spn_lid_drop = _spin((0.0, 90.0), lid["dropout_pct"], 0.5,
-                                  decimals=1, suffix="%", width=88)
-        sec.add_field(
-            "Потери возвратов",
-            "Доля потерянных точек. На скользящих углах теряется кратно "
-            "больше — отсюда характерные прорехи на бортах и на дальнем "
-            "скате насыпи.",
-            self.spn_lid_drop,
-        )
-
         self.spn_lid_circle = _spin((8.0, 100000.0), lid["beams_per_circle"],
                                     100.0, decimals=0, width=88)
         self.spn_lid_ratio = _spin((0.01, 4.0), lid["circle_ratio"], 0.01,
@@ -1055,6 +1290,15 @@ class DatasetSettingsDialog(QDialog):
             "Меньше — реже точки вдоль самой траектории, крупнее рисунок.",
             self.spn_lid_circle,
         )
+        sec.add_field(
+            "Отношение клиньев",
+            "Скорость второго клина к первому. Иррациональное отношение "
+            "(0.618 — золотое) не даёт траектории замкнуться: обороты не "
+            "ложатся в те же борозды, развёртка непериодическая. Круглые "
+            "дроби диалог сам чуть сдвигает.",
+            self.spn_lid_ratio,
+        )
+
         self.spn_lid_spin_hz = _spin((0.01, 1000.0), lid["spin_hz"], 0.05,
                                      decimals=2, suffix=" Гц", width=88)
         self.spn_lid_vert_hz = _spin((0.01, 100000.0), lid["vertical_hz"],
@@ -1082,14 +1326,33 @@ class DatasetSettingsDialog(QDialog):
             "с частотами развёртки задаёт шаг точек по траектории.",
             self.spn_lid_rate,
         )
+        return sec
 
+    def _section_lidar_output(self):
+        sec = _Section(
+            "Лидар · шум и вывод",
+            "Что портит идеальное облако и в каком виде оно ложится в файл.",
+        )
+        lid = self.config["lidar"]
+
+        self.spn_lid_jit = _spin((0.0, 5.0), lid["jitter_deg"], 0.01,
+                                 decimals=3, suffix="°", width=88)
         sec.add_field(
-            "Отношение клиньев",
-            "Скорость второго клина к первому. Иррациональное отношение "
-            "(0.618 — золотое) не даёт траектории замкнуться: обороты не "
-            "ложатся в те же борозды, развёртка непериодическая. Круглые "
-            "дроби диалог сам чуть сдвигает.",
-            self.spn_lid_ratio,
+            "Дрожание луча",
+            "Угловая неровность развёртки: люфт привода и дрожание клиньев. "
+            "Без неё траектория идеально гладкая, и сеть выучивает саму "
+            "развёртку вместо формы груза.",
+            self.spn_lid_jit,
+        )
+
+        self.spn_lid_drop = _spin((0.0, 90.0), lid["dropout_pct"], 0.5,
+                                  decimals=1, suffix="%", width=88)
+        sec.add_field(
+            "Потери возвратов",
+            "Доля потерянных точек. На скользящих углах теряется кратно "
+            "больше — отсюда характерные прорехи на бортах и на дальнем "
+            "скате насыпи.",
+            self.spn_lid_drop,
         )
 
         self.grp_lid_frame = QButtonGroup(self)
@@ -1229,12 +1492,34 @@ class DatasetSettingsDialog(QDialog):
         for spin in (self.spn_full, self.spn_empty, self.spn_ceiling):
             spin.setEnabled(random_vol)
 
+        self._sync_nav()
+
         if not (color_on or depth_on or seg_on):
             self.lbl_out_warn.setText(
                 "Выберите хотя бы один файл — иначе кадр рендерится впустую.")
         else:
             self.lbl_out_warn.setText("")
         self._update_summary()
+
+    def _sync_nav(self):
+        """Подписи страниц показывают, что сейчас реально снимается.
+
+        Раньше про выключенную глубину можно было узнать, только пролистав
+        до её полей. Теперь это видно прямо в списке разделов.
+        """
+        if not getattr(self, "_nav_buttons", None):
+            return
+        states = {
+            "depth": self.chk_out["depth"].isChecked(),
+            "segmentation": self.chk_out["segmentation"].isChecked(),
+            "lidar": self.chk_out["lidar"].isChecked(),
+        }
+        for key, on in states.items():
+            btn = self._nav_buttons.get(key)
+            if btn is None:
+                continue
+            btn.set_subtitle(self._nav_subtitles[key] if on
+                             else "выход выключен")
 
     def _refresh_lidar_backend(self):
         """Чем будем трассировать. Считается ЛЕНИВО и один раз.
@@ -1274,6 +1559,9 @@ class DatasetSettingsDialog(QDialog):
         self.lbl_frames.setText(
             f"{per_fill} кадр(ов) с наполнения → {total} кадров всего")
         self.lbl_summary.setText(f"{total} кадров · {files} файла на кадр")
+        if getattr(self, "_nav_buttons", None):
+            self._nav_buttons["scope"].set_subtitle(
+                f"{total} кадров · {files} файла")
         if hasattr(self, "lbl_lidar_backend") and \
                 self.chk_out["lidar"].isChecked():
             self._refresh_lidar_backend()
@@ -1289,6 +1577,11 @@ class DatasetSettingsDialog(QDialog):
 
     def _tick_preview(self):
         if not self._ready:
+            return
+        # Чтение буфера глубины стоит кадра; на других страницах превью всё
+        # равно не видно, поэтому там таймер не делает ничего.
+        if hasattr(self, "stack") and \
+                self.stack.currentIndex() != getattr(self, "_depth_page", -1):
             return
         grayscale = self.rb_depth_gray.isChecked()
 
@@ -1469,6 +1762,38 @@ class DatasetSettingsDialog(QDialog):
     # ------------------------------------------------------------------
     # Жизненный цикл
     # ------------------------------------------------------------------
+    # Ширина всего, что окружает колонки страницы: боковой список,
+    # разделитель, поля карточки и полоса прокрутки. Считается один раз по
+    # факту первой раскладки, до неё берётся эта оценка.
+    CHROME_W = 283
+    CHROME_H = 140
+
+    def _fit_card(self, avail_w, avail_h):
+        """Подобрать размер карточки под содержимое.
+
+        Растягивать диалог на весь экран бессмысленно: колонки шире 560 px
+        читаются плохо, и при пяти колонках половина карточки оставалась бы
+        пустой. Поэтому перебираем варианты «сколько колонок», берём самый
+        узкий, при котором ни одна страница не требует прокрутки, и уже под
+        него подгоняем высоту.
+        """
+        pages = [self.stack.widget(i).widget()
+                 for i in range(self.stack.count())]
+        best = None
+        for content_w in (440, 892, 1344, 1796):
+            card_w = min(avail_w, content_w + self.CHROME_W)
+            # +24 — запас на округления переноса подписей: без него страница
+            # промахивается на десяток пикселей и получает полосу прокрутки
+            # ради одной строки.
+            need_h = max(page.ideal_height(card_w - self.CHROME_W)
+                         for page in pages) + self.CHROME_H + 24
+            best = (card_w, need_h)
+            if need_h <= avail_h or card_w >= avail_w:
+                break
+        card_w, need_h = best
+        self.card.setFixedSize(max(760, card_w),
+                               max(520, min(avail_h, need_h)))
+
     def showEvent(self, event):
         parent = self.parentWidget()
         top = parent.window() if parent is not None else None
@@ -1476,12 +1801,31 @@ class DatasetSettingsDialog(QDialog):
             geo = top.geometry()
             self.setGeometry(geo)
             max_w, max_h = self.CARD_MAX
-            self.card.setFixedSize(
-                min(max_w, max(720, geo.width() - 120)),
-                min(max_h, max(520, geo.height() - 100)),
-            )
+            mar_w, mar_h = self.CARD_MARGIN
+            self._avail = (min(max_w, max(760, geo.width() - mar_w)),
+                           min(max_h, max(520, geo.height() - mar_h)))
+            self._fit_card(*self._avail)
         super().showEvent(event)
+        QTimer.singleShot(0, self._refit_card)
         QTimer.singleShot(0, self._tick_preview)
+
+    def _refit_card(self):
+        """Уточнить высоту по реальной раскладке.
+
+        Оценка полей выше сделана до первого показа; когда страница уже
+        разложена, ширину колонок и высоту обвязки можно измерить точно.
+        """
+        avail = getattr(self, "_avail", None)
+        page = self.stack.currentWidget()
+        if avail is None or page is None:
+            return
+        viewport = page.viewport().height()
+        if viewport <= 0:
+            return
+        type(self).CHROME_W = max(120, self.card.width()
+                                  - page.viewport().width())
+        type(self).CHROME_H = max(60, self.card.height() - viewport)
+        self._fit_card(*avail)
 
     def closeEvent(self, event):
         self._preview_timer.stop()
@@ -1495,4 +1839,18 @@ class DatasetSettingsDialog(QDialog):
         # дорого, чтобы стартовать от случайного нажатия.
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             return
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            keys = (Qt.Key.Key_1, Qt.Key.Key_2, Qt.Key.Key_3, Qt.Key.Key_4,
+                    Qt.Key.Key_5, Qt.Key.Key_6, Qt.Key.Key_7)
+            if event.key() in keys:
+                self._go_page(keys.index(event.key()))
+                return
+            if event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_PageDown):
+                self._go_page(
+                    (self.stack.currentIndex() + 1) % self.stack.count())
+                return
+            if event.key() in (Qt.Key.Key_Backtab, Qt.Key.Key_PageUp):
+                self._go_page(
+                    (self.stack.currentIndex() - 1) % self.stack.count())
+                return
         super().keyPressEvent(event)
