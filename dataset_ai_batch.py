@@ -56,6 +56,33 @@ RESULT = ROOT / "result"
 STAGE = RESULT / "_stage"
 PLAN_FILE = RESULT / "plan.json"
 
+# Второй датасет («сложные случаи») подключается модулем hardcase_config через
+# --dataset hardcase: он подменяет пути, сборку плана и текст промпта, а вся
+# механика ниже (стейджинг, генерация, коррекция, финализация) общая.
+_PLAN_BUILDER = None      # None -> build_plan() этого модуля
+_PROMPT_BUILDER = None    # None -> build_prompt() этого модуля
+
+
+def configure(dataset: str) -> None:
+    global ROOT, RESULT, STAGE, PLAN_FILE, TOTAL, _PLAN_BUILDER, _PROMPT_BUILDER
+    if dataset == "main":
+        return
+    import hardcase_config as cfg
+    ROOT = cfg.ROOT
+    RESULT = ROOT / "result"
+    STAGE = RESULT / "_stage"
+    PLAN_FILE = RESULT / "plan.json"
+    TOTAL = cfg.TOTAL
+    _PLAN_BUILDER = cfg.build_plan
+    _PROMPT_BUILDER = cfg.build_prompt
+
+
+def prompt_for(rec: dict) -> str:
+    """Промпт для записи плана: сцена передаётся только там, где она есть."""
+    if _PROMPT_BUILDER is None:
+        return build_prompt(rec["engine"], rec["material"], rec["fill"])
+    return _PROMPT_BUILDER(rec["engine"], rec["material"], rec["fill"], rec["scene"])
+
 TOTAL = 500
 SHARE = {"full": 0.45, "empty": 0.40, "partial": 0.15}   # 225 / 200 / 75
 
@@ -95,6 +122,16 @@ CUTOFF_REFERENCE = "r0006_vol0007.53_random_20260723_141356_127246_ai.png"
 # списывается, помогает только повтор с ощутимой задержкой.
 CREATE_RETRIES = 6
 RETRY_BACKOFF_S = 20.0
+# Создание задания платное, поэтому попыток мало; ожидание бесплатное и длинное.
+CREATE_ATTEMPTS = 2
+POLL_TIMEOUT_S = 900
+POLL_INTERVAL_S = 6
+
+# Ошибки, при которых повторять бессмысленно: это состояние аккаунта, а не сети.
+# Прогон прекращается целиком, чтобы не крутить ретраи вхолостую.
+FATAL_ERRORS = ("grace_daily_limit_reached", "daily_limit", "insufficient_credits",
+                "not_enough_credits")
+_ABORT = False
 SEED = 20260814
 
 
@@ -451,43 +488,184 @@ def final_ai_path(rec: dict) -> Path:
     return ai_path(rec)
 
 
+# Авто-загрузка файлов внутри `generate create` регулярно падает на подписи S3
+# (SignatureDoesNotMatch), тогда как отдельная команда `upload create` работает
+# стабильно. Поэтому картинки заливаем заранее и передаём в генерацию по UUID.
+# Идентификаторы кэшируются, так что повторные прогоны не перезаливают файлы.
+_UPLOADS: dict[str, str] = {}
+# stem -> job_id: позволяет пережить перезапуск и не оплачивать кадр дважды.
+_JOBS: dict[str, str] = {}
+_UPLOAD_LOCK: asyncio.Lock | None = None
+
+
+def _uploads_file() -> Path:
+    return STAGE / "uploads.json"
+
+
+def load_uploads() -> None:
+    global _UPLOADS
+    f = _uploads_file()
+    _UPLOADS = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+
+def save_uploads() -> None:
+    _uploads_file().write_text(json.dumps(_UPLOADS, indent=1), encoding="utf-8")
+
+
+def _jobs_file() -> Path:
+    return STAGE / "jobs.json"
+
+
+def load_jobs() -> None:
+    global _JOBS
+    f = _jobs_file()
+    _JOBS = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+
+def save_jobs() -> None:
+    _jobs_file().write_text(json.dumps(_JOBS, indent=1), encoding="utf-8")
+
+
+async def upload_media(path: Path, args) -> str | None:
+    """UUID загруженного файла (из кэша либо свежая загрузка с ретраями)."""
+    key = path.name
+    if key in _UPLOADS:
+        return _UPLOADS[key]
+    for attempt in range(1, CREATE_RETRIES + 1):
+        proc = await asyncio.create_subprocess_exec(
+            args.node, args.cli, "upload", "create", str(path), "--json",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        so, se = await proc.communicate()
+        if proc.returncode == 0:
+            try:
+                uid = json.loads(so.decode("utf-8", "replace")).get("id")
+            except json.JSONDecodeError:
+                uid = None
+            if uid:
+                async with _UPLOAD_LOCK:
+                    _UPLOADS[key] = uid
+                    save_uploads()
+                return uid
+        if attempt < CREATE_RETRIES:
+            await asyncio.sleep(RETRY_BACKOFF_S * attempt)
+    print(f"  UPLOAD-FAIL {path.name}: {se.decode('utf-8', 'replace')[:160]}")
+    return None
+
+
 async def run_one(rec: dict, sem: asyncio.Semaphore, args) -> bool:
+    global _ABORT
+    if _ABORT:
+        return False
     cfg = ENGINES[rec["engine"]]
-    prompt = build_prompt(rec["engine"], rec["material"], rec["fill"])
+    prompt = prompt_for(rec)
     src = STAGE / f"{rec['stem']}.png"
     out = ai_path(rec)
-    cmd = [args.node, args.cli, "generate", "create", cfg["model"],
-           "--prompt", prompt,
-           "--image-references", str(src),
-           "--image-references", str(STAGE / f"{rec['stem']}_seg.png"),
-           "--aspect_ratio", ASPECT,
-           *cfg["extra"],
-           "--wait", "--wait-timeout", WAIT_TIMEOUT, "--json"]
 
     async with sem:
-        for attempt in range(1, CREATE_RETRIES + 1):
+        src_id = await upload_media(src, args)
+        seg_id = await upload_media(STAGE / f"{rec['stem']}_seg.png", args)
+    if not src_id or not seg_id:
+        return False
+
+    # Создание задания и ожидание результата РАЗДЕЛЕНЫ.
+    #
+    # Раньше здесь стоял `generate create --wait`: одна команда и создавала
+    # задание (кредит списывается сразу), и ждала картинку. Любой обрыв во время
+    # ожидания выглядел как ошибка создания, ретрай создавал НОВОЕ платное
+    # задание, а уже оплаченное оставалось висеть на сервере. Прогон 28.08 так
+    # потратил 37 кредитов, отдав 2 кадра.
+    #
+    # Теперь: create возвращает job_id за секунды и сразу пишется в jobs.json,
+    # а ожидание — отдельный бесплатный опрос, который можно повторять сколько
+    # угодно. Даже если процесс убить, задание не потеряется: recover_jobs.py
+    # заберёт его по карте загрузок.
+    job_id = _JOBS.get(rec["stem"])
+    if not job_id:
+        job_id = await create_job(rec, cfg, prompt, src_id, seg_id, sem, args)
+        if not job_id:
+            return False
+    return await collect_job(rec, job_id, out, args)
+
+
+async def create_job(rec, cfg, prompt, src_id, seg_id, sem, args) -> str | None:
+    global _ABORT
+    cmd = [args.node, args.cli, "generate", "create", cfg["model"],
+           "--prompt", prompt,
+           "--image-references", src_id,
+           "--image-references", seg_id,
+           "--aspect_ratio", ASPECT,
+           *cfg["extra"], "--json"]
+    async with sem:
+        # Попыток намеренно мало: команда быстрая, и каждая лишняя попытка —
+        # риск оплатить второе задание для того же кадра.
+        for attempt in range(1, CREATE_ATTEMPTS + 1):
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env=os.environ.copy())
             so, se = await proc.communicate()
             if proc.returncode == 0:
-                url = extract_url(so.decode("utf-8", "replace"))
-                if url:
-                    try:
-                        download(url, out)
-                        print(f"  OK   [{rec['engine']:8s}/{rec['material']:5s}/{rec['fill']:7s}] "
-                              f"{rec['stem']}")
-                        return True
-                    except Exception as e:  # noqa: BLE001
-                        print(f"  DL-ERR {rec['stem']}: {e}")
-                else:
-                    print(f"  NO-URL {rec['stem']}: {so.decode('utf-8', 'replace')[:200]}")
-            else:
-                print(f"  FAIL({proc.returncode}) {rec['stem']} try {attempt}/{CREATE_RETRIES}: "
-                      f"{se.decode('utf-8', 'replace')[:200]}")
-            if attempt < CREATE_RETRIES:
-                await asyncio.sleep(RETRY_BACKOFF_S * attempt)
-        return False
+                jid = extract_job_id(so.decode("utf-8", "replace"))
+                if jid:
+                    async with _UPLOAD_LOCK:
+                        _JOBS[rec["stem"]] = jid
+                        save_jobs()
+                    return jid
+            err = se.decode("utf-8", "replace")
+            if any(k in err for k in FATAL_ERRORS):
+                _ABORT = True
+                print(f"  СТОП: лимит аккаунта — {err[:160]}")
+                return None
+            print(f"  CREATE-FAIL {rec['stem']} {attempt}/{CREATE_ATTEMPTS}: {err[:160]}")
+            if attempt < CREATE_ATTEMPTS:
+                await asyncio.sleep(RETRY_BACKOFF_S)
+    return None
+
+
+async def collect_job(rec, job_id: str, out: Path, args) -> bool:
+    """Опрос статуса задания и загрузка результата. Опрос бесплатный."""
+    deadline = asyncio.get_event_loop().time() + POLL_TIMEOUT_S
+    while asyncio.get_event_loop().time() < deadline:
+        proc = await asyncio.create_subprocess_exec(
+            args.node, args.cli, "generate", "get", job_id, "--json",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        so, _ = await proc.communicate()
+        if proc.returncode == 0:
+            try:
+                d = json.loads(so.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                d = {}
+            status = d.get("status")
+            if status == "completed" and d.get("result_url"):
+                try:
+                    download(d["result_url"], out)
+                    print(f"  OK   [{rec['engine']:8s}/{rec['material']:5s}/"
+                          f"{rec['fill']:7s}] {rec['stem']}")
+                    return True
+                except Exception as e:  # noqa: BLE001
+                    print(f"  DL-ERR {rec['stem']}: {e}")
+            elif status in ("failed", "nsfw", "canceled"):
+                # Задание не даст картинки — снимаем привязку, чтобы кадр можно
+                # было пересоздать осознанно.
+                async with _UPLOAD_LOCK:
+                    _JOBS.pop(rec["stem"], None)
+                    save_jobs()
+                print(f"  JOB-{status.upper()} {rec['stem']}")
+                return False
+        await asyncio.sleep(POLL_INTERVAL_S)
+    print(f"  TIMEOUT {rec['stem']} (job {job_id[:8]} ещё в работе, заберётся позже)")
+    return False
+
+
+def extract_job_id(stdout: str) -> str | None:
+    """`generate create --json` отдаёт список id либо объект с id."""
+    try:
+        d = json.loads(stdout)
+    except json.JSONDecodeError:
+        m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", stdout)
+        return m.group(0) if m else None
+    if isinstance(d, list):
+        return d[0] if d and isinstance(d[0], str) else None
+    return d.get("id") if isinstance(d, dict) else None
 
 
 def extract_url(stdout: str) -> str | None:
@@ -522,9 +700,18 @@ async def do_generate(plan: list[dict], args) -> None:
         print("generate: нечего делать")
         return
     print(f"generate: {len(todo)} кадров, concurrency={args.concurrency}")
+    global _UPLOAD_LOCK
+    _UPLOAD_LOCK = asyncio.Lock()
+    load_uploads()
+    load_jobs()
+    global _ABORT
+    _ABORT = False
     sem = asyncio.Semaphore(args.concurrency)
     res = await asyncio.gather(*(run_one(r, sem, args) for r in todo))
     print(f"generate: готово {sum(res)}/{len(todo)}")
+    if _ABORT:
+        print("generate: ПРЕРВАНО лимитом аккаунта. Уже готовые кадры сохранены; "
+              "перезапустите этот же шаг после сброса лимита — он догенерирует остаток.")
 
 
 def do_fix(plan: list[dict], args) -> None:
@@ -579,6 +766,8 @@ def do_finalize(plan: list[dict]) -> None:
             meta["ai_engine"] = ENGINES[rec["engine"]]["model"]
             meta["ai_material"] = rec["material"]
             meta["ai_fill_class"] = rec["fill"]
+            if "scene" in rec:                 # только у датасета сложных случаев
+                meta["ai_scene"] = rec["scene"]
             meta["ai_offset_corrected"] = img.name.endswith("_ai_fix.png")
             (RESULT / f"{stem}.json").write_text(
                 json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -607,6 +796,8 @@ def print_plan(plan: list[dict]) -> None:
 # ─────────────────────────── CLI ───────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(description="AI-обработка и сборка сегментационного датасета.")
+    ap.add_argument("--dataset", choices=["main", "hardcase"], default="main",
+                    help="main = 13.08 (500 кадров), hardcase = сложные случаи (250)")
     ap.add_argument("--stage-step", dest="step", default="plan",
                     choices=["plan", "stage", "generate", "fix", "crest", "finalize", "all"])
     ap.add_argument("--max", type=int, default=DEFAULT_MAX_PER_RUN,
@@ -620,6 +811,7 @@ def main(argv=None):
     ap.add_argument("--node", default=NODE)
     ap.add_argument("--cli", default=CLI_JS)
     args = ap.parse_args(argv)
+    configure(args.dataset)
 
     if args.show_prompt:
         print(build_prompt(*args.show_prompt))
@@ -629,7 +821,7 @@ def main(argv=None):
     if PLAN_FILE.exists() and not args.replan:
         plan = json.loads(PLAN_FILE.read_text(encoding="utf-8"))
     else:
-        plan = build_plan()
+        plan = (_PLAN_BUILDER or build_plan)()
         PLAN_FILE.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"план записан: {PLAN_FILE}")
 
