@@ -32,3 +32,5 @@ assets/backgrounds/_gemini_cache/
 /renders
 config/tls_config.yaml
 config/higgsfield.json
+/assets/models/generated
+/assets/models/trucks

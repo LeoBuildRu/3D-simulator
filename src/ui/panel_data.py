@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -76,6 +77,14 @@ PLY_EXAMPLES_DIR     = os.path.join(PROJECT_ROOT, "assets", "PLY_examples")
 # reference points / camera presets — those simply aren't provided).
 TRUCKS_MODELS_DIR    = os.path.join(PROJECT_ROOT, "assets", "models", "trucks")
 LOCAL_MODEL_PREFIX   = "local:"
+
+# Комплекты, собранные генератором кузовов (`src/bodygen`). В отличие от
+# одиночных моделей в `trucks/` это ПОЛНЫЕ наборы: кузов, наполнитель и шасси
+# в общих координатах, — то есть их можно грузить как серверные, вместе с
+# генерацией груза, а не только смотреть.
+GENERATED_MODELS_DIR = os.path.join(PROJECT_ROOT, "assets", "models",
+                                    "generated")
+GENERATED_MODEL_PREFIX = "gen:"
 _TRUCK_MODEL_EXTS    = (".bam", ".gltf", ".glb", ".egg.pz", ".egg", ".obj")
 
 # Локальный кэш для скачанных файлов текстур
@@ -246,23 +255,23 @@ def _strip_truck_model_ext(name: str) -> str:
     return name
 
 
-def _scan_local_truck_models() -> Dict[str, dict]:
+def _local_truck_entries() -> List[Tuple[str, dict, str, str]]:
     """
-    Scan `assets/models/trucks/` for local truck models and return
-    {set_key: config}. Two layouts are supported:
+    Пройти `assets/models/trucks/` и вернуть
+    [(set_key, config, stem, model_path)] для каждой найденной модели.
 
-        trucks/<name>.bam            -> single self-contained model file
-        trucks/<name>/<model>.gltf   -> a model living in its own folder
-                                        (first recognised file is used)
+    Вынесено отдельно, потому что нужно дважды: `_scan_local_truck_models`
+    делает из этого словарь конфигов для загрузчика, а
+    `load_model_sets_detailed` берёт `stem`, чтобы найти рядом
+    `<stem>.spec.json` с размерами кузова.
 
-    Each config is minimal — just enough for `load_model_set` to drop the
-    model into the scene:
-        {"model": <display>, "cuzov": <abs path>, "local": True}
+    Поддерживаются две раскладки:
 
-    No ground_plane / max_volume / cam_* keys: per spec, local models
-    don't need reference points or camera presets.
+        trucks/<name>.bam            -> одиночный самодостаточный файл
+        trucks/<name>/<model>.gltf   -> модель в своей папке
+                                        (берётся первый подходящий файл)
     """
-    out: Dict[str, dict] = {}
+    out: List[Tuple[str, dict, str, str]] = []
     if not os.path.isdir(TRUCKS_MODELS_DIR):
         return out
 
@@ -297,12 +306,102 @@ def _scan_local_truck_models() -> Dict[str, dict]:
 
         rel = os.path.relpath(model_path, TRUCKS_MODELS_DIR).replace("\\", "/")
         key = f"{LOCAL_MODEL_PREFIX}{rel}"
-        out[key] = {
+        cfg = {
             "model": f"{_truck_model_display(display_stem)} (локальная)",
             "cuzov": model_path,
             "local": True,
         }
+        out.append((key, cfg, display_stem, model_path))
     return out
+
+
+def _scan_local_truck_models() -> Dict[str, dict]:
+    """
+    Локальные модели из `assets/models/trucks/` в виде {set_key: config}.
+
+    Каждый конфиг минимален — ровно столько, чтобы `load_model_set`
+    положил модель в сцену:
+        {"model": <display>, "cuzov": <abs path>, "local": True}
+
+    Ни ground_plane / max_volume, ни cam_*: по спецификации локальным
+    моделям не нужны ни опорные точки, ни пресеты камеры.
+    """
+    return {key: cfg for key, cfg, _stem, _path in _local_truck_entries()}
+
+
+def _generated_kit_entries() -> List[Tuple[str, dict, str, dict]]:
+    """
+    Комплекты генератора из `assets/models/generated/` в виде
+    [(set_key, config, stem, set_json)].
+
+    Опознаются по `<name>.set.json`, который пишет сам генератор: в нём уже
+    лежат имена частей и объём кузова, так что гадать по файлам не нужно.
+    Комплект регистрируется ОДНОЙ записью со всеми тремя частями — иначе в
+    списке появились бы три отдельные модели, ни одна из которых не грузится
+    целиком.
+
+    `stem` — имя файла без `.set.json`: по нему рядом ищется
+    `<stem>.spec.json` с обмерами кузова (см. `load_model_sets_detailed`).
+    """
+    out: List[Tuple[str, dict, str, dict]] = []
+    if not os.path.isdir(GENERATED_MODELS_DIR):
+        return out
+
+    try:
+        entries = sorted(os.listdir(GENERATED_MODELS_DIR))
+    except OSError as exc:
+        print(f"[panel_data] failed to list models/generated/: {exc}")
+        return out
+
+    for entry in entries:
+        if not entry.endswith(".set.json"):
+            continue
+        stem = entry[: -len(".set.json")]
+        path = os.path.join(GENERATED_MODELS_DIR, entry)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            print(f"[panel_data] {entry}: {exc}")
+            continue
+
+        name = data.get("model") or stem
+
+        def abs_part(key):
+            v = data.get(key)
+            if not v:
+                return None
+            p = os.path.join(GENERATED_MODELS_DIR, v)
+            return p if os.path.exists(p) else None
+
+        cuzov = abs_part("cuzov")
+        if not cuzov:
+            continue
+
+        cfg = {
+            "model": f"{name} (сгенерирован)",
+            "cuzov": cuzov,
+            "local": True,
+        }
+        for src_key, dst_key in (("napolnitel", "napolnitel"),
+                                 ("other", "other"),
+                                 ("target_model", "target_model")):
+            p = abs_part(src_key)
+            if p:
+                cfg[dst_key] = p
+        if data.get("max_volume"):
+            cfg["max_volume"] = float(data["max_volume"])
+        if data.get("ground_plane") is not None:
+            cfg["ground_plane"] = float(data["ground_plane"])
+
+        out.append((f"{GENERATED_MODEL_PREFIX}{name}", cfg, stem, data))
+    return out
+
+
+def _scan_generated_kits() -> Dict[str, dict]:
+    """Комплекты генератора в виде {set_key: config} — см.
+    `_generated_kit_entries`."""
+    return {key: cfg for key, cfg, _stem, _data in _generated_kit_entries()}
 
 
 def _load_local_models_yaml() -> dict:
@@ -317,6 +416,326 @@ def _load_local_models_yaml() -> dict:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Model set metadata — то, что показывает диалог выбора кузова
+# ---------------------------------------------------------------------------
+#: Человекочитаемое имя источника набора.
+MODEL_SOURCE_LABELS = {
+    "server":    "Сервер",
+    "yaml":      "Конфиг",
+    "generated": "Генератор",
+    "local":     "Локальная",
+}
+
+#: Колёсная формула в имени модели: "8x4", "6х4", "8×4".
+_AXLE_RE = re.compile(r"(?<![0-9])([2-9])\s*[xх×]\s*([2-9])(?![0-9])",
+                      re.IGNORECASE)
+
+
+@dataclass
+class ModelSetInfo:
+    """
+    Одна строка в списке кузовов: ключ набора плюс всё, что о нём удалось
+    выяснить, не открывая сам меш.
+
+    Поля намеренно необязательные: у серверных наборов нет обмеров, у
+    локальных .bam без `.spec.json` — ничего, кроме имени файла. UI
+    показывает прочерк там, где данных нет, а не прячет строку.
+    """
+    key: str
+    name: str                      # имя без служебных суффиксов
+    display: str                   # ярлык как в старом комбо-боксе
+    source: str = "server"         # server | yaml | generated | local
+    origin: str = ""               # откуда взялась геометрия
+    chassis: str = ""              # профиль шасси генератора
+    axles: str = ""                # колёсная формула, "8x4"
+    volume: Optional[float] = None          # м³
+    volume_kind: str = ""          # макс. | изм. | расч.
+    length: Optional[float] = None          # внутренние габариты кузова, м
+    width: Optional[float] = None
+    height: Optional[float] = None
+    parts: Tuple[str, ...] = ()    # cuzov / napolnitel / other / target_model
+    file_size: int = 0             # суммарный размер файлов набора, байт
+    mtime: float = 0.0             # время правки кузова (unix)
+    path: str = ""                 # путь к кузову (локальные наборы)
+    ground_plane: Optional[float] = None     # опорная плоскость набора, м
+    ref_rect: Optional[Tuple[float, float]] = None   # прямоугольник points_3d
+    has_camera: bool = False       # есть ли пресет камеры (cam_pos_*)
+    config: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def source_label(self) -> str:
+        return MODEL_SOURCE_LABELS.get(self.source, self.source)
+
+    @property
+    def dims(self) -> Optional[Tuple[float, float, float]]:
+        """(длина, ширина, высота) или None, если обмеров нет."""
+        if self.length is None or self.width is None or self.height is None:
+            return None
+        return (self.length, self.width, self.height)
+
+    @property
+    def kit(self) -> str:
+        """
+        Насколько набор полон. Важно на практике: без `napolnitel` груз
+        не сгенерируется — модель годится только для просмотра (или ей
+        нужен «донор», см. MyApp.load_model_set).
+        """
+        if "napolnitel" in self.parts and "other" in self.parts:
+            return "полный"
+        if "napolnitel" in self.parts:
+            return "кузов + груз"
+        return "только кузов"
+
+    @property
+    def search_text(self) -> str:
+        """Строка, по которой ищет поле поиска в диалоге."""
+        return " ".join(str(x) for x in (
+            self.name, self.key, self.source_label, self.origin,
+            self.chassis, self.axles, self.kit,
+        ) if x).lower()
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """float() без исключений; NaN тоже считается отсутствующим значением."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
+
+
+def _read_json(path: str) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _guess_axles(*texts: Any) -> str:
+    """Вытащить колёсную формулу из имени/ключа набора."""
+    for text in texts:
+        if not text:
+            continue
+        m = _AXLE_RE.search(str(text))
+        if m:
+            return f"{m.group(1)}x{m.group(2)}"
+    return ""
+
+
+def _config_parts(cfg: Dict[str, Any]) -> Tuple[str, ...]:
+    return tuple(k for k in ("cuzov", "napolnitel", "other", "target_model")
+                 if cfg.get(k))
+
+
+def _path_size(path: Optional[str]) -> int:
+    """Размер файла, а для папки — суммарный размер её содержимого."""
+    if not path:
+        return 0
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def _mtime_of(path: Optional[str]) -> float:
+    try:
+        return os.path.getmtime(path) if path else 0.0
+    except OSError:
+        return 0.0
+
+
+def _spec_dims(spec: Dict[str, Any]):
+    return (_as_float(spec.get("inner_length")),
+            _as_float(spec.get("inner_width")),
+            _as_float(spec.get("inner_height")))
+
+
+def _spec_origin(spec: Dict[str, Any]) -> str:
+    """
+    Откуда взят кузов по его `.spec.json`: скан облака точек, запись
+    справочника или ручные параметры.
+    """
+    src = str(spec.get("source") or "").strip()
+    model_key = str(spec.get("model_key") or "").strip()
+    suffix = f" · {model_key}" if model_key else ""
+    if src.lower().endswith(".ply"):
+        return f"скан {os.path.basename(src.replace(chr(92), '/'))}{suffix}"
+    if src == "catalog":
+        return f"справочник{suffix}"
+    if src:
+        return src if len(src) < 60 else os.path.basename(
+            src.replace(chr(92), "/"))
+    return model_key
+
+
+def _rect_of(points: Any) -> Optional[Tuple[float, float]]:
+    """
+    (длинная сторона, короткая сторона) прямоугольника `points_3d`.
+    None, если точек нет или они не разбираются.
+    """
+    if not isinstance(points, (list, tuple)) or len(points) < 3:
+        return None
+    try:
+        xs = [float(p[0]) for p in points]
+        ys = [float(p[1]) for p in points]
+    except (TypeError, ValueError, IndexError):
+        return None
+    a, b = max(ys) - min(ys), max(xs) - min(xs)
+    if a <= 0 or b <= 0:
+        return None
+    return (max(a, b), min(a, b))
+
+
+def _apply_spec(info: "ModelSetInfo", spec: Optional[Dict[str, Any]]) -> None:
+    """Дополнить запись обмерами из `<name>.spec.json`, если он есть."""
+    if not spec:
+        return
+    length, width, height = _spec_dims(spec)
+    if info.length is None:
+        info.length, info.width, info.height = length, width, height
+    if not info.origin:
+        info.origin = _spec_origin(spec)
+    if not info.axles:
+        info.axles = _guess_axles(spec.get("model_key"), spec.get("name"))
+    if info.volume is None:
+        measured = _as_float(spec.get("measured_volume_m3"))
+        if measured:
+            info.volume, info.volume_kind = measured, "изм."
+        elif None not in (length, width, height):
+            info.volume = length * width * height
+            info.volume_kind = "расч."
+
+
+def load_model_sets_detailed() -> List[ModelSetInfo]:
+    """
+    То же, что `load_model_sets`, но с характеристиками каждого набора:
+    источник, колёсная формула, объём, внутренние габариты, состав
+    комплекта, размер файлов.
+
+    Порядок тот же, что и раньше: серверные наборы, затем комплекты
+    генератора, затем локальные модели из `assets/models/trucks`.
+
+    Данные собираются из трёх мест, и ни одно из них не обязательно:
+      * серверный `models_geometry_config.json` (или локальный YAML) —
+        `max_volume`, состав комплекта;
+      * `<name>.set.json` генератора — шасси, объём, габариты по
+        `world_bounds`;
+      * `<name>.spec.json` — внутренние обмеры кузова и источник
+        (скан .ply / справочник).
+    """
+    out: List[ModelSetInfo] = []
+
+    server_cfg = _fetch_model_sets_from_server()
+    if server_cfg:
+        server = _read_active_tls_server()
+        source = "server"
+        origin = f"{server[0]}:{server[1]}" if server else "TLS-сервер"
+        cfg = server_cfg
+    else:
+        source = "yaml"
+        origin = os.path.basename(MODELS_CONFIG_PATH)
+        cfg = _load_local_models_yaml()
+
+    for key, value in cfg.items():
+        if not isinstance(value, dict):
+            continue
+        name = str(value.get("model") or key)
+        volume = _as_float(value.get("max_volume"))
+        # `points_3d` — четыре опорные точки верхнего проёма (по ним
+        # выравнивается камера). Габаритами кузова они НЕ являются: у
+        # большинства наборов это один и тот же шаблонный прямоугольник,
+        # поэтому он идёт только в подробности строки, а не в колонку.
+        out.append(ModelSetInfo(
+            key=str(key), name=name, display=name,
+            source=source, origin=origin,
+            axles=_guess_axles(name, key),
+            volume=volume, volume_kind="макс." if volume else "",
+            parts=_config_parts(value),
+            ground_plane=_as_float(value.get("ground_plane")),
+            ref_rect=_rect_of(value.get("points_3d")),
+            has_camera=value.get("cam_pos_x") is not None,
+            config=value,
+        ))
+
+    # Сгенерированные комплекты идут сразу после серверных: это полные
+    # наборы, а не отдельные модели для просмотра.
+    for key, value, stem, data in _generated_kit_entries():
+        name = key[len(GENERATED_MODEL_PREFIX):]
+        volume = _as_float(data.get("max_volume"))
+        info = ModelSetInfo(
+            key=key, name=name, display=str(value.get("model") or name),
+            source="generated",
+            chassis=str(data.get("chassis") or ""),
+            axles=_guess_axles(data.get("chassis"), name),
+            volume=volume, volume_kind="макс." if volume else "",
+            parts=_config_parts(value),
+            path=value.get("cuzov", ""),
+            ground_plane=_as_float(value.get("ground_plane")),
+            config=value,
+        )
+        # Габариты: сперва обмеры кузова, иначе — рамка комплекта в мире.
+        bounds = (data.get("world_bounds") or {}).get("body")
+        if isinstance(bounds, list) and len(bounds) == 2:
+            try:
+                (x0, y0, z0), (x1, y1, z1) = bounds
+                info.length = abs(float(y1) - float(y0))
+                info.width = abs(float(x1) - float(x0))
+                info.height = abs(float(z1) - float(z0))
+            except (TypeError, ValueError):
+                pass
+        spec = _read_json(os.path.join(GENERATED_MODELS_DIR,
+                                       f"{stem}.spec.json"))
+        if spec:
+            # Внутренние обмеры точнее внешней рамки — они и идут в колонку.
+            length, width, height = _spec_dims(spec)
+            if None not in (length, width, height):
+                info.length, info.width, info.height = length, width, height
+            _apply_spec(info, spec)
+        info.file_size = sum(_path_size(value.get(k))
+                             for k in ("cuzov", "napolnitel", "other"))
+        info.mtime = _mtime_of(value.get("cuzov"))
+        out.append(info)
+
+    # Локальные модели из assets/models/trucks — после серверных, чтобы оба
+    # источника жили в одном списке.
+    for key, value, stem, model_path in _local_truck_entries():
+        folder = os.path.dirname(model_path)
+        info = ModelSetInfo(
+            key=key, name=_truck_model_display(stem),
+            display=str(value.get("model") or key),
+            source="local",
+            axles=_guess_axles(stem, key),
+            parts=_config_parts(value),
+            path=model_path,
+            # Модель в своей папке весит столько, сколько весит вся папка
+            # (текстуры, .bin); одиночный файл — сколько сам файл.
+            file_size=_path_size(model_path if folder == TRUCKS_MODELS_DIR
+                                 else folder),
+            mtime=_mtime_of(model_path),
+            config=value,
+        )
+        _apply_spec(info, _read_json(os.path.join(TRUCKS_MODELS_DIR,
+                                                  f"{stem}.spec.json")))
+        if not info.origin:
+            ext = os.path.splitext(model_path)[1].lstrip(".").upper()
+            info.origin = f"{ext} из assets/models/trucks"
+        out.append(info)
+
+    return out
+
+
 def load_model_sets() -> List[Tuple[str, str]]:
     """
     Return [(set_key, display_name)] for every model set the panel should
@@ -327,22 +746,194 @@ def load_model_sets() -> List[Tuple[str, str]]:
         2. Local `models_config.yaml`         — offline fallback.
 
     `display_name` is each entry's `model` field; falls back to the
-    set_key when `model` is missing.
+    set_key when `model` is missing. Тонкая обёртка над
+    `load_model_sets_detailed`: характеристики нужны только диалогу
+    выбора, остальным (cli.py, поиск модели по имени) хватает пары.
     """
-    cfg = _fetch_model_sets_from_server() or _load_local_models_yaml()
+    return [(info.key, info.display) for info in load_model_sets_detailed()]
 
-    out: List[Tuple[str, str]] = []
-    for key, value in cfg.items():
-        if not isinstance(value, dict):
-            continue
-        display = value.get("model") or key
-        out.append((key, str(display)))
 
-    # Local truck models from assets/models/trucks — listed after the
-    # server sets so both sources live in the same combo.
-    for key, value in _scan_local_truck_models().items():
-        out.append((key, str(value.get("model") or key)))
+# ---------------------------------------------------------------------------
+# Удаление наборов с диска
+# ---------------------------------------------------------------------------
+# Генератор кузовов складывает комплект в `assets/models/generated/` россыпью
+# файлов с общим именем (`<stem>.set.json`, `<stem>-Cuzov.bam`, `<stem>.gltf`,
+# папка `<stem>/` с текстурами и т.д.), а локальные модели лежат в
+# `assets/models/trucks/`. Удалять их вручную из проводника неудобно и легко
+# оставить хвосты, поэтому список умеет убирать набор целиком.
+#
+# Правило владения: файл принадлежит набору, если его имя равно `stem` или
+# начинается с `stem` + разделитель (`.`, `-`, `_`). Когда под правило подходят
+# сразу несколько наборов (`truck` и `truck-2`), файл достаётся ТОМУ, чей stem
+# длиннее, — иначе удаление `truck` унесло бы с собой соседний комплект.
+#
+# Серверные наборы не удаляются: их файлы лежат не у нас.
+
+#: Символы, отделяющие имя набора от суффикса файла.
+_STEM_BOUNDARY = (".", "-", "_")
+
+
+@dataclass
+class ModelSetRemoval:
+    """
+    Что произойдёт при удалении набора: список файлов и папок, их суммарный
+    размер и — если удалить нельзя — причина.
+
+    Возвращается ДО удаления, чтобы интерфейс показал пользователю точный
+    список, а не «удалить набор?» вслепую.
+    """
+    key: str
+    name: str = ""
+    paths: List[str] = field(default_factory=list)
+    total_size: int = 0
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error and bool(self.paths)
+
+    @property
+    def size_label(self) -> str:
+        """Суммарный размер по-человечески — для окна подтверждения."""
+        return _fmt_bytes(self.total_size)
+
+
+def _belongs_to_stem(entry: str, stem: str) -> bool:
+    """Имя файла/папки относится к набору `stem`?"""
+    if entry == stem:
+        return True
+    return (entry.startswith(stem)
+            and entry[len(stem):len(stem) + 1] in _STEM_BOUNDARY)
+
+
+def _entries_owned_by(directory: str, stem: str,
+                      siblings: List[str]) -> List[str]:
+    """
+    Пути внутри `directory`, принадлежащие набору `stem`.
+
+    `siblings` — имена всех наборов в этой папке (включая сам `stem`): по ним
+    разрешается спор между `truck` и `truck-2`, см. комментарий к разделу.
+    """
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError as exc:
+        print(f"[panel_data] failed to list {directory}: {exc}")
+        return []
+
+    out: List[str] = []
+    for entry in entries:
+        owner = ""
+        for cand in siblings:
+            if _belongs_to_stem(entry, cand) and len(cand) > len(owner):
+                owner = cand
+        if owner == stem:
+            out.append(os.path.join(directory, entry))
     return out
+
+
+def _inside(path: str, directory: str) -> bool:
+    """Страховка от выхода за пределы папки набора (симлинки, `..` в имени)."""
+    try:
+        return os.path.commonpath(
+            [os.path.abspath(path), os.path.abspath(directory)]
+        ) == os.path.abspath(directory) and os.path.abspath(path) != \
+            os.path.abspath(directory)
+    except ValueError:      # разные диски на Windows
+        return False
+
+
+def can_delete_model_set(key: Any) -> bool:
+    """Набор лежит у нас на диске и может быть удалён?"""
+    text = str(key or "")
+    return text.startswith(GENERATED_MODEL_PREFIX) or \
+        text.startswith(LOCAL_MODEL_PREFIX)
+
+
+def plan_model_set_removal(key: Any) -> ModelSetRemoval:
+    """
+    Собрать список файлов набора, ничего не удаляя.
+
+    Вызывается перед подтверждением: пользователь видит ровно то, что исчезнет
+    с диска, и суммарный размер.
+    """
+    text = str(key or "")
+    plan = ModelSetRemoval(key=text)
+    if not text:
+        plan.error = "набор не выбран"
+        return plan
+
+    if text.startswith(GENERATED_MODEL_PREFIX):
+        directory = GENERATED_MODELS_DIR
+        entries = _generated_kit_entries()
+        stems = [stem for _k, _cfg, stem, _data in entries]
+        stem = next((s for k, _cfg, s, _d in entries if k == text), "")
+        plan.name = text[len(GENERATED_MODEL_PREFIX):]
+    elif text.startswith(LOCAL_MODEL_PREFIX):
+        directory = TRUCKS_MODELS_DIR
+        entries = _local_truck_entries()
+        stems = [stem for _k, _cfg, stem, _path in entries]
+        stem = next((s for k, _cfg, s, _p in entries if k == text), "")
+        plan.name = _truck_model_display(stem) if stem else text
+    else:
+        plan.error = ("серверный набор нельзя удалить из утилиты — "
+                      "его файлы лежат на сервере")
+        return plan
+
+    if not stem:
+        plan.error = "набор не найден на диске"
+        return plan
+
+    paths = [p for p in _entries_owned_by(directory, stem, stems)
+             if _inside(p, directory)]
+    if not paths:
+        plan.error = "файлы набора не найдены"
+        return plan
+
+    plan.paths = paths
+    plan.total_size = sum(_path_size(p) for p in paths)
+    return plan
+
+
+def delete_model_set(key: Any) -> Tuple[bool, str]:
+    """
+    Удалить файлы набора с диска. Возвращает (успех, сообщение).
+
+    Ничего не бросает: интерфейсу нужен текст для строки состояния, а не
+    исключение посреди обработчика кнопки. Удаляется только то, что попало в
+    `plan_model_set_removal` — то есть ровно то, что видел пользователь.
+    """
+    import shutil
+
+    plan = plan_model_set_removal(key)
+    if not plan.ok:
+        return False, plan.error or "нечего удалять"
+
+    removed, failed = 0, []
+    for path in plan.paths:
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            removed += 1
+        except OSError as exc:
+            failed.append(f"{os.path.basename(path)}: {exc.strerror or exc}")
+
+    if failed:
+        return False, ("удалено {} из {}; не удалось: {}".format(
+            removed, len(plan.paths), "; ".join(failed[:3])))
+    return True, f"«{plan.name}» удалён ({_fmt_bytes(plan.total_size)})"
+
+
+def _fmt_bytes(size: int) -> str:
+    """Человекочитаемый размер — для сообщений об удалении."""
+    value = float(size)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if value < 1024 or unit == "ГБ":
+            return f"{value:.0f} {unit}" if unit in ("Б", "КБ") \
+                else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} Б"
 
 
 def get_model_set_config(key: str) -> Optional[Dict[str, Any]]:
@@ -357,6 +948,8 @@ def get_model_set_config(key: str) -> Optional[Dict[str, Any]]:
     if not key:
         return None
     # Local truck models resolve straight from disk — no server lookup.
+    if str(key).startswith(GENERATED_MODEL_PREFIX):
+        return _scan_generated_kits().get(str(key))
     if str(key).startswith(LOCAL_MODEL_PREFIX):
         return _scan_local_truck_models().get(str(key))
     cfg = _fetch_model_sets_from_server() or _load_local_models_yaml()

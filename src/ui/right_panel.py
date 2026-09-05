@@ -70,8 +70,9 @@ from src.ui.ui_theme import (
     apply_theme, COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_TEXT_DIM,
     COLOR_HAIRLINE, COLOR_HAIRLINE_HOVER, COLOR_WARN, FONT_MONO,
 )
+from src.ui.model_picker import ModelPickerCombo
 from src.ui.panel_data import (
-    load_model_sets, load_texture_sets, get_default_texture_set_key,
+    load_model_sets_detailed, load_texture_sets, get_default_texture_set_key,
     load_reconstructions, Reconstruction, PROJECT_ROOT, HEIGHT_EXAMPLES_DIR,
     get_model_set_config, get_texture_set_config, download_server_image,
     SERVER_IMAGE_CACHE_DIR, RECON_PAGE_SIZE,
@@ -865,6 +866,11 @@ class RightPanel(QWidget):
     """
 
     modelSetChanged          = pyqtSignal(str)
+    # Emitted when the user asks to delete a model set from disk (генератор
+    # кузовов или локальная модель в assets/models/trucks). Payload — ключ
+    # набора. Панель сама ничего не удаляет: подтверждение показывает
+    # MainWindow, потому что удаляемый набор может быть сейчас в сцене.
+    modelSetDeleteRequested  = pyqtSignal(str)
     textureSetChanged        = pyqtSignal(str)
     reconstructionSelected   = pyqtSignal(str)
     # Emitted when the user CLICKS a reconstruction row (not just
@@ -906,6 +912,10 @@ class RightPanel(QWidget):
     # legacy `run_full_process` (target volume → texture set → ground
     # plane → AABB plane → Perlin mesh from CSG).
     runRequested             = pyqtSignal(dict)
+    # Emitted when the user asks to open the body generator. MainWindow shows
+    # the dialog and runs the build in a worker thread — the panel itself knows
+    # nothing about body_builder, so the module stays optional.
+    bodyGenRequested         = pyqtSignal()
     # Emitted when the user picks a graphics preset (ultra/medium/performance).
     # MainWindow persists it and prompts for a restart (the rendering engine
     # is chosen before the window exists).
@@ -993,25 +1003,32 @@ class RightPanel(QWidget):
         # this panel is constructed. Both lists carry the canonical
         # backend key alongside the human-readable display name so we
         # can emit the key on selection.
-        model_sets   = load_model_sets()
+        model_infos  = load_model_sets_detailed()
         texture_sets = load_texture_sets()
         default_tex  = get_default_texture_set_key()
 
         # ---- Section: Model set --------------------------------------
-        self.cmb_model = QComboBox()
-        for key, display in model_sets:
-            self.cmb_model.addItem(display, userData=key)
-        if model_sets:
+        # Не QComboBox: имена наборов в 320-пиксельную панель не влезают, а
+        # выбирать кузов приходится по объёму / шасси / комплектности —
+        # см. src/ui/model_picker.py (поиск + таблица характеристик).
+        self.cmb_model = ModelPickerCombo()
+        self.cmb_model.set_details(model_infos)
+        for info in model_infos:
+            self.cmb_model.addItem(info.display, userData=info.key)
+        if model_infos:
             self.cmb_model.setCurrentIndex(0)
         else:
             self.cmb_model.addItem("— модели не найдены —", userData=None)
             self.cmb_model.setEnabled(False)
         self.cmb_model.currentIndexChanged.connect(self._on_model_index_changed)
-        col.addWidget(self._make_card(
+        self.cmb_model.deleteRequested.connect(
+            lambda key: self.modelSetDeleteRequested.emit(str(key)))
+        self._model_card = self._make_card(
             "Набор моделей",
-            self._make_row("Набор", self.cmb_model),
-            status="v1.4",
-        ))
+            self.cmb_model,
+            status=self._model_count_label(len(model_infos)),
+        )
+        col.addWidget(self._model_card)
 
         # ---- Section: Texture set ------------------------------------
         self.cmb_texture = QComboBox()
@@ -1076,6 +1093,31 @@ class RightPanel(QWidget):
             self._make_row("Объём", self.spn_target),
             status="Параметр",
         ))
+
+        # ---- Section: Body generator --------------------------------
+        # Опциональный модуль: если пакет генератора не найден, кнопка просто
+        # выключена с пояснением — утилита работает как раньше.
+        self.btn_bodygen = QPushButton("Сгенерировать кузов…")
+        self.btn_bodygen.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bodygen.setStyleSheet(self._soft_accent_button_qss())
+        self.btn_bodygen.clicked.connect(self.bodyGenRequested.emit)
+
+        self.lbl_bodygen = QLabel("")
+        self.lbl_bodygen.setWordWrap(True)
+        self.lbl_bodygen.setStyleSheet(
+            f"color: {COLOR_TEXT_MUTED}; font-size: 10px;")
+
+        bodygen_box = QWidget()
+        bodygen_lay = QVBoxLayout(bodygen_box)
+        bodygen_lay.setContentsMargins(0, 0, 0, 0)
+        bodygen_lay.setSpacing(6)
+        bodygen_lay.addWidget(self.btn_bodygen)
+        bodygen_lay.addWidget(self.lbl_bodygen)
+
+        self._bodygen_card = self._make_card(
+            "Генератор кузова", bodygen_box, status="из облака")
+        col.addWidget(self._bodygen_card)
+        self._init_bodygen_state()
 
         # ---- Section: 2D · 3D Reconstructions -----------------------
         self._recons: list[Reconstruction] = load_reconstructions()
@@ -1742,6 +1784,9 @@ class RightPanel(QWidget):
                 f" font-family: 'Geist Mono','JetBrains Mono',monospace;"
             )
             head.addWidget(s)
+            # Ссылка на ярлык статуса: некоторым карточкам (например, счётчику
+            # наборов моделей) его приходится обновлять на лету.
+            card.status_label = s
         v.addLayout(head)
 
         if stretch:
@@ -2119,6 +2164,26 @@ class RightPanel(QWidget):
     # ==================================================================
     # Combo handlers
     # ==================================================================
+    @staticmethod
+    def _model_count_label(count: int) -> str:
+        """«12 наборов» с правильным падежом — статус карточки моделей."""
+        tail = count % 100
+        if 11 <= tail <= 14:
+            word = "наборов"
+        elif count % 10 == 1:
+            word = "набор"
+        elif count % 10 in (2, 3, 4):
+            word = "набора"
+        else:
+            word = "наборов"
+        return f"{count} {word}"
+
+    def _set_model_card_status(self, text: str) -> None:
+        label = getattr(getattr(self, "_model_card", None),
+                        "status_label", None)
+        if label is not None:
+            label.setText(text)
+
     def _on_model_index_changed(self, idx: int) -> None:
         """
         Translate combo index to backend key, sync the target-volume
@@ -2196,6 +2261,65 @@ class RightPanel(QWidget):
     # ==================================================================
     # Public accessors
     # ==================================================================
+    def _init_bodygen_state(self) -> None:
+        """Спросить у модуля, доступен ли он, и оформить карточку."""
+        try:
+            from src.bodygen import probe
+            info = probe()
+        except Exception as exc:
+            info = {"available": False, "reason": f"модуль не загружен: {exc}"}
+
+        if info.get("available"):
+            chassis = ", ".join(info.get("chassis") or []) or "нет"
+            self.lbl_bodygen.setText(f"шасси: {chassis}")
+        else:
+            self.btn_bodygen.setEnabled(False)
+            self.lbl_bodygen.setText(info.get("reason") or "недоступен")
+
+    def set_bodygen_status(self, text: str, busy: bool = False) -> None:
+        """Строка состояния под кнопкой; на время сборки кнопка блокируется."""
+        self.lbl_bodygen.setText(text)
+        self.btn_bodygen.setEnabled(not busy)
+        self.btn_bodygen.setText("Сборка…" if busy else "Сгенерировать кузов…")
+
+    def set_model_status(self, text: str) -> None:
+        """
+        Короткое сообщение в шапке карточки «Набор моделей» (например, итог
+        удаления). Держится до следующего `reload_model_sets`, который вернёт
+        туда счётчик наборов.
+        """
+        self._set_model_card_status(text)
+
+    def reload_model_sets(self, select_key: str | None = None) -> None:
+        """
+        Перечитать список наборов моделей.
+
+        Нужен после генерации: новый комплект появляется в
+        `assets/models/trucks` уже после того, как панель построила список.
+        """
+        try:
+            infos = load_model_sets_detailed()
+        except Exception as exc:
+            print(f"[RightPanel] не удалось перечитать модели: {exc}")
+            return
+
+        self.cmb_model.blockSignals(True)
+        self.cmb_model.clear()
+        self.cmb_model.set_details(infos)
+        for info in infos:
+            self.cmb_model.addItem(info.display, userData=info.key)
+        self.cmb_model.setEnabled(bool(infos))
+        self._set_model_card_status(self._model_count_label(len(infos)))
+        index = 0
+        if select_key:
+            found = self.cmb_model.findData(select_key)
+            if found >= 0:
+                index = found
+        self.cmb_model.setCurrentIndex(index)
+        self.cmb_model.blockSignals(False)
+        if select_key and self.cmb_model.currentData() == select_key:
+            self.modelSetChanged.emit(str(select_key))
+
     def current_model_key(self):
         return self.cmb_model.itemData(self.cmb_model.currentIndex())
 

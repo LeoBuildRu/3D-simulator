@@ -10,7 +10,7 @@ import win32con
 
 from panda3d.core import WindowProperties
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QFrame,
 )
@@ -696,6 +696,9 @@ class MainWindow(QMainWindow):
         self.right_panel.graphicsPresetChanged.connect(
             self._on_graphics_preset_changed
         )
+        self.right_panel.bodyGenRequested.connect(self._on_bodygen_requested)
+        self.right_panel.modelSetDeleteRequested.connect(
+            self._on_model_delete_requested)
 
         # ---- Camera-alignment reference overlay --------------------
         # Full-viewport translucent layer that shows a captured stand
@@ -3372,6 +3375,144 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # Генератор кузовов (опциональный модуль src/bodygen)
+    # ------------------------------------------------------------------
+
+    def _on_bodygen_requested(self) -> None:
+        """Показать диалог параметров и запустить сборку в отдельном потоке."""
+        try:
+            from src.ui.bodygen_dialog import BodyGenDialog
+        except Exception as exc:
+            print(f"[BodyGen] диалог недоступен: {exc}")
+            self.right_panel.set_bodygen_status(f"диалог недоступен: {exc}")
+            return
+
+        dlg = BodyGenDialog(self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+
+        params = dlg.params()
+        self._bodygen_select = bool(dlg.show_in_list())
+
+        # Сборка идёт минуты и держит GIL в numpy-циклах: в главном потоке она
+        # заморозила бы и окно, и рендер Panda3D. Поэтому — отдельный поток, а
+        # в панель только строка состояния.
+        self._bodygen_thread = _BodyGenWorker(params, self)
+        self._bodygen_thread.progressed.connect(
+            lambda msg: self.right_panel.set_bodygen_status(msg, busy=True))
+        self._bodygen_thread.finishedWith.connect(self._on_bodygen_finished)
+        self.right_panel.set_bodygen_status("запуск…", busy=True)
+        self._bodygen_thread.start()
+
+    def _on_bodygen_finished(self, result) -> None:
+        """Обработать результат сборки: показать итог и подхватить комплект."""
+        if not getattr(result, "ok", False):
+            msg = getattr(result, "error", "неизвестная ошибка")
+            print(f"[BodyGen] ошибка: {msg}")
+            self.right_panel.set_bodygen_status(f"ошибка: {msg}"[:180])
+            return
+
+        print(f"[BodyGen] готово за {result.seconds:.1f} с")
+        print(result.summary)
+        self.right_panel.set_bodygen_status(
+            f"{result.name}: готово за {result.seconds:.0f} с")
+
+        if not getattr(self, "_bodygen_select", True):
+            return
+        try:
+            from src.ui.panel_data import GENERATED_MODEL_PREFIX
+            self.right_panel.reload_model_sets(
+                select_key=f"{GENERATED_MODEL_PREFIX}{result.name}")
+        except Exception as exc:
+            print(f"[BodyGen] не удалось обновить список моделей: {exc}")
+
+    def _on_model_delete_requested(self, model_key: str) -> None:
+        """
+        Удалить набор моделей с диска по запросу из списка кузовов.
+
+        Удаляются только «свои» наборы: комплекты генератора из
+        `assets/models/generated` и локальные модели из `assets/models/trucks`.
+        Серверные наборы сюда не попадают — список их и не предлагает.
+
+        Диалог показывает ПОЛНЫЙ список файлов и папок: комплект генератора это
+        не один .bam, а россыпь из кузова, наполнителя, шасси, glTF и папки с
+        текстурами на сотню мегабайт, и пользователь должен видеть, что именно
+        исчезнет. Отмена — кнопка по умолчанию: операция необратима.
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        from src.ui.panel_data import (delete_model_set,
+                                       plan_model_set_removal)
+
+        key = str(model_key or "")
+        if not key:
+            return
+
+        plan = plan_model_set_removal(key)
+        if not plan.ok:
+            QMessageBox.warning(self, "Удаление набора",
+                                plan.error or "нечего удалять")
+            return
+
+        current_key = ""
+        try:
+            current_key = str(self.right_panel.current_model_key() or "")
+        except Exception:
+            pass
+        was_current = (current_key == key)
+
+        text = (f"Удалить набор «{plan.name}»?\n\n"
+                f"С диска будет удалено {len(plan.paths)} объект(ов), "
+                f"{plan.size_label}. Отменить удаление нельзя.")
+        if was_current:
+            text += ("\n\nЭтот набор сейчас выбран — после удаления в сцену "
+                     "загрузится первый из оставшихся.")
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Удаление набора")
+        box.setText(text)
+        box.setDetailedText("\n".join(plan.paths))
+        yes = box.addButton("Удалить", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+
+        ok, message = delete_model_set(key)
+        print(f"[ModelSet] удаление '{key}': {message}")
+        if not ok:
+            QMessageBox.warning(self, "Удаление набора", message)
+
+        try:
+            self.right_panel.reload_model_sets()
+            self.right_panel.set_model_status(message[:120])
+        except Exception as exc:
+            print(f"[ModelSet] не удалось обновить список моделей: {exc}")
+            return
+
+        if not was_current:
+            # В сцене чужой набор — перечитанный список сбросил выбор на
+            # первую строку, возвращаем его на место (без перезагрузки модели:
+            # set_current_model_key блокирует сигналы).
+            if current_key:
+                try:
+                    self.right_panel.set_current_model_key(current_key)
+                except Exception as exc:
+                    print(f"[ModelSet] выбор не восстановлен: {exc}")
+            return
+
+        # Удалённый набор мог быть в сцене: его файлов больше нет, поэтому
+        # подтягиваем то, что панель выбрала вместо него.
+        if ok:
+            try:
+                new_key = self.right_panel.current_model_key()
+                if new_key:
+                    self._on_model_set_changed(str(new_key))
+            except Exception as exc:
+                print(f"[ModelSet] загрузка замены не удалась: {exc}")
+
     def closeEvent(self, e):
         # 1. Stop the Qt-driven loops first, so neither taskMgr.step() nor the
         #    telemetry callback runs against a Panda app we're tearing down.
@@ -3408,3 +3549,25 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         os._exit(0)
+
+
+class _BodyGenWorker(QThread):
+    """
+    Поток сборки кузова.
+
+    Наружу отдаёт только строки состояния и итоговый объект: в поток не
+    передаётся ничего из сцены, поэтому Panda3D продолжает рисовать всё время
+    сборки.
+    """
+
+    progressed = pyqtSignal(str)
+    finishedWith = pyqtSignal(object)
+
+    def __init__(self, params, parent=None):
+        super().__init__(parent)
+        self._params = params
+
+    def run(self) -> None:
+        from src.bodygen import generate
+        result = generate(self._params, progress=self.progressed.emit)
+        self.finishedWith.emit(result)
