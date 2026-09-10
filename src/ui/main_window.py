@@ -699,6 +699,8 @@ class MainWindow(QMainWindow):
         self.right_panel.bodyGenRequested.connect(self._on_bodygen_requested)
         self.right_panel.modelSetDeleteRequested.connect(
             self._on_model_delete_requested)
+        self.right_panel.modelSetUploadRequested.connect(
+            self._on_model_upload_requested)
 
         # ---- Camera-alignment reference overlay --------------------
         # Full-viewport translucent layer that shows a captured stand
@@ -3395,6 +3397,12 @@ class MainWindow(QMainWindow):
         params = dlg.params()
         self._bodygen_select = bool(dlg.show_in_list())
 
+        # Пересборка под тем же именем: диалог уже спросил разрешения, здесь
+        # только стираем прошлый комплект. Делать это до запуска потока
+        # обязательно — иначе удаление догонит уже записанные новые файлы.
+        if not self._bodygen_clear_previous(dlg.overwrite_paths(), params.name):
+            return
+
         # Сборка идёт минуты и держит GIL в numpy-циклах: в главном потоке она
         # заморозила бы и окно, и рендер Panda3D. Поэтому — отдельный поток, а
         # в панель только строка состояния.
@@ -3404,6 +3412,58 @@ class MainWindow(QMainWindow):
         self._bodygen_thread.finishedWith.connect(self._on_bodygen_finished)
         self.right_panel.set_bodygen_status("запуск…", busy=True)
         self._bodygen_thread.start()
+
+    def _bodygen_clear_previous(self, paths, name: str) -> bool:
+        """
+        Стереть файлы прошлого комплекта. False — сборку начинать нельзя.
+
+        Если перезаписывается набор, который сейчас в сцене, она сначала
+        освобождается: смотреть на модель, файлов которой уже нет, незачем, а
+        сборка идёт минуты. Чужой набор в сцене не трогается.
+        """
+        paths = [str(p) for p in (paths or [])]
+        if not paths:
+            return True
+
+        from src.ui.panel_data import GENERATED_MODEL_PREFIX
+        current_key = ""
+        try:
+            current_key = str(self.right_panel.current_model_key() or "")
+        except Exception:
+            pass
+        if current_key == f"{GENERATED_MODEL_PREFIX}{name}":
+            panda = getattr(self, "panda_app", None)
+            if panda is not None and hasattr(panda, "clear_scene"):
+                try:
+                    panda.clear_scene()
+                except Exception as exc:
+                    print(f"[BodyGen] сцена не очищена перед перезаписью: "
+                          f"{exc}")
+
+        failed = []
+        for path in paths:
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                failed.append(f"{os.path.basename(path)}: "
+                              f"{exc.strerror or exc}")
+
+        if failed:
+            from PyQt6.QtWidgets import QMessageBox
+            text = ("Не удалось удалить прошлый комплект — сборка отменена, "
+                    "иначе он смешался бы с новым.\n\n" + "\n".join(failed[:5]))
+            print(f"[BodyGen] перезапись не удалась: {'; '.join(failed)}")
+            QMessageBox.warning(self, "Перезапись комплекта", text)
+            self.right_panel.set_bodygen_status("перезапись не удалась")
+            return False
+
+        print(f"[BodyGen] прошлый комплект удалён: {len(paths)} объект(ов)")
+        return True
 
     def _on_bodygen_finished(self, result) -> None:
         """Обработать результат сборки: показать итог и подхватить комплект."""
@@ -3418,6 +3478,21 @@ class MainWindow(QMainWindow):
         self.right_panel.set_bodygen_status(
             f"{result.name}: готово за {result.seconds:.0f} с")
 
+        # Пересборка под тем же именем даёт те же пути к картам, а TexturePool
+        # кеширует по пути и на диск больше не смотрит. Без сброса в сцену
+        # вернулись бы СТАРЫЕ текстуры: цвет краски, износ и грязь остались бы
+        # от прошлой сборки. Сбрасываем до перезагрузки списка — она сразу же
+        # грузит модель. Сбрасывается только папка карт ЭТОГО комплекта
+        # (`<каталог>/<имя>`, см. pipeline._write_files) — соседние комплекты
+        # не изменились, и перечитывать их по сотне мегабайт незачем.
+        panda = getattr(self, "panda_app", None)
+        if panda is not None and hasattr(panda, "forget_cached_textures"):
+            try:
+                panda.forget_cached_textures(
+                    os.path.join(result.out_dir, result.name))
+            except Exception as exc:
+                print(f"[BodyGen] сброс кеша текстур не удался: {exc}")
+
         if not getattr(self, "_bodygen_select", True):
             return
         try:
@@ -3426,6 +3501,86 @@ class MainWindow(QMainWindow):
                 select_key=f"{GENERATED_MODEL_PREFIX}{result.name}")
         except Exception as exc:
             print(f"[BodyGen] не удалось обновить список моделей: {exc}")
+
+    def _on_model_upload_requested(self, model_key: str) -> None:
+        """
+        Открыть диалог загрузки набора в реестр моделей photo-to-volume.
+
+        Диалог живёт здесь, а не в панели, по двум причинам: ему нужен пресет
+        камеры (реестр без него не примет новую модель, а взять его удобнее
+        всего из текущего вида сцены), и после успешной загрузки список
+        наборов стоит перечитать — серверный конфиг изменился, и набор,
+        который до сих пор был «локальным», приедет уже с сервера.
+        """
+        from PyQt6.QtWidgets import QMessageBox
+
+        key = str(model_key or "")
+        if not key:
+            return
+
+        info = None
+        try:
+            info = self.right_panel.model_info(key)
+        except Exception as exc:
+            print(f"[Registry] характеристики набора недоступны: {exc}")
+        if info is None:
+            QMessageBox.warning(self, "Загрузка модели",
+                                f"Набор «{key}» не найден в списке.")
+            return
+
+        try:
+            from src.ui.registry_dialog import ModelUploadDialog
+        except Exception as exc:                          # noqa: BLE001
+            QMessageBox.critical(
+                self, "Загрузка модели",
+                f"Модуль реестра не загрузился: {exc}\n\n"
+                "Проверьте, что установлен пакет requests "
+                "(pip install requests).")
+            return
+
+        dialog = ModelUploadDialog(self, info=info,
+                                   camera_provider=self._capture_camera_state)
+        dialog.exec()
+        if not dialog.uploaded:
+            return
+
+        # Список наборов после загрузки меняется: тот же кузов теперь есть и
+        # на сервере. Выбор сохраняем — набор в сцене трогать незачем.
+        current_key = ""
+        try:
+            current_key = str(self.right_panel.current_model_key() or "")
+        except Exception:
+            pass
+        try:
+            self.right_panel.reload_model_sets(select_key=current_key or None)
+            self.right_panel.set_model_status("модель отправлена в реестр")
+        except Exception as exc:
+            print(f"[Registry] список моделей не обновлён: {exc}")
+            return
+
+        # Сквозная проверка вместо доверия к коду ответа: список кузовов
+        # приходит с TLS-сервера 9999, который читает СВОЮ копию конфигов, а
+        # реестр пишет в основное дерево и зеркалит во второе. Если модель
+        # уехала только в основное, обработка фото пройдёт, а в списке набора
+        # не будет — молчать об этом нельзя.
+        uploaded_key = str(getattr(dialog, "uploaded_key", "") or "")
+        if not uploaded_key:
+            return
+        try:
+            seen = self.right_panel.model_info(uploaded_key) is not None
+        except Exception:
+            return
+        if seen:
+            print(f"[Registry] '{uploaded_key}' виден в списке кузовов")
+            return
+        QMessageBox.warning(
+            self, "Модель не появилась в списке",
+            f"Реестр принял модель «{uploaded_key}», но сервер по-прежнему не "
+            "отдаёт её в списке кузовов.\n\n"
+            "Обычно это значит, что реестр не зеркалит модель во второе "
+            "дерево конфигов — то, из которого читает сервер списка. "
+            "Проверьте на сервере флаги --mirror-data-dir / "
+            "--mirror-config-dir у демона model-registry.")
 
     def _on_model_delete_requested(self, model_key: str) -> None:
         """

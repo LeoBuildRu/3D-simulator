@@ -871,6 +871,11 @@ class RightPanel(QWidget):
     # набора. Панель сама ничего не удаляет: подтверждение показывает
     # MainWindow, потому что удаляемый набор может быть сейчас в сцене.
     modelSetDeleteRequested  = pyqtSignal(str)
+    # Emitted when the user asks to push a model set to the photo-to-volume
+    # model registry (ПКМ по строке -> «Загрузить на сервер…»). Payload —
+    # ключ набора; диалог показывает MainWindow, у которого есть и камера
+    # сцены для пресета съёмки, и перечитывание списка после загрузки.
+    modelSetUploadRequested  = pyqtSignal(str)
     textureSetChanged        = pyqtSignal(str)
     reconstructionSelected   = pyqtSignal(str)
     # Emitted when the user CLICKS a reconstruction row (not just
@@ -1023,6 +1028,8 @@ class RightPanel(QWidget):
         self.cmb_model.currentIndexChanged.connect(self._on_model_index_changed)
         self.cmb_model.deleteRequested.connect(
             lambda key: self.modelSetDeleteRequested.emit(str(key)))
+        self.cmb_model.uploadRequested.connect(
+            lambda key: self.modelSetUploadRequested.emit(str(key)))
         self._model_card = self._make_card(
             "Набор моделей",
             self.cmb_model,
@@ -2322,6 +2329,15 @@ class RightPanel(QWidget):
 
     def current_model_key(self):
         return self.cmb_model.itemData(self.cmb_model.currentIndex())
+
+    def model_info(self, key):
+        """
+        Характеристики набора по ключу (`ModelSetInfo`) или None.
+
+        Нужны диалогу загрузки в реестр: он собирает по ним и файлы комплекта,
+        и заготовку `meta`.
+        """
+        return self.cmb_model.info_for(key)
 
     def set_current_model_key(self, key) -> bool:
         """

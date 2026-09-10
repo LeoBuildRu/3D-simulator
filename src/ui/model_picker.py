@@ -37,13 +37,15 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import QEvent, QPoint, Qt, pyqtSignal
-from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QPainter, QPainterPath,
-                         QPalette, QPen, QPolygonF)
-from PyQt6.QtCore import QPointF, QRectF
+from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics,
+                         QPainter, QPainterPath, QPalette, QPen, QPolygonF)
+from PyQt6.QtCore import QPointF, QRectF, QUrl
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                              QMenu, QPushButton, QSizePolicy, QStyle,
@@ -94,6 +96,38 @@ SOURCE_COLORS = {
 }
 
 _EM_DASH = "—"
+
+
+def _reveal_target(info: ModelSetInfo) -> str:
+    """
+    Файл набора, который стоит подсветить в проводнике, или "".
+
+    У серверных наборов файлов на диске нет — там пусто, и пункт меню
+    остаётся выключенным.
+    """
+    path = str(getattr(info, "path", "") or "")
+    if not path:
+        return ""
+    full = path if os.path.isabs(path) else os.path.abspath(path)
+    return full if os.path.exists(full) else ""
+
+
+def _reveal_in_file_manager(path: str) -> None:
+    """Открыть папку с файлом, по возможности выделив сам файл."""
+    if not path:
+        return
+    folder = path if os.path.isdir(path) else os.path.dirname(path)
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+            return
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+            return
+        # Linux: единого «выделить файл» нет — открываем папку.
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+    except OSError:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
 
 def _fmt_size(size: int) -> str:
@@ -270,6 +304,10 @@ class _PickerPopup(QFrame):
 
     picked = pyqtSignal(int)          # индекс выбранной строки в комбо
     removeRequested = pyqtSignal(int)  # индекс строки, которую просят удалить
+    #: Индекс строки, которую просят отправить в реестр моделей на сервере.
+    #: Как и удаление, уходит наверх: диалог загрузки модальный, а поверх
+    #: Qt.Popup модальное окно не показать.
+    uploadRequested = pyqtSignal(int)
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent, Qt.WindowType.Popup)
@@ -713,6 +751,22 @@ class _PickerPopup(QFrame):
         if isinstance(idx, int):
             self.removeRequested.emit(idx)
 
+    def _request_upload(self, item: Optional[QTreeWidgetItem]) -> None:
+        """
+        Отдать наверх просьбу загрузить набор в реестр и закрыться.
+
+        Закрываемся по той же причине, что и при удалении: список — Qt.Popup,
+        а диалог загрузки модальный, и первый же клик в нём убил бы popup
+        вместе с обработчиком.
+        """
+        info = self._info_of(item)
+        if info is None or not _reveal_target(info):
+            return
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        self.close()
+        if isinstance(idx, int):
+            self.uploadRequested.emit(idx)
+
     def _on_context_menu(self, pos: QPoint) -> None:
         item = self.tree.itemAt(pos)
         info = self._info_of(item)
@@ -720,11 +774,31 @@ class _PickerPopup(QFrame):
             return
         menu = QMenu(self)
         act_pick = menu.addAction("Выбрать")
+        act_show = menu.addAction("Показать файлы в папке")
+        target = _reveal_target(info)
+        act_show.setEnabled(bool(target))
+        if not target:
+            act_show.setToolTip(
+                "У серверного набора нет файлов на этом компьютере")
+        act_upload = menu.addAction("Загрузить на сервер…")
+        act_upload.setEnabled(bool(target))
+        act_upload.setToolTip(
+            "Отправить файлы набора в реестр моделей photo-to-volume"
+            if target else
+            "Отправлять нечего: файлов этого набора на компьютере нет")
         act_del = menu.addAction("Удалить с диска…")
         act_del.setEnabled(can_delete_model_set(info.key))
+        menu.setToolTipsVisible(True)
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if chosen is act_pick:
             self._commit(item)
+        elif chosen is act_upload:
+            self._request_upload(item)
+        elif chosen is act_show:
+            # Popup закрывается сам, когда открывается проводник; закрываем
+            # явно, чтобы список не висел поверх чужого окна.
+            self.close()
+            _reveal_in_file_manager(target)
         elif chosen is act_del:
             self._request_remove(item)
 
@@ -793,6 +867,11 @@ class ModelPickerCombo(QWidget):
     #: берёт на себя MainWindow (см. `_on_model_delete_requested`), потому что
     #: удалённый набор может быть сейчас в сцене.
     deleteRequested = pyqtSignal(object)
+    #: Пользователь просит отправить набор в реестр моделей на сервере.
+    #: Полезная нагрузка — ключ набора; диалог загрузки открывает MainWindow
+    #: (`_on_model_upload_requested`), потому что ему доступна и камера сцены,
+    #: и перечитывание списка после успешной загрузки.
+    uploadRequested = pyqtSignal(object)
 
     #: Ширина всплывающей таблицы. Панель — 320 px, а сравнивать наборы
     #: удобно только когда все колонки видны разом.
@@ -936,6 +1015,7 @@ class ModelPickerCombo(QWidget):
             self._popup = _PickerPopup(self)
             self._popup.picked.connect(self._on_picked)
             self._popup.removeRequested.connect(self._on_remove_requested)
+            self._popup.uploadRequested.connect(self._on_upload_requested)
             self._popup.destroyed.connect(self._on_popup_destroyed)
         popup = self._popup
         popup.set_rows(self._texts, self._keys, self._row_infos())
@@ -987,6 +1067,12 @@ class ModelPickerCombo(QWidget):
         key = self.itemData(index)
         if key is not None:
             self.deleteRequested.emit(key)
+
+    def _on_upload_requested(self, index: int) -> None:
+        self.button.set_open(False)
+        key = self.itemData(index)
+        if key is not None:
+            self.uploadRequested.emit(key)
 
     def eventFilter(self, obj, event) -> bool:           # noqa: N802 (Qt API)
         if obj is self._popup and event.type() in (QEvent.Type.Close,

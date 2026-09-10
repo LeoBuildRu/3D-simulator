@@ -9,13 +9,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                              QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
-                             QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                             QSpinBox, QStackedWidget, QVBoxLayout, QWidget)
+                             QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                             QPushButton, QSpinBox, QStackedWidget,
+                             QVBoxLayout, QWidget)
 
 from src.bodygen import BodyGenParams, list_chassis, list_models, probe
 from src.bodygen.service import DEFAULT_OUT_DIR
@@ -31,6 +33,41 @@ QUALITY_PRESETS = {
     "Полное (4K, ~2.5 мин)": (400.0, 4096, True),
 }
 
+# src/ui/bodygen_dialog.py -> src/ui -> src -> <корень проекта>
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+#: Последние параметры сборки. Подбор кузова — это несколько прогонов подряд с
+#: правкой одного-двух полей (цвет, износ, рельеф борта), и заполнять форму
+#: заново каждый раз бессмысленно. Рядом с config/dataset.json, тем же
+#: способом: у проекта уже есть эта конвенция.
+SETTINGS_PATH = os.path.join(PROJECT_ROOT, "config", "bodygen.json")
+
+#: Как генератор называет файлы комплекта `<name>` (`pipeline._write_files`).
+#: Список точный, а не «всё, что начинается с имени»: иначе комплект «KAMAZ»
+#: утащил бы за собой файлы «KAMAZ-6520».
+_KIT_SUFFIXES = ("", "-Cuzov.bam", "-Napolnitel.bam", "-Napolnitel.obj",
+                 "-Other.bam", ".bam", ".glb", ".obj", ".gltf", ".bin",
+                 ".set.json", ".spec.json")
+
+
+def existing_kit_paths(out_dir: str, name: str) -> list:
+    """
+    Файлы уже собранного комплекта `name` в папке `out_dir`.
+
+    Пустой список — комплекта нет. Проверяется по именам, которые пишет сам
+    генератор, поэтому работает в любой папке, в том числе выбранной вручную,
+    и не зависит от того, попал ли комплект в список моделей.
+    """
+    if not out_dir or not name:
+        return []
+    found = []
+    for suffix in _KIT_SUFFIXES:
+        path = os.path.join(out_dir, f"{name}{suffix}")
+        if os.path.exists(path):
+            found.append(path)
+    return found
+
 
 class BodyGenDialog(QDialog):
     """Модальный диалог параметров сборки кузова."""
@@ -43,6 +80,9 @@ class BodyGenDialog(QDialog):
         self.setMinimumWidth(560)
 
         self._probe = probe()
+        #: Файлы комплекта, который пользователь согласился перезаписать.
+        #: Читает `MainWindow` и удаляет их перед сборкой.
+        self._overwrite_paths: list = []
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(12)
@@ -63,6 +103,8 @@ class BodyGenDialog(QDialog):
 
         self._ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self._ok_button.setEnabled(bool(self._probe.get("available")))
+
+        self._restore_state()
 
     # ---- секции ------------------------------------------------------- #
 
@@ -220,6 +262,46 @@ class BodyGenDialog(QDialog):
         f = QFormLayout(box)
         f.setContentsMargins(0, 0, 0, 0)
 
+        # Рельеф борта и обвязка — ВЫБОР, а не замер.
+        #
+        # Наружную грань борта лидар с мачты не видит вовсе: она в тени самого
+        # кузова. Поэтому при сборке из облака генератор её не выдумывает, и
+        # без этих полей кузов выходит гладким корытом. Здесь выбирается, чем
+        # его закрыть, — а замеренные размеры остаются как есть.
+        self.cmb_side = QComboBox()
+        for label, key in (("как в описании", ""),
+                           ("решётка квадратных ячеек", "panels"),
+                           ("наклонные стойки (как передний борт)", "slanted"),
+                           ("один длинный вырез с брусьями", "belt"),
+                           ("гладкий борт", "none")):
+            self.cmb_side.addItem(label, key)
+        self.cmb_side.setCurrentIndex(1)
+        self.cmb_side.setToolTip(
+            "Чем закрыта наружная грань борта. В облаке этой формы нет — борт "
+            "снаружи в тени кузова, — поэтому она выбирается, а не меряется. "
+            "Наклонные стойки идут под тем же углом, что передний борт.")
+        f.addRow("Рельеф борта", self.cmb_side)
+
+        self.chk_decor = QCheckBox("обвязка, задняя дверь и стойки")
+        self.chk_decor.setChecked(True)
+        self.chk_decor.setToolTip(
+            "Достроить нижнюю обвязку, петли задней створки и задние угловые "
+            "стойки. Лидар их не показывает, но на настоящем кузове они есть.")
+        f.addRow("Достроить", self.chk_decor)
+
+        self.spn_visor = QDoubleSpinBox()
+        self.spn_visor.setRange(-0.01, 1.20)
+        self.spn_visor.setSingleStep(0.05)
+        self.spn_visor.setDecimals(2)
+        self.spn_visor.setSpecialValueText("как измерено")
+        self.spn_visor.setValue(-0.01)
+        self.spn_visor.setSuffix(" м")
+        self.spn_visor.setToolTip(
+            "Вылет полки козырька ВПЕРЁД, над кабиной. По облаку он не "
+            "определяется: полка стоит на высоте щита и от него не "
+            "отделяется, а кабина в кадр почти не попадает.")
+        f.addRow("Вылет козырька", self.spn_visor)
+
         # Поле намеренно ПУСТОЕ: умолчание живёт в спеке (тёмный нейтральный,
         # как у ручных моделей проекта), и дублировать его здесь значит завести
         # второй источник правды, который рано или поздно разойдётся с первым.
@@ -290,6 +372,160 @@ class BodyGenDialog(QDialog):
         if path:
             edit.setText(path)
 
+    # ---- запоминание полей -------------------------------------------- #
+
+    def _state(self) -> dict:
+        """Снимок всех полей формы — ровно то, что уходит в файл настроек."""
+        return {
+            "source": self.cmb_source.currentData(),
+            "model_key": self.cmb_model.currentData() or "",
+            "ply_path": self.ed_ply.text(),
+            "spec_path": self.ed_spec.text(),
+            "cloud_model": self.cmb_cloud_model.currentData() or "",
+            "rect_width": float(self.spn_rw.value()),
+            "rect_length": float(self.spn_rl.value()),
+            "name": self.ed_name.text(),
+            "out_dir": self.ed_out.text(),
+            "chassis": self.cmb_chassis.currentData() or "auto",
+            "heap": float(self.spn_heap.value()),
+            "quality": self.cmb_quality.currentText(),
+            "decimate": float(self.spn_decimate.value()),
+            "texmax": int(self.cmb_texmax.currentData() or 0),
+            "side_style": self.cmb_side.currentData() or "",
+            "decor": bool(self.chk_decor.isChecked()),
+            "visor": float(self.spn_visor.value()),
+            "paint": self.ed_paint.text(),
+            "wear": float(self.spn_wear.value()),
+            "dirt": float(self.spn_dirt.value()),
+            "seed": int(self.spn_seed.value()),
+            "install": bool(self.chk_install.isChecked()),
+        }
+
+    def _restore_state(self) -> None:
+        """
+        Вернуть поля к прошлой сборке.
+
+        Каждое поле восстанавливается ОТДЕЛЬНО и молча пропускается, если
+        значения больше нет: справочник моделей и каталог шасси приходят
+        снаружи и между запусками меняются, а из-за одной пропавшей записи
+        форма не должна терять остальные.
+        """
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            print(f"[BodyGen] {SETTINGS_PATH} не прочитан ({exc}); "
+                  f"беру умолчания.")
+            return
+        if not isinstance(data, dict):
+            return
+
+        def pick(combo: QComboBox, key: str) -> None:
+            idx = combo.findData(data.get(key))
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        def text(edit: QLineEdit, key: str) -> None:
+            if isinstance(data.get(key), str):
+                edit.setText(data[key])
+
+        def number(spin, key: str) -> None:
+            value = data.get(key)
+            if isinstance(value, (int, float)):
+                spin.setValue(type(spin.value())(value))
+
+        def flag(check: QCheckBox, key: str) -> None:
+            if isinstance(data.get(key), bool):
+                check.setChecked(data[key])
+
+        pick(self.cmb_source, "source")
+        self.stack.setCurrentIndex(self.cmb_source.currentIndex())
+        pick(self.cmb_model, "model_key")
+        pick(self.cmb_cloud_model, "cloud_model")
+        pick(self.cmb_chassis, "chassis")
+        pick(self.cmb_texmax, "texmax")
+        pick(self.cmb_side, "side_style")
+
+        text(self.ed_ply, "ply_path")
+        text(self.ed_spec, "spec_path")
+        text(self.ed_name, "name")
+        text(self.ed_paint, "paint")
+        if data.get("out_dir"):
+            self.ed_out.setText(str(data["out_dir"]))
+
+        number(self.spn_rw, "rect_width")
+        number(self.spn_rl, "rect_length")
+        number(self.spn_heap, "heap")
+        number(self.spn_decimate, "decimate")
+        number(self.spn_visor, "visor")
+        number(self.spn_wear, "wear")
+        number(self.spn_dirt, "dirt")
+        number(self.spn_seed, "seed")
+
+        flag(self.chk_decor, "decor")
+        flag(self.chk_install, "install")
+
+        quality = data.get("quality")
+        if quality in QUALITY_PRESETS:
+            self.cmb_quality.setCurrentText(quality)
+
+    def _save_state(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+                json.dump(self._state(), fh, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            print(f"[BodyGen] настройки не сохранены: {exc}")
+
+    # ---- подтверждение ------------------------------------------------ #
+
+    def accept(self) -> None:
+        """
+        Перед закрытием — спросить про перезапись, если имя уже занято.
+
+        Проверка возможна только при ЯВНО заданном имени: пустое поле означает
+        «взять имя из источника», а оно известно лишь после разбора облака —
+        то есть после самой долгой части сборки.
+
+        Старый комплект именно удаляется, а не перезаписывается поверх: набор
+        файлов зависит от параметров (без шасси не будет `-Other.bam`, без
+        частей — .gltf), и остатки прошлой сборки собрались бы в комплект-химеру.
+        """
+        name = self.ed_name.text().strip()
+        out_dir = self.ed_out.text().strip() or DEFAULT_OUT_DIR
+        existing = existing_kit_paths(out_dir, name)
+        if existing:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Комплект уже существует")
+            box.setText(
+                f"«{name}» уже собран в этой папке.\n\n"
+                f"Перезаписать? Старые файлы ({len(existing)} шт.) будут "
+                f"удалены перед сборкой, отменить это нельзя.")
+            box.setDetailedText("\n".join(existing))
+            yes = box.addButton("Перезаписать",
+                                QMessageBox.ButtonRole.DestructiveRole)
+            back = box.addButton("Изменить имя",
+                                 QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(back)
+            box.exec()
+            if box.clickedButton() is not yes:
+                self.ed_name.setFocus()
+                self.ed_name.selectAll()
+                return
+            self._overwrite_paths = existing
+        else:
+            self._overwrite_paths = []
+
+        self._save_state()
+        super().accept()
+
+    def overwrite_paths(self) -> list:
+        """Файлы прошлого комплекта, которые пользователь согласился стереть."""
+        return list(self._overwrite_paths)
+
     # ---- результат ---------------------------------------------------- #
 
     def params(self) -> BodyGenParams:
@@ -311,6 +547,9 @@ class BodyGenDialog(QDialog):
             density=density, atlas=atlas, with_ao=ao,
             gltf_decimate=float(self.spn_decimate.value()),
             gltf_texture_max=int(self.cmb_texmax.currentData() or 0),
+            side_style=(self.cmb_side.currentData() or ""),
+            decor=bool(self.chk_decor.isChecked()),
+            visor_overhang=float(self.spn_visor.value()),
             paint=self.ed_paint.text().strip(),
             wear=float(self.spn_wear.value()),
             dirt=float(self.spn_dirt.value()),

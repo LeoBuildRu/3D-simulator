@@ -156,6 +156,18 @@ class BodyGenParams:
     gltf_decimate: float = 0.0
     gltf_texture_max: int = 0
 
+    #: Рельеф наружной грани борта. Форму эту лидар с мачты не видит вовсе —
+    #: борт снаружи в тени кузова, — поэтому она не меряется, а выбирается:
+    #: "" оставить как в спеке, иначе "none" | "panels" | "slanted" | "belt".
+    side_style: str = ""
+    #: Наклон стоек для "slanted", градусы; 0 — взять завал переднего борта.
+    side_slant_deg: float = 0.0
+    #: Достроить типовую обвязку и заднюю дверь. При сборке из облака они по
+    #: умолчанию выключены (не измерены), но на настоящем кузове они есть.
+    decor: bool = False
+    #: Вылет полки козырька вперёд, над кабиной, м. Отрицательное — не трогать.
+    visor_overhang: float = -1.0
+
     paint: str = ""                  # "#RRGGBB"
     wear: float = 0.45
     dirt: float = 0.62
@@ -203,6 +215,7 @@ def generate(params: BodyGenParams,
 
         if params.name:
             spec.name = params.name
+        _apply_visual(spec, params)
         if params.paint:
             spec.appearance.paint_rgb = _parse_color(params.paint)
         spec.appearance.wear = float(params.wear)
@@ -236,6 +249,39 @@ def generate(params: BodyGenParams,
         traceback.print_exc()
         return BodyGenResult(ok=False, error=f"{type(exc).__name__}: {exc}",
                              seconds=time.time() - t0)
+
+
+#: Флаги обвязки и задней двери — то, чего в облаке не видно, но что есть
+#: почти на любом кузове.
+_DECOR_FLAGS = ("ribs", "bottom_rail", "rear_door", "rear_post")
+
+
+def _apply_visual(spec, params: BodyGenParams) -> None:
+    """
+    Наложить на спек выбранный визуал.
+
+    Всё, что здесь задаётся, лидар с мачты показать не может: наружная грань
+    борта в тени кузова, а полка козырька стоит на высоте его щита и от него не
+    отделяется. Поэтому при сборке из облака `body_builder` эти элементы
+    выключает — чтобы модель не выдавала догадку за замер, — а включаются они
+    отсюда, явным выбором в интерфейсе.
+
+    Замеренные размеры не трогаются: меняются только форма рельефа и наличие
+    элементов.
+    """
+    f = spec.features
+    if params.side_style:
+        f.side_style = str(params.side_style)
+        # Стиль сам по себе ничего не построит, если рельеф выключен замером.
+        f.ribs = params.side_style != "none"
+    if params.side_slant_deg:
+        f.side_slant_deg = float(params.side_slant_deg)
+    if params.decor:
+        for name in _DECOR_FLAGS:
+            setattr(f, name, True)
+    if params.visor_overhang >= 0.0:
+        f.cab_visor = True
+        f.visor_overhang = float(params.visor_overhang)
 
 
 def _load_spec(params: BodyGenParams, say: Progress):

@@ -34,3 +34,9 @@ config/tls_config.yaml
 config/higgsfield.json
 /assets/models/generated
 /assets/models/trucks
+
+# OBJ, собранные из .bam перед загрузкой в реестр моделей
+assets/models/_registry_cache/
+
+# Локальные переопределения конфига серверов (токен реестра моделей)
+config/tls_config.local.yaml

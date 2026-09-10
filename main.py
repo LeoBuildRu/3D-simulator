@@ -2472,6 +2472,54 @@ class MyApp(ShowBase):
         
         return task.cont
 
+    def forget_cached_textures(self, root_dir):
+        """
+        Выбросить из TexturePool карты, лежащие под `root_dir`.
+
+        Пул кеширует текстуры ПО ПУТИ и не проверяет, изменился ли файл на
+        диске. Пересобрав комплект под тем же именем (сгенерировали заново,
+        перезаписали, скачали новую версию), мы получаем те же пути и те же
+        старые картинки: цвет краски, износ и грязь на модели остаются
+        прежними, хотя .png уже другой. `noCache=True` при загрузке модели тут
+        не помогает — он отменяет кеш МОДЕЛЕЙ, а не текстур.
+
+        Живой сцене это не вредит: у неё свои ссылки на объекты Texture,
+        удаляется только запись в пуле, по которой ищут следующие загрузки.
+
+        Пути сравниваются в НОТАЦИИ PANDA («/g/IQoko/...»), а не через
+        `to_os_specific()`: в пуле лежит кубическая карта неба, загруженная по
+        шаблону `#.png`, а `to_os_specific()` на шаблоне срабатывает ассертом
+        `!get_pattern()` и роняет процесс целиком — не исключением, поймать это
+        из Python нельзя.
+
+        Возвращает число выброшенных карт.
+        """
+        from panda3d.core import TexturePool
+
+        root = os.path.abspath(str(root_dir or ""))
+        if not root or not os.path.isdir(root):
+            return 0
+        prefix = Filename.from_os_specific(root).get_fullpath().rstrip("/")
+        if not prefix:
+            return 0
+        prefix = (prefix + "/").lower()
+
+        dropped = 0
+        for tex in list(TexturePool.find_all_textures()):
+            try:
+                name = tex.get_fullpath()
+                if name.get_pattern():
+                    continue
+                path = name.get_fullpath()
+            except Exception:
+                continue
+            if path and path.lower().startswith(prefix):
+                TexturePool.release_texture(tex)
+                dropped += 1
+        if dropped:
+            print(f"[TexturePool] сброшено карт из кеша: {dropped} ({root})")
+        return dropped
+
     def load_gltf_model(self, file_path):
         model_filename = Filename.from_os_specific(file_path)
         

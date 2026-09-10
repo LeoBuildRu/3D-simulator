@@ -7,3 +7,27 @@ servers:
     host: 78.25.191.12
     port: 9999
     active: true
+
+# Реестр моделей photo-to-volume (демон model-registry).
+#
+# Реестр слушает тот же порт 9999, что и operation3D, но под префиксом
+# /registry — корень порта остаётся за TLS-сервером (get_models_config и
+# прочие его маршруты).
+#
+# Токена здесь НЕТ и быть не должно: файл лежит в git. Свой токен положите
+# в config/tls_config.local.yaml (он в .gitignore), он перекроет эту секцию
+# по полям:
+#
+#     model_registry:
+#       token: "<токен>"
+#
+# Либо задайте переменную окружения MODEL_REGISTRY_TOKEN — она главнее обоих
+# файлов.
+model_registry:
+  url: http://78.25.191.12:9999/registry
+  # port / scheme / prefix — на случай, если адрес складывается из хоста
+  # активного сервера выше, а не задан целиком:
+  # port: 9999
+  # scheme: http
+  # prefix: registry
+  # verify_tls: true   # false, если у прокси самоподписанный сертификат
