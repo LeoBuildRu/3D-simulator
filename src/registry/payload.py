@@ -11,8 +11,20 @@
 генератор кузовов пишет кузов только в `.bam`: OBJ он экспортирует лишь для
 наполнителя. Гонять человека в Blender ради одного файла глупо, поэтому кузов
 конвертируется на месте средствами Panda3D — того же движка, который этот .bam
-и написал, так что координаты совпадают с наполнителем ровно, без пересчётов
-осей (проверено по `world_bounds` из `<stem>.set.json`).
+и написал, так что координаты остаются мировыми, как в .bam.
+
+ОСИ У ДВУХ OBJ РАЗНЫЕ, и это не оплошность, а требование сервера
+(`IQOKO-AVCS/src/main.cpp`):
+
+* `-Cuzov.obj` грузится с ЕДИНИЧНОЙ матрицей, и по нему трассируются лучи
+  камеры прямо в мировых координатах -> кузов обязан быть Z-up, как .bam;
+* `-Napolnitel.obj` грузится как `target_model`, и в отсутствие
+  `target_model_transform` в meta к нему применяется зашитое
+  (x, y, z) -> (-x, -z, y) -> наполнитель обязан быть Y-up.
+
+Так же устроены и ручные комплекты (`SCANIA-P8X400-…`: Cuzov.obj Z-up,
+Napolnitel.obj Y-up). Поворот делает сам генератор
+(`body_builder/export.py::export_obj`), здесь пересчитывать нечего.
 """
 
 from __future__ import annotations
@@ -21,6 +33,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.registry.anchor_points import points_from_mesh
 from src.registry.client import FILE_ROLES, REQUIRED_ROLES, suggest_key
 
 #: Суффикс имени файла -> роль в мультипарте. Порядок важен: `-Napolnitel.obj`
@@ -212,24 +225,44 @@ def detect_web_files(model_path: str) -> Tuple[List[Tuple[str, str]], str]:
     return out, ""
 
 
-def _rect_from_bounds(bounds: Any) -> Optional[List[List[float]]]:
+def _rect_from_set_json(data: Dict[str, Any]) -> Optional[List[List[float]]]:
     """
-    Четыре точки верхней кромки кузова из рамки `[[x0,y0,z0],[x1,y1,z1]]`.
+    Грубая заготовка `points_3d` из `<stem>.set.json`, когда меш недоступен.
 
-    Ровно то, что реестр ждёт в `points_3d`: прямоугольник верхнего проёма в
-    координатах модели, по часовой от правого дальнего угла.
+    Габариты наполнителя — плохая мерка для верхней кромки: наполнитель нарочно
+    продолжен вверх на «горку» (метр по умолчанию), а рамка вокруг завалённых
+    торцов длиннее проёма. По XY погрешность в пределах пары сантиметров и
+    терпима, а вот верх рамки надо опустить с потолка «горки» на борт — высота
+    берётся из объёма полости: `max_volume` в `.set.json` считается ровно до
+    верха борта, так что `объём / площадь дна` даёт высоту борта с точностью до
+    скруглений (на комплектах генератора это 5–8 см).
+
+    Порядок точек — как на сервере: по часовой стрелке от дальнего правого
+    угла, все на одной высоте.
     """
+    bounds = (data.get("world_bounds") or {}).get("napolnitel") \
+        or (data.get("world_bounds") or {}).get("body")
     try:
         (x0, y0, z0), (x1, y1, z1) = bounds
         x0, y0, z0 = float(x0), float(y0), float(z0)
         x1, y1, z1 = float(x1), float(y1), float(z1)
     except (TypeError, ValueError):
         return None
+
+    x_lo, x_hi = min(x0, x1), max(x0, x1)
+    y_lo, y_hi = min(y0, y1), max(y0, y1)
     top = max(z0, z1)
-    return [[max(x0, x1), max(y0, y1), top],
-            [min(x0, x1), max(y0, y1), top],
-            [min(x0, x1), min(y0, y1), top],
-            [max(x0, x1), min(y0, y1), top]]
+    area = (x_hi - x_lo) * (y_hi - y_lo)
+    try:
+        volume = float(data.get("max_volume") or 0.0)
+    except (TypeError, ValueError):
+        volume = 0.0
+    if volume > 0.0 and area > 1e-6:
+        top = min(top, min(z0, z1) + volume / area)
+
+    top = round(top, 4)
+    return [[x_hi, y_hi, top], [x_lo, y_hi, top],
+            [x_lo, y_lo, top], [x_hi, y_lo, top]]
 
 
 def _read_set_json(model_path: str) -> Dict[str, Any]:
@@ -244,6 +277,47 @@ def _read_set_json(model_path: str) -> Dict[str, Any]:
             return json.load(fh) or {}
     except Exception:
         return {}
+
+
+def _guess_points(model_path: str, plan: UploadPlan
+                  ) -> Tuple[Optional[List[List[float]]], str, bool]:
+    """
+    Заготовка `points_3d` для комплекта: (точки, строчка в журнал, точно ли).
+
+    Три источника по убыванию доверия:
+
+    1. `points_3d` в `<stem>.set.json` — их пишет сам генератор из спека
+       кузова, точнее уже некуда;
+    2. обмер меша кузова (`src/registry/anchor_points`) — работает и с
+       комплектами, которые генератор не собирал, и со старыми комплектами
+       генератора, у которых в `.set.json` точек ещё нет;
+    3. габариты комплекта из `.set.json` — грубо, но лучше пустого поля.
+
+    Обмер меша занимает секунду на крупном кузове (300 тыс. треугольников), и
+    делается он один раз при открытии диалога — асинхронности ради этого не
+    городим.
+    """
+    data = _read_set_json(model_path)
+    ready = data.get("points_3d")
+    if isinstance(ready, list) and len(ready) == 4:
+        return ([[float(v) for v in point] for point in ready],
+                "points_3d взяты из .set.json — их посчитал генератор кузова "
+                "по обмерам, править не нужно", True)
+
+    mesh = plan.roles.get("cuzov_bam") or plan.roles.get("cuzov_obj") \
+        or model_path
+    rect, note = points_from_mesh(mesh)
+    if rect:
+        return rect, ("points_3d обмерены " + note
+                      + " — сверьте с верхней кромкой перед загрузкой"), False
+
+    rough = _rect_from_set_json(data)
+    if rough:
+        return rough, ("points_3d посчитаны по габаритам комплекта: " + note
+                       + ". Это грубая оценка, проверьте верхнюю кромку "
+                         "кузова перед загрузкой"), False
+    return None, ("points_3d посчитать не по чему: " + note
+                  + "; задайте четыре точки верхней кромки вручную"), False
 
 
 def build_upload_plan(info: Any) -> UploadPlan:
@@ -286,16 +360,13 @@ def build_upload_plan(info: Any) -> UploadPlan:
     if isinstance(points, list) and len(points) == 4:
         meta["points_3d"] = points
     else:
-        data = _read_set_json(model_path)
-        bounds = (data.get("world_bounds") or {}).get("napolnitel") \
-            or (data.get("world_bounds") or {}).get("body")
-        rect = _rect_from_bounds(bounds)
+        rect, note, exact = _guess_points(model_path, plan)
         if rect:
             meta["points_3d"] = rect
-            plan.guessed.append("points_3d")
-            plan.notes.append(
-                "points_3d посчитаны по габаритам комплекта — проверьте "
-                "верхнюю кромку кузова перед загрузкой")
+            if not exact:
+                plan.guessed.append("points_3d")
+        if note:
+            plan.notes.append(note)
 
     cam_pos = [cfg.get("cam_pos_x"), cfg.get("cam_pos_y"), cfg.get("cam_pos_z")]
     cam_rot = [cfg.get("cam_rot_h"), cfg.get("cam_rot_p"), cfg.get("cam_rot_r")]
@@ -354,9 +425,10 @@ def bam_to_obj(bam_path: str, out_path: str = "") -> str:
     """
     Выгрузить геометрию .bam в OBJ и вернуть путь к нему.
 
-    Только вершины и треугольники: реестр и пайплайн считают по OBJ объём и
-    ставят анкеры, ни материалы, ни UV им не нужны. Координаты — мировые,
-    как в .bam, поэтому наполнитель и кузов остаются в одной системе.
+    Только вершины и треугольники: реестр и пайплайн ставят по OBJ анкеры,
+    ни материалы, ни UV им не нужны. Координаты — мировые, как в .bam, то есть
+    Z вверх; поворачивать их в Y-up НЕЛЬЗЯ — сервер трассирует по кузову лучи
+    камеры с единичной матрицей (подробности в шапке модуля).
 
     Panda3D грузит .bam без окна (`Loader.get_global_ptr()`), так что функция
     работает и в headless-режиме.

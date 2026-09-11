@@ -40,3 +40,4 @@ assets/models/_registry_cache/
 
 # Локальные переопределения конфига серверов (токен реестра моделей)
 config/tls_config.local.yaml
+config/registry_ui.json

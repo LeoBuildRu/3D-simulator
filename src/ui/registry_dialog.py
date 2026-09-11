@@ -44,6 +44,8 @@ from src.registry.client import (COMMON_ROLES, FILE_ROLES, REQUIRED_ROLES,
                                  RegistryConnectionError, UploadCancelled,
                                  validate_key)
 from src.registry.payload import bam_to_obj, build_upload_plan, meta_from_form
+from src.registry.remote_points import RemotePoints, fetch_remote_points
+from src.registry.prefs import load_prefs, save_prefs
 from src.registry.settings import RegistryEndpoint, resolve_registry
 from src.ui.ui_theme import (COLOR_ACCENT, COLOR_DANGER, COLOR_HAIRLINE,
                              COLOR_TEXT_MUTED, COLOR_WARN, FONT_MONO,
@@ -103,6 +105,16 @@ def _elide(path: str, keep: int = 52) -> str:
     return "…" + path[-(keep - 1):]
 
 
+class _JobAbort(RuntimeError):
+    """
+    Работу прервали до того, как что-то ушло на сервер.
+
+    От обычного исключения отличается тем, что текст писал не Python, а мы:
+    он объясняет оператору, что именно не сложилось и что на сервере ничего
+    не изменилось. Поэтому показывается как есть, без «Непредвиденная ошибка».
+    """
+
+
 class _Job(QThread):
     """
     Один сетевой вызов в фоне.
@@ -140,6 +152,9 @@ class _Job(QThread):
             result = self._work(self)
         except UploadCancelled:
             self.cancelled.emit()
+            return
+        except _JobAbort as exc:
+            self.failed.emit("Загрузка не начата", str(exc))
             return
         except ModelRegistryError as exc:
             self.failed.emit("Сервер отклонил запрос", exc.explain())
@@ -293,8 +308,23 @@ class ModelUploadDialog(QDialog):
         #: «ещё не спрашивали»: это разные вещи, и вопрос о замене задаётся
         #: только когда мы точно знаем, что модель там есть.
         self._remote: Any = False
+        #: Точки, прочитанные с сервера для показа (перед отправкой читаются
+        #: заново — между показом и загрузкой их могли поправить).
+        self._server_points: Optional[List[List[float]]] = None
+        #: Что было в поле points_3d до того, как туда лёг серверный вариант.
+        self._points_backup: str = ""
+        #: Спрашивали ли уже сервер о точках: «не нашлось» и «ещё не читали» —
+        #: разные вещи, блокировать кнопку можно только по первому.
+        self._points_probe_done = False
         self._textures: List[str] = list(self._plan.textures) if self._plan \
             else []
+        #: Ключ набора в списке кузовов — под ним лежат запомненные решения
+        #: оператора (имя модели, «беречь серверные точки»).
+        self._set_key = str(getattr(info, "key", "") or
+                            getattr(info, "name", "") or "")
+        #: Пока диалог собирается, галочка точек не должна лезть в сеть:
+        #: первым идёт _probe, иначе он отменится «занятой» задачей.
+        self._restoring = False
         self._started_at = 0.0
         self._uploaded = False
         self._uploaded_key = ""
@@ -331,6 +361,10 @@ class ModelUploadDialog(QDialog):
         root.addWidget(self.buttons)
 
         self._fill_from_plan()
+        #: Что диалог посчитал по комплекту сам — с этим сравниваем при
+        #: сохранении, чтобы помнить только ручные правки.
+        self._defaults = self._form_values()
+        self._restore_prefs()
         self._sync_state()
         if self._endpoint.ok:
             self._probe(auto=True)
@@ -538,10 +572,26 @@ class ModelUploadDialog(QDialog):
         self.ed_points.setFixedHeight(64)
         self.ed_points.setFont(QFont(FONT_MONO.split(",")[0].strip("' "), 9))
         self.ed_points.setToolTip(
-            "Четыре точки [x, y, z] — прямоугольник верхней кромки кузова.\n"
+            "Четыре точки [x, y, z] — ВНУТРЕННИЕ углы верхней кромки кузова, "
+            "по часовой стрелке от дальнего правого, все на одной высоте.\n"
+            "Если борта разной высоты — по низкому борту, как на сервере.\n"
             "C++-пайплайн их не читает, но конфиг без них сервер не примет "
             "в режиме полной замены.")
         lay.addRow("points_3d", self.ed_points)
+
+        # Единственное поле записи конфига, которое правят не у нас: точки
+        # подгоняет оператор через утилиту, и «полная замена» затирала бы
+        # чужую правку молча. С галочкой точки читаются с сервера перед самой
+        # отправкой и уезжают обратно как есть (см. src/registry/remote_points).
+        self.chk_keep_points = QCheckBox("Сохранить точки с сервера")
+        self.chk_keep_points.setToolTip(
+            "Не перезаписывать points_3d: перед отправкой они читаются с "
+            "сервера и уходят обратно без изменений.\n"
+            "Так обновление геометрии кузова не сбрасывает подгонку точек, "
+            "сделанную в утилите.")
+        self.chk_keep_points.toggled.connect(self._on_keep_points_toggled)
+        lay.addRow("", self.chk_keep_points)
+
         self.lbl_points = QLabel("")
         self.lbl_points.setStyleSheet(f"color: {COLOR_WARN}; font-size: 11px;")
         self.lbl_points.setWordWrap(True)
@@ -660,7 +710,8 @@ class ModelUploadDialog(QDialog):
                 json.dumps(points, ensure_ascii=False))
         if "points_3d" in plan.guessed:
             self.lbl_points.setText(
-                "посчитано по габаритам комплекта — проверьте перед загрузкой")
+                "посчитано по кузову — сверьте с верхней кромкой перед "
+                "загрузкой (подробности в журнале)")
         camera = meta.get("camera")
         if camera:
             values = list(camera.get("pos", [0, 0, 0])) \
@@ -674,6 +725,89 @@ class ModelUploadDialog(QDialog):
 
         for note in plan.notes:
             self._log(note)
+
+    # ---- память диалога ----------------------------------------------
+    def _form_values(self) -> Dict[str, Any]:
+        """Снимок всех настраиваемых полей диалога — как есть."""
+        return {
+            "key": self.ed_key.text().strip(),
+            "display_name": self.ed_display.text().strip(),
+            "mode": self._mode(),
+            "max_volume": round(self.sp_volume.value(), 4),
+            "ground_plane": round(self.sp_ground.value(), 4),
+            "points_3d": self.ed_points.toPlainText().strip(),
+            "keep_points": self.chk_keep_points.isChecked(),
+            "camera_on": self.chk_camera.isChecked(),
+            "camera": [round(sp.value(), 4) for sp in self.cam_fields],
+            "textures": self.chk_textures.isChecked(),
+            "web": self.chk_web.isChecked(),
+        }
+
+    def _apply_values(self, values: Dict[str, Any]) -> None:
+        """Разложить снимок обратно по полям, молча пропуская мусор."""
+        key = str(values.get("key") or "")
+        if key and not validate_key(key):
+            self.ed_key.setText(key)
+        if "display_name" in values:
+            self.ed_display.setText(str(values.get("display_name") or ""))
+        if values.get("mode") == "patch":
+            self.rb_patch.setChecked(True)
+        elif values.get("mode") == "replace":
+            self.rb_replace.setChecked(True)
+        if "max_volume" in values:
+            self.sp_volume.setValue(float(values["max_volume"] or 0.0))
+        if "ground_plane" in values:
+            self.sp_ground.setValue(float(values["ground_plane"] or 0.0))
+        if "points_3d" in values:
+            self.ed_points.setPlainText(str(values.get("points_3d") or ""))
+        if "camera_on" in values:
+            self.chk_camera.setChecked(bool(values["camera_on"]))
+        camera = values.get("camera")
+        if isinstance(camera, list) and len(camera) == len(self.cam_fields):
+            for sp, value in zip(self.cam_fields, camera):
+                sp.setValue(float(value or 0.0))
+        # Галочки файлов не включаем, если включать нечего: текстур или
+        # веб-комплекта рядом с этой версией набора может уже не быть.
+        if "textures" in values and self.chk_textures.isEnabled():
+            self.chk_textures.setChecked(bool(values["textures"]))
+        if "web" in values and self.chk_web.isEnabled():
+            self.chk_web.setChecked(bool(values["web"]))
+        if "keep_points" in values:
+            self._restoring = True
+            try:
+                self.chk_keep_points.setChecked(bool(values["keep_points"]))
+            finally:
+                self._restoring = False
+
+    def _restore_prefs(self) -> None:
+        """
+        Вернуть то, что оператор правил руками в прошлый раз.
+
+        Помним не весь снимок, а только поля, отличавшиеся от посчитанных по
+        комплекту (см. `_save_prefs`). Иначе память диалога перекрывала бы
+        свежие данные набора: перегенерировали кузов с другим объёмом — а в
+        полях старые числа, и никто не заметил.
+        """
+        prefs = load_prefs(self._set_key)
+        if prefs:
+            self._apply_values(prefs)
+
+    def _save_prefs(self) -> None:
+        """Сохранить только правки: совпавшее с автозаполнением не помним."""
+        current = self._form_values()
+        edited = {name: value for name, value in current.items()
+                  if value != self._defaults.get(name)}
+        # Ключ храним всегда: под ним лежит модель на сервере, и по нему
+        # понятно, к какой записи реестра относятся остальные правки.
+        edited["key"] = current["key"]
+        save_prefs(self._set_key, edited)
+
+    def done(self, result: int) -> None:                  # noqa: D102
+        try:
+            self._save_prefs()
+        except Exception as exc:                          # noqa: BLE001
+            print(f"[Registry] настройки диалога не сохранены: {exc}")
+        super().done(result)
 
     def _show_rare_roles(self) -> None:
         for role, row in self.rows.items():
@@ -799,7 +933,13 @@ class ModelUploadDialog(QDialog):
             if self.sp_volume.value() <= 0:
                 out.append("не задан max_volume — сервер обязательно требует "
                            "его при полной замене")
-            if not self.ed_points.toPlainText().strip():
+            if self.chk_keep_points.isChecked():
+                # Точки берём с сервера, но если их там нет, взять нечего —
+                # а сервер при полной замене их требует.
+                if self._points_probe_done and self._server_points is None:
+                    out.append("на сервере нет points_3d, сохранять нечего — "
+                               "снимите галочку и задайте точки вручную")
+            elif not self.ed_points.toPlainText().strip():
                 out.append("не заданы points_3d — четыре точки верхней кромки "
                            "кузова, сервер требует их при полной замене")
         elif not self._selected_files() and not self._selected_textures() \
@@ -828,6 +968,8 @@ class ModelUploadDialog(QDialog):
         # Ключ сменился — то, что мы знали о модели на сервере, больше не
         # про неё: спросим заново перед загрузкой.
         self._remote = False
+        self._server_points = None
+        self._points_probe_done = False
         self._sync_state()
 
     # ---- журнал ------------------------------------------------------
@@ -885,9 +1027,79 @@ class ModelUploadDialog(QDialog):
             if not remote.get("ready"):
                 for problem in remote.get("problems") or []:
                     self._log(f"на сервере: {problem}")
+            if (remote.get("config") or {}).get("points_3d")                     and not self.chk_keep_points.isChecked():
+                self._log("у модели на сервере заданы points_3d — включите "
+                          "«Сохранить точки с сервера», чтобы полная замена "
+                          "их не затёрла")
             mirror = _mirror_note(remote)
             if mirror:
                 self._log(f"внимание: {mirror}")
+        self._sync_state()
+        # Галочка могла приехать из запомненных настроек — тогда точки с
+        # сервера ещё не читались: во время сборки диалога сеть не трогаем.
+        if self.chk_keep_points.isChecked() and not self._points_probe_done:
+            self._fetch_points_preview()
+
+    # ---- points_3d с сервера -----------------------------------------
+    def _on_keep_points_toggled(self, on: bool) -> None:
+        """Галочка «Сохранить точки с сервера»."""
+        self.ed_points.setReadOnly(on)
+        if on:
+            self._points_backup = self.ed_points.toPlainText()
+            self._set_points_note(
+                "точки читаются с сервера перед отправкой и уезжают обратно "
+                "без изменений", warn=False)
+            if not self._restoring:
+                self._fetch_points_preview()
+        else:
+            # Возвращаем то, что было до подстановки серверных точек: иначе
+            # снятая галочка оставляет чужие точки на редактирование, и
+            # затирание, от которого мы уходим, случится вручную.
+            if self._server_points is not None:
+                self.ed_points.setPlainText(self._points_backup)
+            self._set_points_note("", warn=False)
+        self._sync_state()
+
+    def _set_points_note(self, text: str, warn: bool) -> None:
+        self.lbl_points.setText(text)
+        self.lbl_points.setStyleSheet(
+            f"color: {COLOR_WARN if warn else COLOR_TEXT_MUTED};"
+            f" font-size: 11px;")
+
+    def _fetch_points_preview(self) -> None:
+        """Показать текущие точки с сервера, не дожидаясь загрузки."""
+        key = self.ed_key.text().strip()
+        if validate_key(key):
+            return
+        if self._job is not None and self._job.isRunning():
+            return                     # покажем при следующем случае
+        client = self._client()
+
+        def work(_job: _Job) -> RemotePoints:
+            return fetch_remote_points(client, key)
+
+        self._log("читаем текущие points_3d с сервера…")
+        self._run_job(work, self._on_points_fetched,
+                      on_fail=self._on_probe_failed_quiet)
+
+    def _on_points_fetched(self, found: RemotePoints) -> None:
+        self._server_points = found.points
+        self._points_probe_done = True
+        for note in found.notes:
+            self._log(f"points_3d: {note}")
+        if not self.chk_keep_points.isChecked():
+            self._sync_state()
+            return
+        if found.ok:
+            self.ed_points.setPlainText(
+                json.dumps(found.points, ensure_ascii=False))
+            self._set_points_note(
+                f"точки с сервера ({found.source}) — уедут обратно как есть",
+                warn=False)
+        else:
+            self._set_points_note(
+                "точек на сервере не нашлось — снимите галочку и задайте их "
+                "вручную", warn=True)
         self._sync_state()
 
     def _on_probe_failed(self, title: str, text: str) -> None:
@@ -1006,6 +1218,11 @@ class ModelUploadDialog(QDialog):
         """`meta` из полей формы или None, если поля не разобрались."""
         points = None
         raw = self.ed_points.toPlainText().strip()
+        if self.chk_keep_points.isChecked():
+            # Точки подставляются перед самой отправкой, уже прочитанные с
+            # сервера: то, что лежит в поле сейчас, — только показ, и за
+            # время диалога их могли поправить ещё раз.
+            raw = ""
         if raw:
             try:
                 points = json.loads(raw)
@@ -1106,6 +1323,9 @@ class ModelUploadDialog(QDialog):
                 if self._mode() == "replace" else
                 "Недостающие файлы останутся от прежней версии, обновятся "
                 "только присланные.")
+            if self.chk_keep_points.isChecked():
+                mode_line += ("\npoints_3d будут прочитаны с сервера и "
+                              "возвращены как есть.")
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Warning)
             box.setWindowTitle("Модель уже есть на сервере")
@@ -1135,7 +1355,28 @@ class ModelUploadDialog(QDialog):
         client = self._client()
         mode = self._mode()
 
+        keep_points = self.chk_keep_points.isChecked()
+
         def work(job: _Job) -> Dict[str, Any]:
+            if keep_points:
+                # Читаем прямо здесь, а не при показе диалога: между показом и
+                # отправкой точки могли поправить ещё раз, а смысл опции — не
+                # тронуть то, что на сервере лежит СЕЙЧАС.
+                job.message.emit("читаем points_3d с сервера…")
+                found = fetch_remote_points(client, key)
+                for note in found.notes:
+                    job.message.emit(f"points_3d: {note}")
+                if not found.ok:
+                    raise _JobAbort(
+                        "Сохранить points_3d не получилось: на сервере их не "
+                        "нашлось.\n\n"
+                        + "\n".join(found.notes)
+                        + "\n\nНа сервер ничего не отправлено. Снимите "
+                          "галочку «Сохранить точки с сервера» и задайте "
+                          "точки вручную.")
+                meta["points_3d"] = found.points
+                job.message.emit(f"points_3d сохраняются как есть "
+                                 f"({found.source})")
             job.message.emit(
                 f"отправляем {len(files) + len(textures) + len(web_files)} "
                 f"файл(ов), режим {mode}…")
