@@ -317,6 +317,12 @@ def _apply_visual(spec, params: BodyGenParams) -> None:
         f.side_style = str(params.side_style)
         # Стиль сам по себе ничего не построит, если рельеф выключен замером.
         f.ribs = params.side_style != "none"
+        # Вместе с рёбрами возвращается и верхняя обвязка. Стойки упираются
+        # именно в неё: без планки продольные балки шли до самого верха борта
+        # и упирались в воздух — на скане c59e63b9 замер дал 29 мм вылета,
+        # порог не прошёл, и борт остался со стойками, но без верхней балки.
+        if f.ribs:
+            f.top_rail = True
     if params.side_slant_deg:
         f.side_slant_deg = float(params.side_slant_deg)
     if params.decor:
