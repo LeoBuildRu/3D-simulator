@@ -13,9 +13,12 @@ sys.path.append(os.path.join(current_dir, "render_pipeline"))
 # INCLUDE FILES — кладём всё, что нужно EXE
 # -----------------------------------------------------
 include_files = [
-    # assets/models содержит base.bam + base_without_ground.bam + текстуры в
-    # подпапке tex. Копируется рекурсивно — не разбивать на отдельные строки.
-    ("assets/models", "assets/models"),
+    # assets/models — поштучно: _registry_cache/ и generated/ это локальные
+    # кеши/результаты генератора (гигабайты), в билд они не идут.
+    ("assets/models/base.bam", "assets/models/base.bam"),
+    ("assets/models/base_without_ground.bam", "assets/models/base_without_ground.bam"),
+    ("assets/models/tex", "assets/models/tex"),
+    ("assets/models/trucks", "assets/models/trucks"),
     ("assets/textures", "assets/textures"),
     ("assets/height_examples", "assets/height_examples"),
     ("assets/fonts", "assets/fonts"),
@@ -97,7 +100,8 @@ build_exe_options = {
 
     # Билд кладём отдельно от исходников проекта, чтобы toner_project/
     # оставался чистым (никаких build/ внутри репозитория).
-    "build_exe": r"C:\Users\larle\compile_vizUtil_cx_Freeze",
+    # Переопределяется переменной окружения SIM_BUILD_DIR.
+    "build_exe": os.environ.get("SIM_BUILD_DIR") or os.path.join(current_dir, "build", "3D_Simulator"),
 }
 
 # -----------------------------------------------------
@@ -121,3 +125,16 @@ setup(
     options={"build_exe": build_exe_options},
     executables=executables
 )
+
+# -----------------------------------------------------
+# Чистка байткод-кешей, приехавших вместе с include_files
+# (render_pipeline, warp). Модули самого приложения лежат в lib/ и не трогаются.
+# -----------------------------------------------------
+if "build" in sys.argv or "build_exe" in sys.argv:
+    import shutil
+    out_dir = build_exe_options["build_exe"]
+    for sub in ("render_pipeline", "warp", "src", "lib/rpplugins"):
+        for root, dirs, _ in os.walk(os.path.join(out_dir, sub)):
+            if "__pycache__" in dirs:
+                shutil.rmtree(os.path.join(root, "__pycache__"), ignore_errors=True)
+                dirs.remove("__pycache__")

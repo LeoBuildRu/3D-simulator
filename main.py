@@ -5,7 +5,7 @@ import traceback
 # Если приложение скомпилировано, базовый путь — каталог с exe,
 # иначе — текущая директория (для разработки)
 if getattr(sys, 'frozen', False):
-    base_path = os.path.dirname(sys.exefcutable)
+    base_path = os.path.dirname(sys.executable)
 else:
     base_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -114,7 +114,7 @@ from direct.showbase.DirectObject import DirectObject
 
 from noise import pnoise2
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = base_path  # в exe __file__ указывает внутрь library.zip
 RP_PATH = os.path.join(PROJECT_ROOT, "render_pipeline")
 if RP_PATH not in sys.path:
     sys.path.insert(0, RP_PATH)
