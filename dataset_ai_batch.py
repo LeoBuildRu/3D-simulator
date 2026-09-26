@@ -67,7 +67,7 @@ def configure(dataset: str) -> None:
     global ROOT, RESULT, STAGE, PLAN_FILE, TOTAL, _PLAN_BUILDER, _PROMPT_BUILDER
     if dataset == "main":
         return
-    import hardcase_config as cfg
+    cfg = __import__("hardcase_config" if dataset == "hardcase" else "newset_config")
     ROOT = cfg.ROOT
     RESULT = ROOT / "result"
     STAGE = RESULT / "_stage"
@@ -796,8 +796,9 @@ def print_plan(plan: list[dict]) -> None:
 # ─────────────────────────── CLI ───────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(description="AI-обработка и сборка сегментационного датасета.")
-    ap.add_argument("--dataset", choices=["main", "hardcase"], default="main",
-                    help="main = 13.08 (500 кадров), hardcase = сложные случаи (250)")
+    ap.add_argument("--dataset", choices=["main", "hardcase", "newset"], default="main",
+                    help="main = 13.08 (500), hardcase = сложные случаи (250), "
+                         "newset = сложные случаи на свежем пуле (300)")
     ap.add_argument("--stage-step", dest="step", default="plan",
                     choices=["plan", "stage", "generate", "fix", "crest", "finalize", "all"])
     ap.add_argument("--max", type=int, default=DEFAULT_MAX_PER_RUN,

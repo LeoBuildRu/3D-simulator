@@ -38,6 +38,7 @@ from fix_ai_offset import IDENTITY, seg_score  # noqa: E402
 ROOTS = {
     "main": pathlib.Path(r"D:\IQoko\datasets\13.08\result"),
     "hardcase": pathlib.Path(r"D:\IQoko\datasets\hardcase\result"),
+    "newset": pathlib.Path(r"D:\IQoko\datasets\newset\result"),
 }
 CARGO, BODY = (253, 2, 2), (40, 85, 243)
 

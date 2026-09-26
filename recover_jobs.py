@@ -40,6 +40,7 @@ CLI = r"C:\Users\xmake\AppData\Roaming\npm\node_modules\@higgsfield\cli\bin\higg
 STAGES = {
     "main": Path(r"D:\IQoko\datasets\13.08\result\_stage"),
     "hardcase": Path(r"D:\IQoko\datasets\hardcase\result\_stage"),
+    "newset": Path(r"D:\IQoko\datasets\newset\result\_stage"),
 }
 
 
