@@ -98,12 +98,18 @@ class DepthMapRenderer:
         fb_props.set_depth_bits(32)
         fb_props.set_float_depth(True)
         
-        self.depth_buffer = self.base.win.make_texture_buffer("depth_buffer", win_width, win_height, 
-                                                              self.depth_texture, to_ram=True)
-        
+        # Глубина остаётся ТОЛЬКО на GPU. Раньше тут стоял to_ram=True
+        # (RTM_copy_ram): каждый кадр 8 МБ float-глубины синхронно тянулись в
+        # RAM, и CPU ждал, пока GPU доработает весь кадр, — ~18 мс на кадр, FPS
+        # на «ультра» падал вдвое. Оверлей и датасетный колорайзер читают
+        # текстуру шейдером, RAM им не нужна; превью в Qt берёт маленькую
+        # копию по запросу — см. preview_depth().
+        self.depth_buffer = self.base.win.make_texture_buffer("depth_buffer", win_width, win_height,
+                                                              self.depth_texture, to_ram=False)
+
         if self.depth_buffer is None:
             self.depth_buffer = self.base.graphicsEngine.make_output(
-                self.base.pipe, "depth_buffer", 0, 
+                self.base.pipe, "depth_buffer", 0,
                 fb_props,
                 WindowProperties.size(win_width, win_height),
                 GraphicsPipe.BF_refuse_window,
@@ -111,8 +117,8 @@ class DepthMapRenderer:
             )
             if self.depth_buffer:
                 self.depth_buffer.add_render_texture(
-                    self.depth_texture, 
-                    GraphicsOutput.RTM_copy_ram, 
+                    self.depth_texture,
+                    GraphicsOutput.RTM_bind_or_copy,
                     GraphicsOutput.RTP_depth
                 )
         
@@ -284,6 +290,133 @@ class DepthMapRenderer:
             self.base.camera = original_camera
             self.depth_buffer.set_active(False)
     
+    # ------------------------------------------------------------------
+    # Маленькая копия глубины для превью в Qt.
+    #
+    # Сырая (нелинейная) глубина прореживается на GPU в буфер PREVIEW_SIZE с
+    # float-цветом и читается в RAM только по запросу, асинхронно (PBO, см.
+    # src/core/gl_sync.py): ~0.5 МБ раз в тик превью и без ожидания GPU,
+    # вместо полного кадра глубины синхронно в каждом кадре.
+    # ------------------------------------------------------------------
+    PREVIEW_SIZE = (480, 270)
+
+    def _ensure_preview(self):
+        if getattr(self, "_preview_buf", None) is not None:
+            return self._preview_buf
+        if getattr(self, "_preview_failed", False) or not self.depth_buffer:
+            return None
+        try:
+            w, h = self.PREVIEW_SIZE
+            fb = FrameBufferProperties()
+            fb.set_rgba_bits(32, 0, 0, 0)
+            fb.set_float_color(True)
+            fb.set_depth_bits(0)
+            buf = self.base.graphicsEngine.make_output(
+                self.base.pipe, "depth_preview_buf",
+                self.depth_buffer.get_sort() + 1, fb,
+                WindowProperties.size(w, h),
+                GraphicsPipe.BF_refuse_window,
+                self.base.win.get_gsg(), self.base.win)
+            if buf is None:
+                raise RuntimeError("make_output вернул None")
+            buf.set_clear_color_active(True)
+            buf.set_clear_color((1, 0, 0, 1))
+
+            root = NodePath("depth_preview_root")
+            root.set_depth_test(False)
+            root.set_depth_write(False)
+            cm = CardMaker("depth_preview_card")
+            cm.set_frame(-1, 1, -1, 1)
+            card = root.attach_new_node(cm.generate())
+            card.set_shader(Shader.make(Shader.SL_GLSL, """
+                #version 330
+                uniform mat4 p3d_ModelViewProjectionMatrix;
+                in vec4 p3d_Vertex;
+                in vec2 p3d_MultiTexCoord0;
+                out vec2 texcoord;
+                void main() {
+                    gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
+                    texcoord = p3d_MultiTexCoord0;
+                }""", """
+                #version 330
+                uniform sampler2D depthMap;
+                in vec2 texcoord;
+                out vec4 o;
+                void main() { o = vec4(texture(depthMap, texcoord).r, 0.0, 0.0, 1.0); }
+                """))
+            card.set_shader_input("depthMap", self.depth_texture)
+
+            lens = OrthographicLens()
+            lens.set_film_size(2, 2)
+            lens.set_near_far(-10, 10)
+            cam = root.attach_new_node(Camera("depth_preview_cam", lens))
+            cam.set_pos(0, -1, 0)
+            dr = buf.make_display_region(0, 1, 0, 1)
+            dr.set_camera(cam)
+
+            # Основной путь — асинхронное чтение через PBO (не ждёт GPU).
+            # Без PyOpenGL — triggered copy: работает, но каждая копия ждёт
+            # всю очередь кадров драйвера.
+            self._preview_reader = None
+            self._preview_tex = None
+            try:
+                from src.core.gl_sync import AsyncReadback
+                self._preview_reader = AsyncReadback(dr, w, h, channels=1,
+                                                     dtype="float32")
+            except Exception as exc:
+                print(f"[Depth] асинхронное чтение недоступно ({exc}) — "
+                      f"превью через triggered copy")
+                tex = Texture("depth_preview")
+                ok = buf.add_render_texture(
+                    tex, GraphicsOutput.RTM_triggered_copy_ram,
+                    GraphicsOutput.RTP_color)
+                if ok is False:
+                    raise RuntimeError("add_render_texture отклонён")
+                self._preview_tex = tex
+
+            self._preview_buf = buf
+            self._preview_root = root
+            self._preview_last = None
+            return buf
+        except Exception as exc:
+            print(f"[Depth] превью-буфер недоступен: {exc}")
+            self._preview_failed = True
+            return None
+
+    def preview_depth(self):
+        """
+        Последняя пришедшая копия сырой глубины для превью: float32 массив
+        (h, w) в порядке строк Panda (снизу вверх), либо None, пока первая
+        копия не пришла. Заодно заказывает следующую копию — её отдаст уже
+        следующий вызов, поэтому превью отстаёт на один тик.
+        """
+        buf = self._ensure_preview()
+        if buf is None:
+            return None
+        reader = self._preview_reader
+        if reader is not None:
+            reader.request()
+            return reader.latest
+        tex = self._preview_tex
+        if tex.has_ram_image():
+            try:
+                import numpy as np
+                w, h = tex.get_x_size(), tex.get_y_size()
+                ncomp = tex.get_num_components()
+                raw = np.frombuffer(memoryview(tex.get_ram_image()),
+                                    dtype=np.float32)
+                if raw.size == w * h * ncomp:
+                    # В RAM-образе Panda каналы идут как BGR(A) — красный,
+                    # где лежит глубина, у многоканальной текстуры последний
+                    # из цветовых.
+                    ch = 0 if ncomp == 1 else min(2, ncomp - 1)
+                    self._preview_last = raw.reshape(h, w, ncomp)[:, :, ch].copy()
+            except Exception as exc:
+                print(f"[Depth] копия превью не разобрана: {exc}")
+            tex.clear_ram_image()
+        buf.trigger_copy()
+        return self._preview_last
+
     def toggle_overlay(self):
         if self.overlay_node:
             if self.overlay_node.isHidden():

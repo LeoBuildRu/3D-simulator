@@ -1,0 +1,11 @@
+# Clip an object by a plane (RenderPipeline effect).
+# Used when the fill switches from the hologram to PBR: everything "behind"
+# the plane cineClip (dot(p, xyz) > w, world space) is not drawn.
+# Set the plane on the node: set_shader_input("cineClip", Vec4(nx, ny, nz, d)).
+# NOTE: keep this file ASCII - RenderPipeline reads it with the system codepage.
+
+fragment:
+    inout: |
+        uniform vec4 cineClip;
+    texcoord: |
+        if (dot(vOutput.position, cineClip.xyz) > cineClip.w) discard;

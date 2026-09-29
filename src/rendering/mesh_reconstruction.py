@@ -21,19 +21,53 @@
 
 import os
 import json
+from dataclasses import dataclass
+from typing import Any, Dict
 
-try:
-    import trimesh
-except ImportError as _e:  # pragma: no cover
-    trimesh = None
-    _TRIMESH_IMPORT_ERROR = _e
-else:
-    _TRIMESH_IMPORT_ERROR = None
+import numpy as np
 
 try:
     from tkinter import filedialog
 except ImportError:
     filedialog = None
+
+
+def uv_scale_for(tex_set) -> tuple:
+    """
+    Повторы текстуры наполнителя (U, V) из набора текстур.
+
+    Тайлинг берём из текущего набора текстур (textures_napolnitel_config.json
+    на сервере), а не из жёстко зашитых Babylon-констант — иначе правка
+    textureRepeatX/Y на сервере не влияет на меш реконструкции. Fallback на
+    исторические Babylon-значения, если набор ещё не подъехал.
+    """
+    tex_set = tex_set or {}
+    out = []
+    for key, fallback in (("textureRepeatX", 0.7), ("textureRepeatY", 1.8)):
+        try:
+            out.append(float(tex_set.get(key, fallback)))
+        except (TypeError, ValueError):
+            out.append(fallback)
+    return tuple(out)
+
+
+#: Карты материала наполнителя (diffuse, normal, roughness) — тот же набор
+#: groundV2_4k, что у babylon-viewer.js.
+_GROUND_TEX_DIR = os.path.join("assets", "textures", "groundV2_4k")
+_GROUND_MAPS = tuple(os.path.join(_GROUND_TEX_DIR, name) for name in (
+    "Ground_basecolor.jpg", "Ground_normal.jpg", "Ground_roughness.jpg"))
+
+
+@dataclass
+class PreparedMesh:
+    """Результат `MeshReconstruction.prepare`: всё, что нужно для сцены."""
+
+    json_path: str
+    data: Dict[str, Any]
+    obj_path: str
+    vertices: np.ndarray        # (N,3) float64
+    faces: np.ndarray           # (M,3) int64
+    interleaved: np.ndarray     # (N,8) float32: pos, normal, uv
 
 
 class MeshReconstruction:
@@ -79,15 +113,40 @@ class MeshReconstruction:
         self.run_2d_to_3d_reconstruction_from(self.recon_json_path)
 
     def run_2d_to_3d_reconstruction_from(self, json_path: str, ply_path=None) -> None:
+        """Синхронный запуск: подготовка и применение подряд в этом потоке.
+
+        Интерфейс по проездам этим больше не пользуется — он зовёт
+        `prepare()` из фонового потока и `apply()` из главного (см.
+        src/rendering/recon_job.py), чтобы рендер не вставал.
+        """
         # Чистим предыдущий результат — иначе повторный запуск накапливает
         # меши на сцене (точно как делал старый модуль).
         self._dispose_previous_mesh()
+        tex_set = getattr(self.panda_app, "current_texture_set", None) or {}
+        prepared = self.prepare(json_path, uv_scale=uv_scale_for(tex_set))
+        if prepared is not None:
+            self.apply(prepared)
+
+    # ------------------------------------------------------------------
+    # Подготовка: сеть, диск, numpy. Сцену не трогает — можно из потока.
+    # ------------------------------------------------------------------
+    def prepare(self, json_path: str, uv_scale=(0.7, 1.8)):
+        """
+        Прочитать JSON, скачать `_result.obj` (если его ещё нет рядом),
+        разобрать и посчитать нормали/UV. Возвращает `PreparedMesh` или None
+        (причина уже в логе).
+
+        `uv_scale` — повторы текстуры (textureRepeatX/Y выбранного набора):
+        RenderPipeline не уважает матрицу TextureStage, поэтому масштаб
+        зашивается прямо в texcoord.
+        """
+        from src.rendering import mesh_io
 
         self.log("🚀 Запуск 2D-3D реконструкции (server-side)")
 
         if not json_path or not os.path.isfile(json_path):
             self.log(f"❌ JSON не найден: {json_path!r}")
-            return
+            return None
 
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -102,47 +161,76 @@ class MeshReconstruction:
                 "Серверный mesh_reconstruction либо ещё не запускался, "
                 "либо упал на этапе boolean diff."
             )
-            return
-
-        if self.tls_client is None:
-            self.log("❌ TLS client не передан в MeshReconstruction — нечем скачать .obj")
-            return
-
-        if trimesh is None:
-            self.log(f"❌ trimesh не установлен: {_TRIMESH_IMPORT_ERROR}")
-            return
+            return None
 
         # Кладём .obj рядом с JSON; если уже лежит — не качаем повторно.
         local_obj_path = os.path.join(os.path.dirname(json_path), result_obj)
         if os.path.isfile(local_obj_path):
             self.log(f"📁 Использую локальную копию {result_obj}")
         else:
+            if self.tls_client is None:
+                self.log("❌ TLS client не передан в MeshReconstruction — нечем скачать .obj")
+                return None
             self.log(f"⬇️ Скачиваю {result_obj} с сервера...")
             try:
                 self.tls_client.download_file(result_obj, local_obj_path)
             except Exception as exc:
                 self.log(f"❌ Не удалось скачать {result_obj}: {exc}")
-                return
+                return None
 
-        # Парсим .obj. Сервер пишет plain vertices+triangles (без UV/normals),
-        # trimesh нормально это глотает.
+        # Сервер пишет plain vertices+triangles (без UV/normals).
         try:
-            mesh = trimesh.load(local_obj_path, force="mesh")
+            vertices, faces = mesh_io.load_obj_arrays(local_obj_path)
         except Exception as exc:
             self.log(f"❌ Не удалось разобрать {result_obj}: {exc}")
-            return
+            return None
 
-        if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        if len(vertices) == 0 or len(faces) == 0:
             self.log("❌ .obj пустой или некорректный")
-            return
+            return None
 
-        self.log(f"✅ Меш загружен: {len(mesh.vertices)} вершин, {len(mesh.faces)} треугольников")
+        self.log(f"✅ Меш загружен: {len(vertices)} вершин, {len(faces)} треугольников")
 
-        # trimesh → Panda3D NodePath (вычисляет нормали, формирует Geom).
-        node_path = self.panda_app.trimesh_to_panda(mesh)
+        normals = mesh_io.vertex_normals(vertices, faces)
+        uv = mesh_io.planar_uv(vertices, *uv_scale)
+        # Текстуры материала — в TexturePool заранее: декодирование 4k-карт
+        # в apply() стоило бы кадров. Загрузчик Panda отпускает GIL.
+        from panda3d.core import Filename
+        for path in _GROUND_MAPS:
+            if os.path.isfile(path):
+                try:
+                    self.panda_app.loader.loadTexture(
+                        Filename.fromOsSpecific(str(path)))
+                except Exception:
+                    pass
+        return PreparedMesh(
+            json_path=json_path,
+            data=data,
+            obj_path=local_obj_path,
+            vertices=vertices,
+            faces=faces,
+            interleaved=mesh_io.interleave_v3n3t2(vertices, normals, uv),
+        )
+
+    # ------------------------------------------------------------------
+    # Применение: только главный поток.
+    # ------------------------------------------------------------------
+    def apply(self, prepared: "PreparedMesh"):
+        """Собрать Geom из подготовленных массивов и поставить в сцену.
+
+        Возвращает NodePath меша или None.
+        """
+        from src.rendering import mesh_io
+
+        self._dispose_previous_mesh()
+        data = prepared.data
+
+        node = mesh_io.geom_node_from_arrays(
+            "trimesh_result", prepared.interleaved, prepared.faces)
+        node_path = self.panda_app.attach_generated_mesh(node)
         if node_path is None or node_path.is_empty():
-            self.log("❌ trimesh_to_panda вернул пустой NodePath")
-            return
+            self.log("❌ не удалось поставить меш в сцену")
+            return None
 
         self.panda_app.final_mesh_node = node_path
 
@@ -176,6 +264,7 @@ class MeshReconstruction:
                 self.log(f"⚠️ update_overlay_info упал: {exc}")
 
         self.log(f"✅ Реконструкция завершена, объём ≈ {volume} м³")
+        return node_path
 
     # ------------------------------------------------------------------
     # Внутренние помощники
@@ -199,59 +288,19 @@ class MeshReconstruction:
         где зелёный канал интерпретируется как сила нормалей (см.
         main.py:_apply_textures_and_material).
         """
-        from panda3d.core import (
-            Texture, TextureStage, Material, Filename,
-            GeomNode, GeomVertexReader, GeomVertexWriter,
-        )
+        from panda3d.core import Texture, TextureStage, Material, Filename
         import os
 
-        tex_dir       = os.path.join("assets", "textures", "groundV2_4k")
-        diffuse_path  = os.path.join(tex_dir, "Ground_basecolor.jpg")
-        normal_path   = os.path.join(tex_dir, "Ground_normal.jpg")
-        rough_path    = os.path.join(tex_dir, "Ground_roughness.jpg")
+        diffuse_path, normal_path, rough_path = _GROUND_MAPS
 
         if not os.path.isfile(diffuse_path):
             self.log(f"⚠️ Не найдена {diffuse_path} — меш без текстуры")
             return
 
-        # Тайлинг берём из текущего набора текстур (textures_napolnitel_config.json
-        # на сервере), а не из жёстко зашитых Babylon-констант — иначе правка
-        # textureRepeatX/Y на сервере не влияет на меш реконструкции.
-        # Fallback на исторические Babylon-значения, если по какой-то причине
-        # current_texture_set ещё не подъехал.
-        tex_set = getattr(self.panda_app, "current_texture_set", None) or {}
-        try:
-            U_SCALE = float(tex_set.get("textureRepeatX", 0.7))
-        except (TypeError, ValueError):
-            U_SCALE = 0.7
-        try:
-            V_SCALE = float(tex_set.get("textureRepeatY", 1.8))
-        except (TypeError, ValueError):
-            V_SCALE = 1.8
-
-        # RenderPipeline подменяет панда-шейдеры, и matrix у TextureStage
-        # (setTexScale) в его пайплайн НЕ доезжает — текстура всегда видна
-        # 1:1 как при scale=(1,1). Поэтому масштаб мы запекаем напрямую в
-        # texcoord: trimesh_to_panda кладёт UV в диапазон [0, 1] планарным
-        # маппингом по XY-bbox, умножаем их на (U_SCALE, V_SCALE) и режим
-        # WMRepeat у текстуры даёт нужное число повторов.
-        gn = node_path.node()
-        if isinstance(gn, GeomNode):
-            for gi in range(gn.getNumGeoms()):
-                geom  = gn.modifyGeom(gi)
-                vdata = geom.modifyVertexData()
-                n_rows = vdata.getNumRows()
-                if n_rows <= 0:
-                    continue
-                reader = GeomVertexReader(vdata, "texcoord")
-                uvs = []
-                for _ in range(n_rows):
-                    uv = reader.getData2f()
-                    uvs.append((uv[0] * U_SCALE, uv[1] * V_SCALE))
-                del reader
-                writer = GeomVertexWriter(vdata, "texcoord")
-                for u, v in uvs:
-                    writer.setData2f(u, v)
+        # Масштаб тайлинга (textureRepeatX/Y) уже зашит в texcoord при
+        # подготовке — см. prepare() и uv_scale_for(): RenderPipeline не
+        # уважает матрицу TextureStage, а режим WMRepeat у текстуры даёт
+        # нужное число повторов.
 
         loader = self.panda_app.loader
 

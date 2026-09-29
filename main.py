@@ -157,6 +157,11 @@ class MyApp(ShowBase):
                 self.render_pipeline.mount_mgr.config_dir = rp_config_dir
                 print(f"[MyApp] RenderPipeline config dir -> {rp_config_dir}")
             self.render_pipeline.pre_showbase_init()
+            # panda3d-config.prc RenderPipeline включает gl-debug: драйвер
+            # проверяет каждый GL-вызов синхронно, и это ~10 мс CPU на кадр.
+            # Для отладки шейдеров включается обратно: IQOKO_GL_DEBUG=1.
+            if os.environ.get("IQOKO_GL_DEBUG") != "1":
+                loadPrcFileData("", "gl-debug #f")
 
             loadPrcFileData("", f"win-size {w} {h}")
             loadPrcFileData("", "window-type onscreen")
@@ -220,6 +225,9 @@ class MyApp(ShowBase):
 
         self.loaded_models = []
         self.model_paths = {}
+        # Модели, прочитанные с диска фоновым потоком (preload_model_files),
+        # ждут здесь, пока load_gltf_model не повесит их в сцену.
+        self._preloaded_models = {}
 
         self.setup_scene()
         # ---- Static base scene model -------------------------------------
@@ -346,6 +354,21 @@ class MyApp(ShowBase):
         # повторный вход в шаг задач («Ignoring recursive poll() within another
         # task», из-за которого кадры молча пропускались) невозможен.
         self.frame_pump = FramePump(self)
+
+        # Не даём драйверу копить кадры впрок (см. src/core/gl_sync.py): иначе
+        # камера отстаёт от мыши на ~3 кадра, а любое чтение с GPU ждёт всю
+        # очередь. IQOKO_MAX_FRAMES_IN_FLIGHT=0 — отключить.
+        self.frame_limiter = None
+        try:
+            in_flight = int(os.environ.get("IQOKO_MAX_FRAMES_IN_FLIGHT", "1"))
+        except ValueError:
+            in_flight = 1
+        if in_flight > 0:
+            try:
+                from src.core.gl_sync import FrameLatencyLimiter
+                self.frame_limiter = FrameLatencyLimiter(self, in_flight)
+            except Exception as exc:
+                print(f"[MyApp] ограничитель очереди кадров не включён: {exc}")
 
         self.perlin_generator = PerlinMeshGenerator(self, tls_client=self.tls_client)
         self.renderer_utils = RendererUtils(self)
@@ -1744,65 +1767,38 @@ class MyApp(ShowBase):
         return trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(faces))
 
     def trimesh_to_panda(self, trimesh_mesh):
-        vertices = trimesh_mesh.vertices
-        faces = trimesh_mesh.faces
+        from src.rendering import mesh_io
 
-        if not hasattr(trimesh_mesh, 'vertex_normals') or len(trimesh_mesh.vertex_normals) != len(vertices):
-            trimesh_mesh.compute_vertex_normals()
+        vertices = np.asarray(trimesh_mesh.vertices, dtype=np.float64)
+        faces = np.asarray(trimesh_mesh.faces, dtype=np.int64)
 
-        normals = trimesh_mesh.vertex_normals
+        normals = np.array(trimesh_mesh.vertex_normals, dtype=np.float64)
+        if len(normals) != len(vertices):
+            normals = mesh_io.vertex_normals(vertices, faces)
+        else:
+            bad = (~np.isfinite(normals).all(axis=1)
+                   | (np.linalg.norm(normals, axis=1) < 0.1))
+            normals[bad] = (0.0, 0.0, 1.0)
 
         # Planar UV-маппинг по XY-bbox меша. Без этого все texcoord = (0, 0)
         # и текстура схлопывается в один тексел (видимо как однотонный цвет).
         # Тот же подход в babylon-viewer.js (см. _loadObjMesh: UV считаются
         # после загрузки OBJ от bbox по (X, Z) Babylon, что соответствует
         # (X, Y) в наших OBJ-файлах Panda-конвенции).
-        verts_np = np.asarray(vertices, dtype=np.float64)
-        vmin_x, vmax_x = float(verts_np[:, 0].min()), float(verts_np[:, 0].max())
-        vmin_y, vmax_y = float(verts_np[:, 1].min()), float(verts_np[:, 1].max())
-        range_x = max(vmax_x - vmin_x, 1e-6)
-        range_y = max(vmax_y - vmin_y, 1e-6)
+        uv = mesh_io.planar_uv(vertices)
+        node = mesh_io.geom_node_from_arrays(
+            "trimesh_result",
+            mesh_io.interleave_v3n3t2(vertices, normals, uv), faces)
+        return self.attach_generated_mesh(node)
 
-        format = GeomVertexFormat.getV3n3t2()
-        format = GeomVertexFormat.registerFormat(format)
-        vdata = GeomVertexData("trimesh_result", format, Geom.UHStatic)
-
-        vertex_writer = GeomVertexWriter(vdata, "vertex")
-        normal_writer = GeomVertexWriter(vdata, "normal")
-        texcoord_writer = GeomVertexWriter(vdata, "texcoord")
-
-        for i, vertex in enumerate(vertices):
-            vertex_writer.addData3f(vertex[0], vertex[1], vertex[2])
-
-            if i < len(normals):
-                normal = normals[i]
-                if np.any(np.isnan(normal)) or np.linalg.norm(normal) < 0.1:
-                    normal = [0, 0, 1]
-                normal_writer.addData3f(normal[0], normal[1], normal[2])
-            else:
-                normal_writer.addData3f(0, 0, 1)
-
-            u = (float(vertex[0]) - vmin_x) / range_x
-            v = (float(vertex[1]) - vmin_y) / range_y
-            texcoord_writer.addData2f(u, v)
-        
-        prim = GeomTriangles(Geom.UHStatic)
-        for face in faces:
-            prim.addVertices(face[0], face[1], face[2])
-        prim.closePrimitive()
-        
-        geom = Geom(vdata)
-        geom.addPrimitive(prim)
-        
-        node = GeomNode("trimesh_result")
-        node.addGeom(geom)
-        print(self.particle_flag)
+    def attach_generated_mesh(self, node):
+        """Повесить готовый GeomNode наполнения в сцену (+ раскидать меши)."""
         if self.particle_flag == True:
             if(self.canDistributeMeshes):
                 self.distribute_meshes(node)
-        
+
         result_np = self.render.attachNewNode(node)
-        
+
         return result_np
     
     def extract_mesh_from_geom_node(self, geom_node):
@@ -2520,10 +2516,35 @@ class MyApp(ShowBase):
             print(f"[TexturePool] сброшено карт из кеша: {dropped} ({root})")
         return dropped
 
+    def preload_model_files(self, paths) -> None:
+        """
+        Загрузить модели с диска заранее — можно из фонового потока.
+
+        Чтение .bam и декодирование их текстур — это секунды, и в главном
+        потоке всё это время стоял бы рендер. Загрузчик Panda отпускает GIL,
+        поэтому из потока он кадрам не мешает. Готовые узлы ждут в
+        `_preloaded_models`, пока их не заберёт load_gltf_model; в сцену и в
+        RenderPipeline они попадают только там, в главном потоке.
+        """
+        store = self._preloaded_models
+        for path in paths:
+            if not path or not os.path.exists(path) or path in store:
+                continue
+            try:
+                store[path] = self.loader.load_model(
+                    Filename.from_os_specific(path), noCache=True)
+            except Exception as exc:
+                print(f"[preload] {os.path.basename(path)}: {exc}")
+
+    def drop_preloaded_models(self) -> None:
+        """Выбросить предзагруженное, но так и не понадобившееся."""
+        self._preloaded_models.clear()
+
     def load_gltf_model(self, file_path):
-        model_filename = Filename.from_os_specific(file_path)
-        
-        model_np = self.loader.load_model(model_filename, noCache=True) 
+        model_np = self._preloaded_models.pop(file_path, None)
+        if model_np is None or model_np.is_empty():
+            model_filename = Filename.from_os_specific(file_path)
+            model_np = self.loader.load_model(model_filename, noCache=True)
         
         model_np.reparent_to(self.render)
         # RenderPipeline converts Panda lights/materials to RP equivalents.

@@ -116,20 +116,30 @@ def depth_to_qimage(depth_renderer, out_w: int, out_h: int, *,
         import numpy as np
         from PyQt6.QtGui import QImage
 
-        if not tex.has_ram_image():
-            return None
-        ram = tex.get_ram_image_as("D")
-        if ram is None:
-            return None
-        buf = memoryview(ram).tobytes()
-        if not buf:
-            return None
-        tw = tex.get_x_size()
-        th = tex.get_y_size()
-        if tw * th * 4 != len(buf):
-            return None
-
-        depth = np.frombuffer(buf, dtype=np.float32).reshape(th, tw)
+        # Основной источник — маленькая копия глубины, которую рендерер
+        # прореживает на GPU и отдаёт по запросу (DepthMapRenderer.
+        # preview_depth). Полная depth_texture в RAM больше не копируется.
+        depth = None
+        getter = getattr(depth_renderer, "preview_depth", None)
+        if callable(getter):
+            depth = getter()
+            if depth is None:
+                return None
+        else:
+            if not tex.has_ram_image():
+                return None
+            ram = tex.get_ram_image_as("D")
+            if ram is None:
+                return None
+            buf = memoryview(ram).tobytes()
+            if not buf:
+                return None
+            tw = tex.get_x_size()
+            th = tex.get_y_size()
+            if tw * th * 4 != len(buf):
+                return None
+            depth = np.frombuffer(buf, dtype=np.float32).reshape(th, tw)
+        th, tw = depth.shape
 
         near = float(getattr(depth_renderer, "min_depth", 0.1)
                      if near is None else near)
@@ -150,12 +160,13 @@ def depth_to_qimage(depth_renderer, out_w: int, out_h: int, *,
         n = np.clip((linear - gs) / (ge - gs), 0.0, 1.0)
         t = 1.0 - n                     # ближе — «горячее» / светлее
 
-        # Прореживание до размера превью (дёшево и достаточно чётко).
-        out_w = max(1, int(out_w))
-        out_h = max(1, int(out_h))
-        sx = max(1, tw // out_w)
-        sy = max(1, th // out_h)
-        t_small = t[::sy, ::sx][:out_h, :out_w]
+        # Прореживание до размера превью (дёшево и достаточно чётко). Больше
+        # источника не растягиваем — это сделает Qt при показе.
+        out_w = min(max(1, int(out_w)), tw)
+        out_h = min(max(1, int(out_h)), th)
+        ys = (np.arange(out_h) * th) // out_h
+        xs = (np.arange(out_w) * tw) // out_w
+        t_small = t[ys[:, None], xs[None, :]]
         sh, sw = t_small.shape
         if sh == 0 or sw == 0:
             return None

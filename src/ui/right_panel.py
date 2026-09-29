@@ -51,6 +51,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent, QSize, QRectF, QTimer, pyqtSignal
@@ -63,7 +64,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QGroupBox, QPushButton, QFrame,
     QScrollArea, QSizePolicy, QGraphicsDropShadowEffect, QDialog,
     QGridLayout, QDoubleSpinBox, QMenu, QApplication, QSlider, QDial,
-    QToolButton,
+    QToolButton, QCheckBox,
 )
 
 from src.ui.ui_theme import (
@@ -412,6 +413,26 @@ def _elide(text: str, font, max_w: int,
 # panel's fixed inner width. Background is transparent — the
 # QListWidget's item:hover / item:selected rule paints behind us.
 # ---------------------------------------------------------------------------
+
+_CINEMATIC_CFG = os.path.join(PROJECT_ROOT, "config", "cinematic.json")
+
+
+def _load_cinematic_enabled() -> bool:
+    try:
+        with open(_CINEMATIC_CFG, "r", encoding="utf-8") as fh:
+            return bool(json.load(fh).get("enabled", True))
+    except (OSError, ValueError):
+        return True
+
+
+def _save_cinematic_enabled(on: bool) -> None:
+    try:
+        os.makedirs(os.path.dirname(_CINEMATIC_CFG), exist_ok=True)
+        with open(_CINEMATIC_CFG, "w", encoding="utf-8") as fh:
+            json.dump({"enabled": bool(on)}, fh)
+    except OSError as exc:
+        print(f"[RightPanel] cinematic.json не сохранён: {exc}")
+
 class ReconRowWidget(QWidget):
     """Custom 2-line row widget for one Reconstruction record."""
 
@@ -1271,8 +1292,20 @@ class RightPanel(QWidget):
         self.btn_run_recon.setStyleSheet(self._soft_accent_button_qss())
         self.btn_run_recon.clicked.connect(self._emit_recon_run_requested)
 
+        # Кинематографичный показ реконструкции (src/cinematic). Выбор
+        # запоминается в config/cinematic.json.
+        self.chk_cinematic = QCheckBox("Кино")
+        self.chk_cinematic.setToolTip(
+            "Показывать реконструкцию по проезду кинематографично: снимок, "
+            "лидар, поиск кузова, этапы расчёта наполнения. Esc — пропустить.")
+        self.chk_cinematic.setChecked(_load_cinematic_enabled())
+        self.chk_cinematic.setStyleSheet(
+            f"QCheckBox {{ color: {COLOR_TEXT_MUTED}; font-size: 11px; }}")
+        self.chk_cinematic.toggled.connect(_save_cinematic_enabled)
+
         bottom_row.addWidget(self.btn_load_more)
         bottom_row.addStretch(1)
+        bottom_row.addWidget(self.chk_cinematic)
         bottom_row.addWidget(self.btn_run_recon)
         col.addLayout(bottom_row)
 
@@ -1928,6 +1961,10 @@ class RightPanel(QWidget):
     # Details population
     # ==================================================================
     # ------------------------------------------------------------------
+    def cinematic_enabled(self) -> bool:
+        chk = getattr(self, "chk_cinematic", None)
+        return bool(chk is not None and chk.isChecked())
+
     def _emit_recon_run_requested(self) -> None:
         """Fire the reconstructionRunRequested signal for the selected row."""
         rec = getattr(self, "_selected_rec", None)

@@ -59,7 +59,13 @@ class ErrorMessageDisplay(RPObject):
             self._init_notify()
 
         while self._notify_stream.is_text_available():
-            line = self._notify_stream.get_line().strip()
+            # Panda may emit a message in the system codepage (e.g. a file path
+            # with Cyrillic in cp1251); a strict UTF-8 decode here used to raise
+            # inside the RP update task and take the whole application down.
+            try:
+                line = self._notify_stream.get_line().strip()
+            except UnicodeDecodeError:
+                line = "(Panda3D message in an unknown encoding)"
             if "warning" in line:
                 RPObject.global_warn("Panda3D", line)
                 # self.add_warning(line)

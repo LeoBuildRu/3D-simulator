@@ -29,6 +29,7 @@ import random
 import time
 import shutil
 import tempfile
+import traceback
 from typing import Any
 
 from src.ui.panel_data import (
@@ -60,6 +61,16 @@ def _is_child_of(hwnd: int, parent_hwnd: int) -> bool:
 
 class MainWindow(QMainWindow):
     """Qt main window shell. Panda3D ShowBase attaches AFTER show()."""
+
+    #: Ход реконструкции по проезду: (стадия, данные). Точка подключения для
+    #: визуального сопровождения. Стадии по порядку:
+    #:   "started"  {"rec"}
+    #:   "fetched"  {"rec", "json", "ply_path", "model_key", "texture_key",
+    #:               "vertices", "faces", "volume"} — всё скачано и разобрано,
+    #:               сцена ещё не тронута
+    #:   "applied"  {"rec", "node", "volume"} — меш стоит в сцене
+    #:   "failed"   {"rec", "error"}
+    reconstructionStage = pyqtSignal(str, object)
 
     def __init__(self):
         super().__init__()
@@ -119,9 +130,16 @@ class MainWindow(QMainWindow):
         # съёмка датасета (она сама крутит кадры), тик этого таймера, доехавший
         # через QApplication.processEvents, отсекается защитой от повторного
         # входа — вместо «Ignoring recursive poll()» и молча пропущенного кадра.
+        #
+        # Точный таймер с интервалом в период обновления экрана: грубый
+        # (по умолчанию) QTimer на Windows округляет до ~15.6 мс, и ровные
+        # 16 мс давали потолок 62 FPS с дрожанием интервала. Если кадр дольше
+        # периода, следующий тик приходит сразу — упираемся в GPU, а не в
+        # таймер; если короче — не гоняем сотни лишних кадров.
         self._panda_timer = QTimer(self)
+        self._panda_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._panda_timer.timeout.connect(self._pump_frame)
-        self._panda_timer.start(16)
+        self._panda_timer.start(self._frame_interval_ms())
 
         # ---- Depth-map overlay (top-LEFT, live image only) ---------
         # Minimal card: only the depth image is rendered, no chrome.
@@ -760,6 +778,10 @@ class MainWindow(QMainWindow):
         self._telemetry_timer.timeout.connect(self._update_telemetry)
         self._telemetry_timer.start(80)
 
+        # Кинематограф: заранее скомпилировать шейдеры и выделить буферы,
+        # чтобы запуск сцены не начинался с секундного рывка.
+        QTimer.singleShot(8000, self._warmup_cinematic)
+
     # ==================================================================
     # Graphics preset
     # ==================================================================
@@ -1078,6 +1100,36 @@ class MainWindow(QMainWindow):
             self._run_stand_reconstruction(rec)
             return
 
+        # Кинематографичный показ (src/cinematic): снимок, лидар, поиск
+        # кузова, этапы расчёта. Нужен RenderPipeline.
+        if (getattr(rec, "data_type", "") == "ply"
+                and getattr(self, "right_panel", None) is not None
+                and self.right_panel.cinematic_enabled()):
+            try:
+                from src.cinematic.session import CineSession
+                if CineSession.supported(self.panda_app):
+                    CineSession(self, rec).start()
+                    return
+            except Exception as exc:
+                traceback.print_exc()
+                print(f"[Recon] кинематограф недоступен: {exc}")
+        self._on_reconstruction_run_plain(rec)
+
+    def _warmup_cinematic(self) -> None:
+        app = self.panda_app
+        rp = getattr(self, "right_panel", None)
+        if app is None or rp is None or not rp.cinematic_enabled():
+            return
+        try:
+            from src.cinematic.session import CineSession
+            from src.vfx.compositor import Compositor
+            if CineSession.supported(app) and CineSession.current is None:
+                Compositor.shared(app, app.render_pipeline).warmup()
+        except Exception as exc:
+            print(f"[cine] прогрев не удался: {exc}")
+
+    def _on_reconstruction_run_plain(self, rec: Reconstruction) -> None:
+        """Штатная реконструкция: загрузка в фоне, сцена — в главном потоке."""
         recon_module = getattr(self.panda_app, "mesh_reconstruction", None)
         if recon_module is None:
             print("[Recon] panda_app.mesh_reconstruction not available.")
@@ -1087,89 +1139,87 @@ class MainWindow(QMainWindow):
         print(f"[Recon] click '{rec.name}' (data_type={rec.data_type}, "
               f"is_local={rec.is_local})")
 
+        # Сеть, диск и разбор меша — в фоновом потоке: холодный запуск —
+        # это десятки секунд скачиваний, и всё это время рендер раньше стоял.
+        # В сцену результат ставится уже в главном потоке
+        # (_apply_reconstruction). Повторный клик во время загрузки
+        # перекрывает прошлый запуск: его результат просто выбрасывается.
+        self._recon_seq = getattr(self, "_recon_seq", 0) + 1
+        seq = self._recon_seq
+        worker = _CallInThread(lambda: self._fetch_reconstruction(rec), self)
+        worker.finishedWith.connect(
+            lambda out, _seq=seq: self._apply_reconstruction(rec, out, _seq))
+        worker.finished.connect(worker.deleteLater)
+        self._recon_worker = worker
+        self.reconstructionStage.emit("started", {"rec": rec})
+        worker.start()
+
+    # ------------------------------------------------------------------
+    def _fetch_reconstruction(self, rec: Reconstruction) -> dict:
+        """
+        Фоновая часть реконструкции: всё, что не трогает сцену.
+
+        Скачивает JSON, текстуры наполнителя, файлы модели, PLY и готовый
+        меш, разбирает меш. Возвращает словарь для _apply_reconstruction; при
+        отказе — {"error": ...}. Исключения ловит сам поток (_CallInThread).
+        """
+        recon_module = self.panda_app.mesh_reconstruction
+
         # ---- 1) Resolve JSON path (local or download) ---------------
         local_json_path = self._resolve_recon_json(rec)
         if not local_json_path or not os.path.exists(local_json_path):
-            print(f"[Recon] could not resolve JSON for {rec.name!r}")
-            print("=" * 60)
-            return
+            return {"error": f"could not resolve JSON for {rec.name!r}"}
 
         # ---- 2) Parse JSON ------------------------------------------
         try:
             with open(local_json_path, "r", encoding="utf-8") as fp:
                 json_data = json.load(fp)
         except Exception as exc:
-            print(f"[Recon] failed to read JSON: {exc}")
-            print("=" * 60)
-            return
+            return {"error": f"failed to read JSON: {exc}"}
 
-        filler        = json_data.get("filler") or rec.filler
-        model_name    = json_data.get("model")  or rec.model
-        target_volume = json_data.get("target_volume")
-        car_number    = json_data.get("car_number") or rec.car_number
-        time_str      = json_data.get("time") or rec.time
+        out: dict = {"json_path": local_json_path, "json": json_data}
+        filler = json_data.get("filler") or rec.filler
+        model_name = json_data.get("model") or rec.model
 
-        # ---- 3) Apply texture set by filler -------------------------
+        # ---- 3) Texture set by filler: скачать файлы ----------------
         if filler:
             tex_key, tex_cfg = self._find_texture_by_filler(filler)
-            if tex_cfg is not None and hasattr(self.panda_app, "set_texture_set"):
-                # Сохраняем сырой конфиг для серверного displace.
-                self.panda_app.current_texture_set_raw = dict(tex_cfg)
-                try:
-                    self.panda_app.set_texture_set(
-                        self._materialize_texture_set(tex_cfg)
-                    )
-                    print(f"[Recon] texture set by filler: '{tex_key}'")
-                except Exception as exc:
-                    print(f"[Recon] set_texture_set failed: {exc}")
+            if tex_cfg is not None:
+                out["texture_key"] = tex_key
+                out["texture_raw"] = dict(tex_cfg)
+                out["texture_set"] = self._materialize_texture_set(tex_cfg)
             else:
                 print(f"[Recon] no texture set found for filler='{filler}'")
 
-        # ---- 4) Load model set --------------------------------------
+        # ---- 4) Model set: скачать файлы ----------------------------
         if model_name:
             model_key = self._find_model_key_by_name(model_name)
-            if (model_key
-                    and hasattr(self.panda_app, "cache_and_load_model_set")):
-                cfg = get_model_set_config(model_key)
-                if cfg is not None:
-                    try:
-                        ok = bool(self.panda_app.cache_and_load_model_set(
-                            model_key, cfg
-                        ))
-                        print(f"[Recon] model set "
-                              f"'{model_key}' loaded: {ok}")
-                        # Синхронизируем выбор в правой панели: иначе
-                        # right_panel.current_model_key() продолжает
-                        # возвращать прежний (дефолтный) ключ, и
-                        # _apply_onboard_camera берёт камеру не той модели.
-                        if ok:
-                            rp = getattr(self, "right_panel", None)
-                            if rp is not None and hasattr(
-                                rp, "set_current_model_key"
-                            ):
-                                rp.set_current_model_key(model_key)
-                            # Если на момент реконструкции уже включён
-                            # бортовой вид — пересобираем pos/hpr камеры
-                            # под новую модель сразу, чтобы пользователю
-                            # не пришлось переключать режим вручную.
-                            if getattr(self, "_camera_mode", None) == "onboard":
-                                try:
-                                    self._apply_onboard_camera()
-                                except Exception as exc:
-                                    print(f"[Recon] reapply onboard: {exc}")
-                    except Exception as exc:
-                        print(f"[Recon] cache_and_load_model_set: {exc}")
-                else:
-                    print(f"[Recon] config for '{model_key}' missing.")
+            cfg = get_model_set_config(model_key) if model_key else None
+            if cfg is not None and hasattr(
+                    self.panda_app, "download_and_cache_model_set"):
+                try:
+                    out["model_key"] = model_key
+                    out["model_cfg"] = cfg
+                    files = self.panda_app.download_and_cache_model_set(
+                        model_key, cfg)
+                    out["model_files"] = files
+                    # Прочитать модели и их текстуры здесь же, в потоке, —
+                    # главному останется только повесить их в сцену.
+                    self.panda_app.preload_model_files(
+                        files.get(k) for k in ("other", "cuzov", "napolnitel"))
+                except Exception as exc:
+                    print(f"[Recon] model set '{model_key}' not cached: {exc}")
+            elif model_key:
+                print(f"[Recon] config for '{model_key}' missing.")
             else:
                 print(f"[Recon] no model key for '{model_name}'.")
 
         # ---- 5) Resolve PLY path (download if SERVER) ---------------
-        local_ply_path = None
         ply_filename = json_data.get("ply_file") or rec.ply_file
         if ply_filename:
             local_ply_path = self._resolve_recon_ply(rec, ply_filename,
                                                     local_json_path)
+            out["ply_path"] = local_ply_path
             if local_ply_path:
                 print(f"[Recon] PLY ready: {local_ply_path}")
             else:
@@ -1183,41 +1233,129 @@ class MainWindow(QMainWindow):
                     rec, heightmap_filename, local_json_path
                 )
                 if not local_hm_path or not os.path.exists(local_hm_path):
-                    print(f"[Recon] heightmap '{heightmap_filename}' "
-                          f"could not be resolved - aborting.")
-                    print("=" * 60)
-                    return
+                    return {"error": f"heightmap '{heightmap_filename}' "
+                                     f"could not be resolved"}
+
+        # ---- 7) Готовый меш: скачать и разобрать --------------------
+        # Повторы текстуры — от набора, который встанет в сцену (с теми же
+        # умолчаниями, что добавляет MyApp.set_texture_set), иначе — от
+        # текущего.
+        from src.rendering.mesh_reconstruction import uv_scale_for
+        tex_set = out.get("texture_set")
+        if tex_set is not None:
+            tex_set = {"textureRepeatX": 1.35, "textureRepeatY": 3.2,
+                       **tex_set}
+        else:
+            tex_set = getattr(self.panda_app, "current_texture_set", None)
+        out["mesh"] = recon_module.prepare(local_json_path,
+                                           uv_scale=uv_scale_for(tex_set))
+        return out
+
+    # ------------------------------------------------------------------
+    def _apply_reconstruction(self, rec: Reconstruction, out, seq: int) -> None:
+        """Главный поток: поставить скачанное и разобранное в сцену."""
+        if seq != getattr(self, "_recon_seq", 0):
+            print(f"[Recon] '{rec.name}': результат устарел — пропускаю")
+            return
+        if isinstance(out, BaseException) or "error" in out:
+            err = out if isinstance(out, BaseException) else out["error"]
+            print(f"[Recon] ERR {err}")
+            print("=" * 60)
+            self.reconstructionStage.emit("failed",
+                                          {"rec": rec, "error": str(err)})
+            return
+
+        json_data = out["json"]
+        prepared = out.get("mesh")
+        self.reconstructionStage.emit("fetched", {
+            "rec": rec,
+            "json": json_data,
+            "ply_path": out.get("ply_path"),
+            "model_key": out.get("model_key"),
+            "texture_key": out.get("texture_key"),
+            "vertices": getattr(prepared, "vertices", None),
+            "faces": getattr(prepared, "faces", None),
+            "volume": json_data.get("target_volume"),
+        })
+
+        filler = json_data.get("filler") or rec.filler
+
+        # ---- 3) Apply texture set by filler -------------------------
+        if out.get("texture_set") is not None and hasattr(
+                self.panda_app, "set_texture_set"):
+            # Сохраняем сырой конфиг для серверного displace.
+            self.panda_app.current_texture_set_raw = out["texture_raw"]
+            try:
+                self.panda_app.set_texture_set(out["texture_set"])
+                print(f"[Recon] texture set by filler: '{out['texture_key']}'")
+            except Exception as exc:
+                print(f"[Recon] set_texture_set failed: {exc}")
+
+        # ---- 4) Load model set (файлы уже в кэше) -------------------
+        model_key = out.get("model_key")
+        if model_key and out.get("model_files") is not None:
+            cached = out["model_files"]
+            model_config = {
+                "cuzov":        cached.get("cuzov"),
+                "napolnitel":   cached.get("napolnitel"),
+                "other":        cached.get("other"),
+                "max_volume":   cached.get("max_volume"),
+                "ground_plane": cached.get("ground_plane"),
+                "target_model": out["model_cfg"].get("target_model"),
+            }
+            try:
+                ok = bool(self.panda_app.load_model_set(model_config,
+                                                        model_key))
+                print(f"[Recon] model set '{model_key}' loaded: {ok}")
+                # Синхронизируем выбор в правой панели: иначе
+                # right_panel.current_model_key() продолжает
+                # возвращать прежний (дефолтный) ключ, и
+                # _apply_onboard_camera берёт камеру не той модели.
+                if ok:
+                    rp = getattr(self, "right_panel", None)
+                    if rp is not None and hasattr(rp, "set_current_model_key"):
+                        rp.set_current_model_key(model_key)
+                    # Если на момент реконструкции уже включён
+                    # бортовой вид — пересобираем pos/hpr камеры
+                    # под новую модель сразу, чтобы пользователю
+                    # не пришлось переключать режим вручную.
+                    if getattr(self, "_camera_mode", None) == "onboard":
+                        try:
+                            self._apply_onboard_camera()
+                        except Exception as exc:
+                            print(f"[Recon] reapply onboard: {exc}")
+            except Exception as exc:
+                print(f"[Recon] load_model_set: {exc}")
+        self.panda_app.drop_preloaded_models()
 
         # ---- 7) Push overlay info if MyApp supports it --------------
         try:
             if hasattr(self.panda_app, "update_overlay_info"):
                 self.panda_app.update_overlay_info(
                     texture=filler,
-                    car_number=car_number,
-                    initial_volume=target_volume,
-                    time=time_str,
+                    car_number=json_data.get("car_number") or rec.car_number,
+                    initial_volume=json_data.get("target_volume"),
+                    time=json_data.get("time") or rec.time,
                 )
         except Exception as exc:
             print(f"[Recon] update_overlay_info failed: {exc}")
 
-        # ---- 8) Run the reconstruction ------------------------------
-        try:
-            if rec.data_type == "height":
-                print("[Recon] launching height-map reconstruction...")
-                recon_module.run_2d_to_3d_reconstruction_from(
-                    json_path=local_json_path
-                )
-            else:
-                print("[Recon] launching PLY reconstruction...")
-                recon_module.run_2d_to_3d_reconstruction_from(
-                    json_path=local_json_path,
-                    ply_path=local_ply_path,
-                )
-            print("[Recon] OK pipeline finished.")
-        except Exception as exc:
-            print(f"[Recon] ERR run_2d_to_3d_reconstruction_from: {exc}")
-
+        # ---- 8) Put the mesh into the scene -------------------------
+        node = None
+        if prepared is not None:
+            try:
+                node = self.panda_app.mesh_reconstruction.apply(prepared)
+                print("[Recon] OK pipeline finished.")
+            except Exception as exc:
+                print(f"[Recon] ERR mesh_reconstruction.apply: {exc}")
         print("=" * 60)
+        if node is None:
+            self.reconstructionStage.emit(
+                "failed", {"rec": rec, "error": "меш не построен"})
+            return
+        self.reconstructionStage.emit("applied", {
+            "rec": rec, "node": node,
+            "volume": json_data.get("target_volume")})
 
     # ------------------------------------------------------------------
     # Recon helpers
@@ -1373,11 +1511,21 @@ class MainWindow(QMainWindow):
         try:
             from panda3d.core import Texture
             tex = Texture("color_mirror")
-            tex.set_keep_ram_image(True)
+            # Кадр читается асинхронно (src/core/gl_sync.AsyncReadback):
+            # to_ram=True копировал его в RAM каждый кадр синхронно, с
+            # ожиданием всей очереди GPU. Без PyOpenGL — старый путь.
+            reader_ok = True
+            try:
+                from src.core.gl_sync import available as _gl_ok
+                reader_ok = _gl_ok()
+            except Exception:
+                reader_ok = False
+            if not reader_ok:
+                tex.set_keep_ram_image(True)
             buf = self.panda_app.win.make_texture_buffer(
                 "color_mirror_buf",
                 self._depth_capture_w, self._depth_capture_h,
-                tex, to_ram=True,
+                tex, to_ram=not reader_ok,
             )
             if buf is None:
                 print("[Depth] make_texture_buffer returned None.")
@@ -1389,6 +1537,13 @@ class MainWindow(QMainWindow):
             cam.reparent_to(self.panda_app.camera)
             cam.set_pos(0, 0, 0)
             cam.set_hpr(0, 0, 0)
+            self._color_mirror_reader = None
+            if reader_ok:
+                from src.core.gl_sync import AsyncReadback
+                self._color_mirror_reader = AsyncReadback(
+                    buf.get_display_region(buf.get_num_display_regions() - 1),
+                    self._depth_capture_w, self._depth_capture_h,
+                    channels=4, dtype="uint8")
             self._color_mirror_tex = tex
             self._color_mirror_buf = buf
             self._color_mirror_cam = cam
@@ -1541,6 +1696,19 @@ class MainWindow(QMainWindow):
         try:
             import numpy as np
             from PyQt6.QtGui import QImage
+
+            reader = getattr(self, "_color_mirror_reader", None)
+            if reader is not None:
+                reader.request()
+                arr = reader.latest
+                if arr is None:
+                    return
+                th, tw = arr.shape[:2]
+                img = QImage(np.ascontiguousarray(arr).tobytes(), tw, th,
+                             tw * 4, QImage.Format.Format_RGBA8888)
+                # GL отдаёт строки снизу вверх.
+                self.depth_overlay.set_image(img.mirrored(False, True).copy())
+                return
 
             tex = self._color_mirror_tex
             if not tex.has_ram_image():
@@ -3325,6 +3493,16 @@ class MainWindow(QMainWindow):
 
         return None
 
+    def _frame_interval_ms(self) -> int:
+        """Период обновления экрана в целых мс (потолок частоты кадров)."""
+        try:
+            hz = float(self.screen().refreshRate())
+        except Exception:
+            hz = 0.0
+        if not (30.0 <= hz <= 500.0):
+            hz = 60.0
+        return max(1, int(1000.0 / hz))
+
     def _pump_frame(self) -> None:
         """Тик Qt-таймера: один кадр Panda через защищённый насос."""
         app = getattr(self, "panda_app", None)
@@ -3704,6 +3882,30 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         os._exit(0)
+
+
+class _CallInThread(QThread):
+    """
+    Выполнить функцию в отдельном потоке и отдать результат в главный.
+
+    `finishedWith` получает возвращённое значение либо исключение, которым
+    функция упала. Для работы с сетью и диском: сокеты и файловый ввод-вывод
+    отпускают GIL, поэтому кадры Panda в это время идут без задержек.
+    """
+
+    finishedWith = pyqtSignal(object)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            result = self._fn()
+        except Exception as exc:
+            traceback.print_exc()
+            result = exc
+        self.finishedWith.emit(result)
 
 
 class _BodyGenWorker(QThread):
