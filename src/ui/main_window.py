@@ -17,9 +17,10 @@ from PyQt6.QtWidgets import (
 
 from src.ui.ui_theme import apply_theme
 from src.ui.overlay_widgets import (
-    SceneOverlay, DepthMapOverlay, CameraReferenceOverlay,
+    TelemetryHUD, DepthMapOverlay, CameraReferenceOverlay,
 )
 from src.ui.right_panel import RightPanel
+from src.ui.toolbar import ViewToolbar
 from src.ui import dataset_config
 from src.ui.depth_preview import depth_to_qimage
 import os
@@ -79,7 +80,7 @@ class MainWindow(QMainWindow):
         self._panda_hwnd: int | None = None
 
         # Настройки съёмки датасета живут в config/dataset.json и правятся
-        # в отдельном диалоге (кнопка «Настроить…» в карточке камеры).
+        # в отдельном диалоге (вкладка «Датасет» инспектора → «Настроить»).
         self._dataset_cfg = dataset_config.load()
 
         self.setWindowTitle("IQoko · 3D Симулятор")
@@ -141,85 +142,66 @@ class MainWindow(QMainWindow):
         self._panda_timer.timeout.connect(self._pump_frame)
         self._panda_timer.start(self._frame_interval_ms())
 
-        # ---- Depth-map overlay (top-LEFT, live image only) ---------
-        # Minimal card: only the depth image is rendered, no chrome.
-        # Anchored to the top-left so it sits exactly where the user
-        # asked for it.
+        # ---- Раскладка интерфейса над 3D-видом -------------------------
+        #   слева сверху  — превью глубины («картинка в картинке»);
+        #   сверху        — панель вида: режим камеры, виды 1-3, время
+        #                   суток, превью, справка по клавишам;
+        #   слева снизу   — строка телеметрии камеры;
+        #   справа        — инспектор с вкладками (RightPanel).
+        # Все панели — отдельные окна Qt.Tool (см. src/ui/hud.py).
+
+        # ---- Превью глубины ------------------------------------------
         self.depth_overlay = DepthMapOverlay(
-            parent=self.panda_container,
-            anchor="top-left",
-            margin=16,
-            width=320,
+            parent=self.panda_container, anchor="top-left", margin=16,
+            width=300,
         )
         self.depth_overlay.attach()
         self.depth_overlay.toggleRequested.connect(self._on_depth_toggle)
-        # ---- Depth settings strip (NEAR / FAR / GRAD START / GRAD END)
-        # Lives inside the same DepthMapOverlay card, below the canvas,
-        # mirroring the gui.py behaviour for tuning the depth pass.
+        # Диапазон глубины (ближняя / дальняя плоскость и градиент) — в
+        # поповере под кнопкой на превью.
         try:
             from PyQt6.QtWidgets import (
-                QDoubleSpinBox as _QDSB, QLabel as _QL,
-                QGridLayout as _QGL, QFrame as _QFr,
+                QDoubleSpinBox as _QDSB, QGridLayout as _QGL, QWidget as _QW,
             )
-            from src.ui.ui_theme import (
-                COLOR_TEXT_MUTED as _DTM, COLOR_HAIRLINE as _DCH,
-                COLOR_TEXT as _DCT, FONT_MONO as _DFM,
-            )
+            from src.ui.hud import label as _hud_label, icon_label as _hud_icon
 
-            depth_settings = _QFr()
-            depth_settings.setStyleSheet(
-                "QFrame { background: transparent; border: none; }"
-            )
+            depth_settings = _QW()
             grid = _QGL(depth_settings)
-            grid.setContentsMargins(0, 8, 0, 0)
+            grid.setContentsMargins(0, 0, 0, 0)
             grid.setHorizontalSpacing(8)
-            grid.setVerticalSpacing(4)
+            grid.setVerticalSpacing(8)
 
-            def _make_lbl(text: str):
-                lbl = _QL(text)
-                lbl.setStyleSheet(
-                    f"color: {_DTM}; font-size: 10px;"
-                    f" letter-spacing: 0.6px; background: transparent;"
-                )
-                return lbl
-
-            def _make_spin(rng, val, step, decimals=2):
+            def _make_spin(rng, val, step, decimals=2, suffix=""):
                 sp = _QDSB()
                 sp.setRange(*rng)
                 sp.setSingleStep(step)
                 sp.setDecimals(decimals)
                 sp.setValue(val)
-                sp.setFixedHeight(22)
-                sp.setStyleSheet(
-                    "QDoubleSpinBox {"
-                    "  background: rgba(255,255,255,4);"
-                    f"  color: {_DCT};"
-                    f"  border: 1px solid {_DCH};"
-                    "  border-radius: 4px;"
-                    "  padding: 1px 4px;"
-                    f"  font-family: {_DFM};"
-                    "  font-size: 11px;"
-                    "}"
-                    "QDoubleSpinBox::up-button,"
-                    "QDoubleSpinBox::down-button { width: 0; }"
-                )
+                if suffix:
+                    sp.setSuffix(suffix)
                 return sp
 
-            self.spn_near = _make_spin((0.01, 1000.0), 0.1, 0.1)
-            self.spn_far  = _make_spin((0.1, 10000.0), 100.0, 1.0, decimals=1)
+            self.spn_near = _make_spin((0.01, 1000.0), 0.1, 0.1, suffix=" м")
+            self.spn_far  = _make_spin((0.1, 10000.0), 100.0, 1.0,
+                                       decimals=1, suffix=" м")
             self.spn_g_a  = _make_spin((0.0, 1.0), 0.2, 0.05)
             self.spn_g_b  = _make_spin((0.0, 1.0), 0.4, 0.05)
 
-            grid.addWidget(_make_lbl("Ближняя"), 0, 0)
-            grid.addWidget(self.spn_near,        0, 1)
-            grid.addWidget(_make_lbl("Дальняя"), 0, 2)
-            grid.addWidget(self.spn_far,         0, 3)
-            grid.addWidget(_make_lbl("Начало"),  1, 0)
-            grid.addWidget(self.spn_g_a,         1, 1)
-            grid.addWidget(_make_lbl("Конец"),   1, 2)
-            grid.addWidget(self.spn_g_b,         1, 3)
+            grid.addWidget(_hud_label("Плоскости", role="eyebrow"), 0, 0, 1, 2)
+            grid.addWidget(_hud_icon("chevron_left", tooltip="Ближняя"), 1, 0)
+            grid.addWidget(self.spn_near, 1, 1)
+            grid.addWidget(_hud_icon("chevron_right", tooltip="Дальняя"), 2, 0)
+            grid.addWidget(self.spn_far, 2, 1)
+            grid.addWidget(_hud_label("Градиент", role="eyebrow"), 3, 0, 1, 2)
+            grid.addWidget(_hud_icon("depth", tooltip="Начало градиента"), 4, 0)
+            grid.addWidget(self.spn_g_a, 4, 1)
+            grid.addWidget(_hud_icon("bars", tooltip="Конец градиента"), 5, 0)
+            grid.addWidget(self.spn_g_b, 5, 1)
             grid.setColumnStretch(1, 1)
-            grid.setColumnStretch(3, 1)
+            self.spn_near.setToolTip("Ближняя плоскость")
+            self.spn_far.setToolTip("Дальняя плоскость")
+            self.spn_g_a.setToolTip("Начало градиента (0…1)")
+            self.spn_g_b.setToolTip("Конец градиента (0…1)")
 
             self.spn_near.valueChanged.connect(self._on_depth_min_changed)
             self.spn_far.valueChanged.connect(self._on_depth_max_changed)
@@ -228,10 +210,9 @@ class MainWindow(QMainWindow):
 
             self.depth_overlay.attach_extra(depth_settings)
         except Exception as exc:
-            print(f"[MainWindow] depth-settings strip init failed: {exc}")
-        # Feed it from panda_app.depth_renderer.depth_texture (this is
-        # the texture DepthMapRenderer already populates each frame via
-        # its own offscreen camera + display region).
+            print(f"[MainWindow] depth-settings init failed: {exc}")
+        # Кадры для превью берутся из panda_app.depth_renderer.depth_texture
+        # (DepthMapRenderer сам обновляет её каждый кадр).
         self._depth_capture_w = 320
         self._depth_capture_h = 180   # 16:9
         self._depth_in_main = False   # default: main = normal, widget = depth
@@ -240,434 +221,55 @@ class MainWindow(QMainWindow):
         self._color_mirror_cam = None
         self._depth_timer = QTimer(self)
         self._depth_timer.timeout.connect(self._tick_depth_overlay)
-        # Defer the first tick so RenderPipeline has time to boot - if
-        # we start banging on it from frame 0 the splash screen never
-        # closes and we get bogus get_screenshot results.
+        # Первый тик — с задержкой, чтобы RenderPipeline успел загрузиться:
+        # иначе заставка не закрывается и get_screenshot врёт. ~8 FPS для
+        # превью достаточно и не мешает RP.
         QTimer.singleShot(3000, lambda: self._depth_timer.start(120))
-        # ~8 FPS preview is plenty and stays out of RP's way.
 
-        # ---- Camera telemetry (BOTTOM-LEFT) -------------------------
-        # Wider than the default 240px card: this one carries the whole
-        # camera + dataset control stack (telemetry, daytime, camera modes,
-        # presets, snapshot options), so the extra width lets the rows sit
-        # side by side instead of overflowing.
-        self.telemetry = SceneOverlay(
-            "Камера · Телеметрия",
-            anchor="bottom-left",
-            parent=self.panda_container,
-            margin=16,
-            width=240,
-        )
-        # Two columns → 7 telemetry rows collapse to 4 lines, freeing the
-        # vertical space the controls below need.
-        self.telemetry.set_rows([
-            ("PITCH", "  0.0"),
-            ("YAW",   "  0.0"),
-            ("ROLL",  "  0.0"),
-            ("FOV",   " 60.0"),
-            ("X",     "  0.0"),
-            ("Y",     "  0.0"),
-            ("Z",     "  0.0"),
-        ], columns=2)
+        # ---- Телеметрия камеры ---------------------------------------
+        self.telemetry = TelemetryHUD(self.panda_container, margin=16)
         self.telemetry.attach()
 
-        # ---- Time-of-day slider (sits inside the telemetry card) ----
-        try:
-            from PyQt6.QtWidgets import QSlider, QLabel as _QLabel, QHBoxLayout as _QHB
-            from src.ui.ui_theme import (
-                COLOR_TEXT_MUTED as _CTM, COLOR_TEXT as _CT,
-                COLOR_ACCENT as _CA, COLOR_HAIRLINE as _CH,
-                FONT_MONO as _FM,
-            )
+        # ---- Панель вида ---------------------------------------------
+        self._camera_mode = "free"   # free | stationary | onboard
+        # Пользовательские виды: dict {"pos", "hpr", "fov", ...} или None,
+        # с диска — чтобы переживали перезапуск.
+        self._cam_presets = self._load_cam_presets()
+        self._preset_save_armed = False
+        self._selected_preset = None
+        # Пока ждём выбора слота для сохранения, все три мигают.
+        self._preset_blink_on = False
+        self._preset_blink_timer = QTimer(self)
+        self._preset_blink_timer.timeout.connect(self._on_preset_blink_tick)
 
-            self.daytime_slider_holder = QFrame()
-            self.daytime_slider_holder.setStyleSheet(
-                "QFrame { background: transparent; border: none; }"
-            )
-            holder_lay = QHBoxLayout(self.daytime_slider_holder)
-            holder_lay.setContentsMargins(0, 8, 0, 0)
-            holder_lay.setSpacing(8)
-
-            label = _QLabel("TIME")
-            label.setStyleSheet(
-                f"color: {_CTM}; font-size: 10px;"
-                f" letter-spacing: 1.0px; background: transparent;"
-            )
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(0, 1439)              # minutes in a day
-            slider.setValue(15 * 60)              # 15:00 default (raking sun)
-            slider.setFixedHeight(18)
-            slider.setStyleSheet(
-                "QSlider::groove:horizontal {"
-                f"  background: {_CH};"
-                "  height: 3px; border-radius: 1px;"
-                "}"
-                "QSlider::sub-page:horizontal {"
-                f"  background: {_CA}; height: 3px; border-radius: 1px;"
-                "}"
-                "QSlider::handle:horizontal {"
-                f"  background: {_CA};"
-                "  width: 10px; height: 10px;"
-                "  margin: -4px 0; border-radius: 5px;"
-                "}"
-                "QSlider::handle:horizontal:hover {"
-                "  background: #00FFAA;"
-                "}"
-            )
-
-            value_lbl = _QLabel("15:00")
-            value_lbl.setStyleSheet(
-                f"color: {_CT}; font-family: {_FM};"
-                f"font-size: 11px; background: transparent;"
-            )
-            value_lbl.setMinimumWidth(38)
-            value_lbl.setAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-
-            holder_lay.addWidget(label, 0, Qt.AlignmentFlag.AlignVCenter)
-            holder_lay.addWidget(slider, 1, Qt.AlignmentFlag.AlignVCenter)
-            holder_lay.addWidget(value_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
-
-            def _on_daytime_changed(mins: int,
-                                     _vlbl=value_lbl,
-                                     _app=panda_app):
-                hh = mins // 60
-                mm = mins % 60
-                txt = f"{hh:02d}:{mm:02d}"
-                _vlbl.setText(txt)
-                # Prefer MyApp.set_time_of_day — it drives RenderPipeline's
-                # daytime manager (ultra/medium) OR moves the simplepbr sun
-                # (performance). Fall back to the RP daytime manager directly.
-                try:
-                    if hasattr(_app, "set_time_of_day"):
-                        _app.set_time_of_day(int(mins))
-                    else:
-                        rp = getattr(_app, "render_pipeline", None)
-                        dt_mgr = getattr(rp, "daytime_mgr", None) if rp else None
-                        if dt_mgr is not None:
-                            dt_mgr.time = txt
-                except Exception as exc:
-                    print(f"[Daytime] set failed: {exc}")
-
-            slider.valueChanged.connect(_on_daytime_changed)
-            self.daytime_slider = slider
-            self.daytime_value_lbl = value_lbl
-
-            # Append the row inside the telemetry card body.
-            self.telemetry.attach_extra(self.daytime_slider_holder)
-            # Trigger an initial sync so RP's daytime matches the slider.
-            _on_daytime_changed(slider.value())
-        except Exception as exc:
-            print(f"[MainWindow] daytime slider init failed: {exc}")
-
-        # ---- Camera-mode buttons (FREE / STATIC / BOARD) ------------
-        try:
-            from PyQt6.QtWidgets import (
-                QPushButton as _QPB,
-                QHBoxLayout as _QHB,
-                QFrame as _QFr,
-            )
-            from src.ui.ui_theme import (
-                COLOR_TEXT as _MCT,
-                COLOR_TEXT_MUTED as _MCTM,
-                COLOR_HAIRLINE as _MCH,
-                COLOR_ACCENT as _MCA,
-            )
-            self._camera_mode = "free"   # free | stationary | onboard
-
-            mode_holder = _QFr()
-            mode_holder.setStyleSheet(
-                "QFrame { background: transparent; border: none; }"
-            )
-            mh_lay = _QHB(mode_holder)
-            mh_lay.setContentsMargins(0, 6, 0, 0)
-            mh_lay.setSpacing(4)
-
-            def _seg_button_qss(active: bool) -> str:
-                if active:
-                    return (
-                        "QPushButton {"
-                        f"  background-color: rgba(0, 255, 136, 50);"
-                        f"  color: {_MCT};"
-                        f"  border: 1px solid {_MCA};"
-                        "  border-radius: 5px;"
-                        "  padding: 4px 6px;"
-                        "  font-size: 10px;"
-                        "  font-weight: 700;"
-                        "  letter-spacing: 0.6px;"
-                        "}"
-                    )
-                return (
-                    "QPushButton {"
-                    "  background: transparent;"
-                    f"  color: {_MCTM};"
-                    f"  border: 1px solid {_MCH};"
-                    "  border-radius: 5px;"
-                    "  padding: 4px 6px;"
-                    "  font-size: 10px;"
-                    "  font-weight: 600;"
-                    "  letter-spacing: 0.6px;"
-                    "}"
-                    "QPushButton:hover {"
-                    "  background: rgba(255,255,255,8);"
-                    f"  color: {_MCT};"
-                    "}"
-                )
-
-            self._mode_btns: dict = {}
-            for code, label in (
-                ("free",       "СВОБ"),
-                ("stationary", "СТАЦ"),
-                ("onboard",    "БОРТ"),
-            ):
-                btn = _QPB(label)
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.setFixedHeight(22)
-                btn.setStyleSheet(_seg_button_qss(code == self._camera_mode))
-                btn.clicked.connect(
-                    lambda _checked=False, c=code: self._on_camera_mode(c)
-                )
-                self._mode_btns[code] = btn
-                mh_lay.addWidget(btn, 1)
-
-            self.telemetry.attach_extra(mode_holder)
-            # Cache the qss-builder so _on_camera_mode can re-style.
-            self._seg_button_qss = _seg_button_qss
-        except Exception as exc:
-            print(f"[MainWindow] camera-mode buttons init failed: {exc}")
-
-        # ---- Custom camera presets (3 user slots: position + FOV) ---
-        try:
-            from PyQt6.QtWidgets import (
-                QPushButton as _PPB,
-                QHBoxLayout as _PHB,
-                QFrame as _PFr,
-                QLabel as _PL,
-            )
-            from src.ui.ui_theme import (
-                COLOR_TEXT_MUTED as _PCTM,
-            )
-
-            # Per-slot state: dict {"pos", "hpr", "fov"} or None. Loaded
-            # from disk so user presets survive restarts.
-            self._cam_presets = self._load_cam_presets()
-            self._preset_save_armed = False
-            self._selected_preset = None      # currently active slot
-            # Blink timer: while save mode is armed all 3 slots pulse to
-            # invite the user to pick a slot to save into.
-            self._preset_blink_on = False
-            self._preset_blink_timer = QTimer(self)
-            self._preset_blink_timer.timeout.connect(self._on_preset_blink_tick)
-
-            preset_holder = _PFr()
-            preset_holder.setStyleSheet(
-                "QFrame { background: transparent; border: none; }"
-            )
-            ph_lay = _PHB(preset_holder)
-            ph_lay.setContentsMargins(0, 6, 0, 0)
-            ph_lay.setSpacing(4)
-
-            lbl = _PL("МОИ")
-            lbl.setStyleSheet(
-                f"color: {_PCTM}; font-size: 9px; letter-spacing: 1.0px;"
-                f" background: transparent;"
-            )
-            ph_lay.addWidget(lbl, 0)
-
-            self._preset_btns: dict = {}
-            for slot in (0, 1, 2):
-                btn = _PPB(str(slot + 1))
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.setFixedHeight(22)
-                btn.setToolTip(
-                    "ЛКМ — загрузить пресет\n"
-                    "В режиме «Сохр» — записать текущую камеру\n"
-                    "ПКМ — сохранить/очистить"
-                )
-                btn.setContextMenuPolicy(
-                    Qt.ContextMenuPolicy.CustomContextMenu
-                )
-                btn.customContextMenuRequested.connect(
-                    lambda _p, s=slot: self._on_preset_context_menu(s)
-                )
-                btn.clicked.connect(
-                    lambda _c=False, s=slot: self._on_preset_clicked(s)
-                )
-                self._preset_btns[slot] = btn
-                ph_lay.addWidget(btn, 1)
-
-            self._btn_preset_save = _PPB("Сохр")
-            self._btn_preset_save.setCheckable(True)
-            self._btn_preset_save.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._btn_preset_save.setFixedHeight(22)
-            self._btn_preset_save.setToolTip(
-                "Нажмите — слоты замигают; выберите слот 1/2/3, затем\n"
-                "кликайте опорные точки на кузове (кадр наложится на 30%).\n"
-                "ПКМ или Esc — завершить. Сохранятся поза, FOV, крен и точки"
-            )
-            self._btn_preset_save.toggled.connect(self._on_preset_save_armed)
-            ph_lay.addWidget(self._btn_preset_save, 1)
-
-            self.telemetry.attach_extra(preset_holder)
-            self._apply_preset_styles()
-        except Exception as exc:
-            print(f"[MainWindow] camera preset buttons init failed: {exc}")
-
-        # ---- Dataset row (настроить + снять) -----------------------
-        # Раньше здесь жил весь пульт съёмки: спинбоксы, выпадающий список
-        # типов и чекбоксы, ужатые в 240 пикселей ширины. Настройки уехали в
-        # отдельный диалог (src/ui/dataset_dialog.py), здесь осталась пара
-        # кнопок и строка-итог.
-        try:
-            from PyQt6.QtWidgets import (
-                QPushButton as _QPB2,
-                QHBoxLayout as _QHB2,
-                QVBoxLayout as _QVB2,
-                QLabel as _QL2,
-                QFrame as _QFr2,
-            )
-            from src.ui.ui_theme import (
-                COLOR_TEXT as _RCT,
-                COLOR_TEXT_MUTED as _RCTM,
-                COLOR_HAIRLINE as _RCH,
-                FONT_MONO as _RFM,
-            )
-
-            save_holder = _QFr2()
-            save_holder.setStyleSheet(
-                "QFrame { background: transparent; border: none; }"
-            )
-            sh_lay = _QVB2(save_holder)
-            sh_lay.setContentsMargins(0, 6, 0, 0)
-            sh_lay.setSpacing(6)
-
-            sr_label = _QL2("ДАТАСЕТ")
-            sr_label.setStyleSheet(
-                f"color: {_RCTM}; font-size: 10px;"
-                f" letter-spacing: 0.6px; background: transparent;"
-            )
-
-            self.lbl_dataset_summary = _QL2("")
-            self.lbl_dataset_summary.setWordWrap(True)
-            self.lbl_dataset_summary.setStyleSheet(
-                f"color: {_RCTM}; font-size: 10px;"
-                f" font-family: {_RFM}; background: transparent;"
-            )
-
-            _quiet_btn_css = (
-                "QPushButton {"
-                "  background: rgba(255,255,255,6);"
-                f"  color: {_RCT};"
-                f"  border: 1px solid {_RCH};"
-                "  border-radius: 5px;"
-                "  padding: 2px 10px;"
-                "  font-size: 10px;"
-                "  letter-spacing: 0.4px;"
-                "}"
-                "QPushButton:hover { background: rgba(255,255,255,16); }"
-                "QPushButton:disabled {"
-                f"  color: {_RCTM}; border: 1px solid {_RCH}; }}"
-            )
-
-            self.btn_dataset_setup = _QPB2("Настроить…")
-            self.btn_dataset_setup.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.btn_dataset_setup.setFixedHeight(22)
-            self.btn_dataset_setup.setToolTip(
-                "Открыть настройки съёмки: что сохранять, куда, как "
-                "варьировать наполнение, камеру и свет"
-            )
-            self.btn_dataset_setup.setStyleSheet(_quiet_btn_css)
-            self.btn_dataset_setup.clicked.connect(
-                self._on_dataset_settings_clicked)
-
-            self.btn_save_render = _QPB2("Снять")
-            self.btn_save_render.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.btn_save_render.setFixedHeight(22)
-            self.btn_save_render.setToolTip(
-                "Запустить съёмку с текущими настройками")
-            self.btn_save_render.setStyleSheet(
-                "QPushButton {"
-                "  background-color: rgba(0, 255, 136, 30);"
-                f"  color: {_RCT};"
-                "  border: 1px solid #00FF88;"
-                "  border-radius: 5px;"
-                "  padding: 2px 12px;"
-                "  font-size: 10px;"
-                "  font-weight: 600;"
-                "  letter-spacing: 0.4px;"
-                "}"
-                "QPushButton:hover {"
-                "  background-color: rgba(0, 255, 136, 55);"
-                "}"
-                "QPushButton:pressed {"
-                "  background-color: rgba(0, 255, 136, 90);"
-                "}"
-                "QPushButton:disabled {"
-                "  background: rgba(255, 255, 255, 4);"
-                f"  color: {_RCTM};"
-                f"  border: 1px solid {_RCH};"
-                "}"
-            )
-            self.btn_save_render.clicked.connect(self._on_save_render_clicked)
-
-            sh_row1 = _QHB2()
-            sh_row1.setContentsMargins(0, 0, 0, 0)
-            sh_row1.setSpacing(6)
-            sh_row1.addWidget(sr_label, 0, Qt.AlignmentFlag.AlignVCenter)
-            sh_row1.addWidget(self.btn_dataset_setup, 1,
-                              Qt.AlignmentFlag.AlignVCenter)
-            sh_row1.addWidget(self.btn_save_render, 0,
-                              Qt.AlignmentFlag.AlignVCenter)
-
-            sh_lay.addLayout(sh_row1)
-            sh_lay.addWidget(self.lbl_dataset_summary)
-
-            self._refresh_dataset_summary()
-            self.telemetry.attach_extra(save_holder)
-        except Exception as exc:
-            print(f"[MainWindow] dataset row init failed: {exc}")
-
-        self.controls = SceneOverlay(
-            "Управление",
-            anchor="top-left",
-            parent=self.panda_container,
-            width=240,
-            margin=16,
-        )
-        self.controls.set_rows([
-            ("WASD",  "Движение"),
-            ("Q / E", "Вниз / Вверх"),
-            ("Shift", "Ускорение"),
-            ("ПКМ",   "Обзор"),
-        ])
-        self.controls.attach()
-        # Anchor the Controls card to the right of the depth overlay
-        # (same trick the telemetry used to use before the swap).
-        try:
-            from PyQt6.QtCore import QPoint as _QP
-            _depth = self.depth_overlay
-            _top_y = 16
-            _x_off = 16 + _depth.width() + 12
-            def _controls_reposition(_self=self.controls,
-                                      _owner=self.panda_container,
-                                      _x=_x_off, _y=_top_y):
-                w = _self.width()
-                h = _self.sizeHint().height()
-                gp = _owner.mapToGlobal(_QP(_x, _y))
-                _self.setGeometry(gp.x(), gp.y(), w, h)
-                _self.raise_()
-            import types as _types
-            self.controls._reposition = _types.MethodType(
-                lambda s, _f=_controls_reposition: _f(),
-                self.controls,
-            )
-            self.controls._reposition()
-        except Exception as exc:
-            print(f"[MainWindow] controls reposition patch failed: {exc}")
+        self.toolbar = ViewToolbar(self.panda_container, margin=16)
+        self._preset_btns = self.toolbar.preset_btns
+        self._btn_preset_save = self.toolbar.btn_save
+        self.daytime_slider = self.toolbar.daytime_slider
+        self.toolbar.modeChanged.connect(self._on_camera_mode)
+        self.toolbar.presetClicked.connect(self._on_preset_clicked)
+        self.toolbar.presetMenuRequested.connect(self._on_preset_context_menu)
+        self.toolbar.saveArmToggled.connect(self._on_preset_save_armed)
+        self.toolbar.daytimeChanged.connect(self._on_daytime_changed)
+        self.toolbar.pipToggled.connect(self._on_pip_toggled)
+        self.toolbar.attach()
+        self._apply_preset_styles()
+        # Синхронизировать время суток в рендере с положением ползунка.
+        self._on_daytime_changed(self.daytime_slider.value())
 
         self.right_panel = RightPanel(parent=self.panda_container)
         self.right_panel.attach()
+        # Панель вида центрируется в свободной полосе между превью и
+        # инспектором, чтобы не заходить ни под одно из них.
+        self._update_toolbar_insets()
+        # Съёмка датасета — вкладка «Датасет» инспектора.
+        self.btn_dataset_setup = self.right_panel.btn_dataset_setup
+        self.btn_save_render = self.right_panel.btn_dataset_start
+        self.right_panel.datasetSettingsRequested.connect(
+            self._on_dataset_settings_clicked)
+        self.right_panel.datasetStartRequested.connect(
+            self._on_save_render_clicked)
+        self._refresh_dataset_summary()
         # Если конфиг текстур уже подтянут с сервера (см. main.py), сразу
         # перезаливаем выпадающий список. Безопасно вызывать и в случае,
         # когда конфига нет — метод просто оставит комбо как есть.
@@ -781,6 +383,45 @@ class MainWindow(QMainWindow):
         # Кинематограф: заранее скомпилировать шейдеры и выделить буферы,
         # чтобы запуск сцены не начинался с секундного рывка.
         QTimer.singleShot(8000, self._warmup_cinematic)
+
+    # ==================================================================
+    # Панель вида: время суток, превью, раскладка
+    # ==================================================================
+    def _on_daytime_changed(self, mins: int) -> None:
+        """Время суток: MyApp.set_time_of_day ведёт и daytime-менеджер
+        RenderPipeline (ultra / medium), и солнце simplepbr (performance)."""
+        app = self.panda_app
+        if app is None:
+            return
+        try:
+            if hasattr(app, "set_time_of_day"):
+                app.set_time_of_day(int(mins))
+            else:
+                rp = getattr(app, "render_pipeline", None)
+                dt_mgr = getattr(rp, "daytime_mgr", None) if rp else None
+                if dt_mgr is not None:
+                    dt_mgr.time = f"{int(mins) // 60:02d}:{int(mins) % 60:02d}"
+        except Exception as exc:
+            print(f"[Daytime] set failed: {exc}")
+
+    def _on_pip_toggled(self, visible: bool) -> None:
+        ov = getattr(self, "depth_overlay", None)
+        if ov is not None:
+            ov.set_user_visible(bool(visible))
+        self._update_toolbar_insets()
+
+    def _update_toolbar_insets(self) -> None:
+        tb = getattr(self, "toolbar", None)
+        if tb is None:
+            return
+        gap = 12
+        pip = getattr(self, "depth_overlay", None)
+        rp = getattr(self, "right_panel", None)
+        tb.inset_left = (16 + pip.card_rect().width() + gap
+                         if pip is not None and not pip.user_hidden else 0)
+        tb.inset_right = (16 + rp.card_rect().width() + gap
+                          if rp is not None else 0)
+        tb._reposition()
 
     # ==================================================================
     # Graphics preset
@@ -1818,12 +1459,10 @@ class MainWindow(QMainWindow):
             return
         self._camera_mode = mode
 
-        # Repaint the segment buttons.
-        try:
-            for code, btn in self._mode_btns.items():
-                btn.setStyleSheet(self._seg_button_qss(code == mode))
-        except Exception:
-            pass
+        # Отразить режим на панели вида (сигнал не повторяется).
+        tb = getattr(self, "toolbar", None)
+        if tb is not None:
+            tb.set_mode(mode)
 
         if mode == "free":
             self._apply_free_camera()
@@ -1950,54 +1589,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             print(f"[Preset] save failed: {exc}")
 
-    @staticmethod
-    def _preset_qss(state: str) -> str:
-        """QSS for a preset slot / save button in a given visual state:
-        'selected' | 'filled' | 'empty' | 'blink_on' | 'blink_off' |
-        'save_armed' | 'save_idle'."""
-        from src.ui.ui_theme import (
-            COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_HAIRLINE, COLOR_ACCENT,
-        )
-
-        def _btn(bg, fg, border, weight=600, hover_bg=None):
-            css = (
-                "QPushButton {"
-                f"  background: {bg};"
-                f"  color: {fg};"
-                f"  border: {border};"
-                "  border-radius: 5px;"
-                "  padding: 4px 6px;"
-                "  font-size: 10px;"
-                f"  font-weight: {weight};"
-                "  letter-spacing: 0.6px;"
-                "}"
-            )
-            if hover_bg is not None:
-                css += f"QPushButton:hover {{ background: {hover_bg}; }}"
-            return css
-
-        if state == "selected":
-            return _btn("rgba(0,255,136,55)", COLOR_TEXT,
-                        f"1px solid {COLOR_ACCENT}", 700)
-        if state == "filled":
-            return _btn("transparent", COLOR_ACCENT,
-                        f"1px solid {COLOR_ACCENT}", 600,
-                        hover_bg="rgba(0,255,136,18)")
-        if state == "blink_on":
-            return _btn("rgba(0,255,136,70)", COLOR_TEXT,
-                        f"1px dashed {COLOR_ACCENT}", 700)
-        if state == "blink_off":
-            return _btn("transparent", COLOR_TEXT_MUTED,
-                        f"1px dashed {COLOR_HAIRLINE}", 600)
-        if state == "save_armed":
-            return _btn("rgba(0,255,136,55)", COLOR_TEXT,
-                        f"1px solid {COLOR_ACCENT}", 700)
-        # 'empty' / 'save_idle'
-        return _btn("transparent", COLOR_TEXT_MUTED,
-                    f"1px solid {COLOR_HAIRLINE}", 600,
-                    hover_bg="rgba(255,255,255,8)")
-
     def _apply_preset_styles(self) -> None:
+        """Состояние слотов видов на панели: пустой / сохранён / выбран /
+        мигает (ждёт выбора слота для сохранения)."""
         try:
             armed = getattr(self, "_preset_save_armed", False)
             blink_on = getattr(self, "_preset_blink_on", False)
@@ -2010,12 +1604,7 @@ class MainWindow(QMainWindow):
                     state = "filled"
                 else:
                     state = "empty"
-                btn.setStyleSheet(self._preset_qss(state))
-            sb = getattr(self, "_btn_preset_save", None)
-            if sb is not None:
-                sb.setStyleSheet(
-                    self._preset_qss("save_armed" if armed else "save_idle")
-                )
+                btn.set_state(state)
         except Exception:
             pass
 
@@ -2512,7 +2101,7 @@ class MainWindow(QMainWindow):
         """Keep the interactive panel + read-only HUDs above the
         click-through reference layer (the telemetry card shows camera
         pos/rot/FOV the user reads while aligning)."""
-        for name in ("telemetry", "controls", "depth_overlay", "right_panel"):
+        for name in ("telemetry", "toolbar", "depth_overlay", "right_panel"):
             w = getattr(self, name, None)
             if w is not None:
                 try:
@@ -2798,7 +2387,7 @@ class MainWindow(QMainWindow):
     # reference-photo overlay is intentionally NOT in this list — it keeps
     # rendering during picking so the user can see where the bed corners are.
     _PICK_HIDE_WIDGETS = (
-        "telemetry", "depth_overlay", "controls", "right_panel",
+        "telemetry", "depth_overlay", "toolbar", "right_panel",
     )
 
     def _on_picking_state(self, active: bool) -> None:
@@ -2913,7 +2502,7 @@ class MainWindow(QMainWindow):
 
     def _hide_huds_for_modal(self) -> None:
         self._modal_hidden_huds = []
-        for name in ("telemetry", "controls", "depth_overlay", "right_panel"):
+        for name in ("telemetry", "toolbar", "depth_overlay", "right_panel"):
             widget = getattr(self, name, None)
             if widget is None:
                 continue
@@ -2948,25 +2537,21 @@ class MainWindow(QMainWindow):
             print(f"[Dataset] палитра сегментации не применена: {exc}")
 
     def _refresh_dataset_summary(self) -> None:
-        """Строка-итог под кнопками: сколько кадров и что именно сохранится."""
-        label = getattr(self, "lbl_dataset_summary", None)
-        if label is None:
+        """Сводка на вкладке «Датасет»: сколько кадров и что сохранится."""
+        rp = getattr(self, "right_panel", None)
+        if rp is None or not hasattr(rp, "set_dataset_summary"):
             return
         try:
             cfg = dataset_config.normalize(self._dataset_cfg)
-            total = dataset_config.total_frames(cfg)
-            per_fill = dataset_config.frames_per_fill(cfg)
-            names = {"color": "цвет", "depth": "глубина",
-                     "segmentation": "маска", "lidar": "лидар",
-                     "json": "json"}
-            files = ", ".join(names[k]
-                              for k in dataset_config.output_list(cfg))
-            label.setText(
-                f"{cfg['count']}×{per_fill} = {total} кадров · {files}\n"
-                f"{cfg['output_dir']}"
+            rp.set_dataset_summary(
+                count=cfg["count"],
+                per_fill=dataset_config.frames_per_fill(cfg),
+                total=dataset_config.total_frames(cfg),
+                outputs=list(dataset_config.output_list(cfg)),
+                out_dir=cfg["output_dir"],
             )
         except Exception as exc:
-            label.setText(f"настройки не прочитаны: {exc}")
+            rp.set_dataset_error(f"настройки не прочитаны: {exc}")
 
     def _on_save_render_clicked(self) -> None:
         """Запустить съёмку датасета с текущим конфигом."""

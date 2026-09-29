@@ -17,78 +17,30 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QPixmap
+from PyQt6.QtCore import Qt, QRectF, QSize, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QFrame, QLabel, QPushButton, QCheckBox, QRadioButton,
     QButtonGroup, QSpinBox, QDoubleSpinBox, QLineEdit, QVBoxLayout,
     QHBoxLayout, QGridLayout, QScrollArea, QSizePolicy, QFileDialog,
-    QColorDialog, QGraphicsDropShadowEffect, QStackedWidget,
+    QColorDialog, QStackedWidget,
 )
 
+from src.ui import icons
+from src.ui.hud import IconButton
 from src.ui.ui_theme import (
-    COLOR_ACCENT, COLOR_HAIRLINE, COLOR_TEXT, COLOR_TEXT_MUTED,
-    COLOR_TEXT_DIM, COLOR_WARN, FONT_MONO, apply_theme,
+    COLOR_ACCENT, COLOR_PURPLE, COLOR_SUCCESS, COLOR_TEAL, COLOR_TEXT,
+    COLOR_TEXT_MUTED, COLOR_TEXT_DIM, COLOR_WARN, FONT_MONO, apply_hud_theme,
 )
 from src.ui import dataset_config as dscfg
 from src.ui.depth_preview import depth_to_qimage, gradient_strip_qimage
 
 
 # ---------------------------------------------------------------------------
-# Мелкие фабрики виджетов в стиле HUD
+# Мелкие фабрики виджетов. Оформление берётся из общей темы (ui_theme):
+# здесь только размеры и поведение.
 # ---------------------------------------------------------------------------
-_FIELD_CSS = (
-    "  background: rgba(255,255,255,4);"
-    f"  color: {COLOR_TEXT};"
-    f"  border: 1px solid {COLOR_HAIRLINE};"
-    "  border-radius: 4px;"
-    "  padding: 2px 6px;"
-    f"  font-family: {FONT_MONO};"
-    "  font-size: 11px;"
-)
-
-# Qt считает width/height индикатора по области содержимого, без рамки.
-# Поэтому размер прописан отдельно для каждого состояния так, чтобы внешний
-# габарит везде был 14x14: иначе выбранный вариант «раздувается» и круг
-# радиокнопки превращается в скруглённый квадрат.
-_CHECK_CSS = (
-    f"QCheckBox {{ color: {COLOR_TEXT}; font-size: 12px;"
-    f" background: transparent; }}"
-    "QCheckBox::indicator:unchecked {"
-    "  width: 12px; height: 12px;"
-    f"  border: 1px solid {COLOR_HAIRLINE}; border-radius: 3px;"
-    "  background: rgba(255,255,255,4); }"
-    "QCheckBox::indicator:checked {"
-    "  width: 12px; height: 12px;"
-    f"  border: 1px solid {COLOR_ACCENT}; border-radius: 3px;"
-    f"  background: {COLOR_ACCENT}; }}"
-    f"QCheckBox:disabled {{ color: {COLOR_TEXT_DIM}; }}"
-    "QCheckBox::indicator:unchecked:disabled {"
-    f"  border-color: {COLOR_HAIRLINE}; background: #101010; }}"
-    "QCheckBox::indicator:checked:disabled {"
-    f"  border-color: {COLOR_TEXT_DIM}; background: {COLOR_TEXT_DIM}; }}"
-)
-
-_RADIO_CSS = (
-    f"QRadioButton {{ color: {COLOR_TEXT}; font-size: 12px;"
-    f" background: transparent; }}"
-    "QRadioButton::indicator:unchecked {"
-    "  width: 12px; height: 12px;"
-    f"  border: 1px solid {COLOR_HAIRLINE}; border-radius: 7px;"
-    "  background: rgba(255,255,255,4); }"
-    "QRadioButton::indicator:checked {"
-    "  width: 6px; height: 6px;"
-    f"  border: 4px solid {COLOR_ACCENT}; border-radius: 7px;"
-    "  background: #101010; }"
-    f"QRadioButton:disabled {{ color: {COLOR_TEXT_DIM}; }}"
-    "QRadioButton::indicator:unchecked:disabled {"
-    f"  border-color: {COLOR_HAIRLINE}; background: #101010; }}"
-    "QRadioButton::indicator:checked:disabled {"
-    f"  border-color: {COLOR_TEXT_DIM}; background: #101010; }}"
-)
-
-
-def _label(text, *, size=12, color=COLOR_TEXT, mono=False, bold=False,
+def _label(text, *, size=13, color=COLOR_TEXT, mono=False, bold=False,
            wrap=False):
     lbl = QLabel(text)
     lbl.setWordWrap(wrap)
@@ -102,40 +54,34 @@ def _label(text, *, size=12, color=COLOR_TEXT, mono=False, bold=False,
 
 def _hint(text):
     """Пояснение под опцией — то, ради чего затевался этот диалог."""
-    return _label(text, size=11, color=COLOR_TEXT_MUTED, wrap=True)
+    return _label(text, size=12, color=COLOR_TEXT_MUTED, wrap=True)
 
 
-def _spin(rng, value, step, decimals=2, suffix="", width=88):
+def _spin(rng, value, step, decimals=2, suffix="", width=100):
     sp = QDoubleSpinBox()
+    # Без стрелок: в узком поле они съедали цифры. Колесо и ↑/↓ работают.
+    sp.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
     sp.setRange(*rng)
     sp.setSingleStep(step)
     sp.setDecimals(decimals)
     sp.setValue(float(value))
     if suffix:
         sp.setSuffix(suffix)
-    sp.setFixedHeight(24)
+    sp.setFixedHeight(28)
     sp.setFixedWidth(width)
-    sp.setStyleSheet(
-        "QDoubleSpinBox {" + _FIELD_CSS + "}"
-        "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }"
-        f"QDoubleSpinBox:disabled {{ color: {COLOR_TEXT_DIM}; }}"
-    )
     return sp
 
 
-def _int_spin(rng, value, suffix="", width=88):
+def _int_spin(rng, value, suffix="", width=100):
     sp = QSpinBox()
+    # Без стрелок: в узком поле они съедали цифры. Колесо и ↑/↓ работают.
+    sp.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
     sp.setRange(*rng)
     sp.setValue(int(value))
     if suffix:
         sp.setSuffix(suffix)
-    sp.setFixedHeight(24)
+    sp.setFixedHeight(28)
     sp.setFixedWidth(width)
-    sp.setStyleSheet(
-        "QSpinBox {" + _FIELD_CSS + "}"
-        "QSpinBox::up-button, QSpinBox::down-button { width: 0; }"
-        f"QSpinBox:disabled {{ color: {COLOR_TEXT_DIM}; }}"
-    )
     return sp
 
 
@@ -143,7 +89,6 @@ def _check(text, checked=False, tip=""):
     box = QCheckBox(text)
     box.setChecked(bool(checked))
     box.setCursor(Qt.CursorShape.PointingHandCursor)
-    box.setStyleSheet(_CHECK_CSS)
     if tip:
         box.setToolTip(tip)
     return box
@@ -153,83 +98,56 @@ def _radio(text, checked=False):
     btn = QRadioButton(text)
     btn.setChecked(bool(checked))
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    btn.setStyleSheet(_RADIO_CSS)
     return btn
 
 
-def _button(text, *, accent=False, width=None):
+def _button(text, *, accent=False, width=None, icon=None):
     btn = QPushButton(text)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    btn.setFixedHeight(28)
+    btn.setFixedHeight(30)
     if width:
         btn.setFixedWidth(width)
     if accent:
-        btn.setStyleSheet(
-            "QPushButton {"
-            "  background-color: rgba(0, 255, 136, 30);"
-            f"  color: {COLOR_TEXT};"
-            f"  border: 1px solid {COLOR_ACCENT};"
-            "  border-radius: 5px; padding: 3px 16px;"
-            "  font-size: 12px; font-weight: 600; letter-spacing: 0.4px;"
-            "}"
-            "QPushButton:hover { background-color: rgba(0, 255, 136, 55); }"
-            "QPushButton:pressed { background-color: rgba(0, 255, 136, 90); }"
-            "QPushButton:disabled {"
-            "  background: rgba(255,255,255,4);"
-            f"  color: {COLOR_TEXT_DIM}; border: 1px solid {COLOR_HAIRLINE}; }}"
-        )
-    else:
-        btn.setStyleSheet(
-            "QPushButton {"
-            "  background: rgba(255,255,255,6);"
-            f"  color: {COLOR_TEXT};"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "  border-radius: 5px; padding: 3px 14px; font-size: 12px;"
-            "}"
-            "QPushButton:hover { background: rgba(255,255,255,14); }"
-            f"QPushButton:disabled {{ color: {COLOR_TEXT_DIM}; }}"
-        )
+        btn.setProperty("variant", "primary")
+    if icon:
+        color = "#FFFFFF" if accent else COLOR_TEXT
+        btn.setIcon(icons.icon(icon, color, 14, active_color=color))
+        btn.setIconSize(QSize(14, 14))
     return btn
 
 
 def _hairline():
     line = QFrame()
     line.setFixedHeight(1)
-    line.setStyleSheet(f"background-color: {COLOR_HAIRLINE}; border: none;")
+    line.setStyleSheet("background-color: rgba(255,255,255,20); border: none;")
     return line
 
 
 class _Section(QFrame):
-    """Блок настроек: заголовок-надглазник, подпись и вертикальный стек."""
+    """Блок настроек: заголовок, подпись и вертикальный стек — карточка в
+    духе «Системных настроек» macOS."""
 
     def __init__(self, title, subtitle=""):
         super().__init__()
+        self.setObjectName("DsSection")
         self.setStyleSheet(
-            "QFrame {"
-            "  background: rgba(255,255,255,3);"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "  border-radius: 8px;"
+            "QFrame#DsSection {"
+            "  background: rgba(255,255,255,12);"
+            "  border: none;"
+            "  border-radius: 10px;"
             "}"
         )
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 12, 14, 14)
-        lay.setSpacing(8)
+        lay.setContentsMargins(16, 14, 16, 16)
+        lay.setSpacing(6)
 
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        dot = _label("●", size=9, color=COLOR_ACCENT)
-        head.addWidget(dot, 0, Qt.AlignmentFlag.AlignVCenter)
-        head.addWidget(_label(title.upper(), size=11, color=COLOR_TEXT,
-                              bold=True), 0, Qt.AlignmentFlag.AlignVCenter)
-        head.addStretch(1)
-        lay.addLayout(head)
-
+        lay.addWidget(_label(title, size=14, bold=True))
         if subtitle:
             lay.addWidget(_hint(subtitle))
-        lay.addWidget(_hairline())
+        lay.addSpacing(6)
 
         self.body = QVBoxLayout()
-        self.body.setSpacing(10)
+        self.body.setSpacing(12)
         lay.addLayout(self.body)
 
     def add(self, widget_or_layout):
@@ -244,7 +162,7 @@ class _Section(QFrame):
         wrap.setSpacing(2)
         wrap.addWidget(control)
         hint = _hint(hint_text)
-        hint.setContentsMargins(21, 0, 0, 0)
+        hint.setContentsMargins(23, 0, 0, 0)
         wrap.addWidget(hint)
         self.body.addLayout(wrap)
         return control
@@ -255,7 +173,7 @@ class _Section(QFrame):
         wrap.setSpacing(2)
         row = QHBoxLayout()
         row.setSpacing(8)
-        row.addWidget(_label(title, size=12), 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(_label(title), 0, Qt.AlignmentFlag.AlignVCenter)
         row.addStretch(1)
         # Диапазон «от … до» рядом с подписью требует под 450 px минимума и
         # в одиночку решает, сколько колонок влезет в окно. Такие поля уходят
@@ -286,7 +204,6 @@ class _Columns(QWidget):
 
     def __init__(self, min_col=340, max_col=560, max_cols=4, spacing=12):
         super().__init__()
-        self.setStyleSheet("background: transparent;")
         self._items: list[QWidget] = []
         self._cols = 0
         self._cw = 0
@@ -365,7 +282,6 @@ class _Columns(QWidget):
         lays, heights = [], []
         for _ in range(cols):
             holder = QWidget()
-            holder.setStyleSheet("background: transparent;")
             lay = QVBoxLayout(holder)
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(self._spacing)
@@ -404,42 +320,81 @@ class _Columns(QWidget):
 
 
 class _NavButton(QPushButton):
-    """Пункт бокового списка страниц: заголовок, подпись и метка состояния."""
+    """Пункт бокового списка страниц: цветная плитка-иконка, заголовок и
+    подпись-состояние (как в «Системных настройках» macOS)."""
 
-    def __init__(self, title, subtitle):
+    def __init__(self, title, subtitle, icon_name="dot", tint=COLOR_ACCENT):
         super().__init__()
         self._title = title
         self._subtitle = subtitle
+        self._icon = icon_name
+        self._tint = tint
+        self._hover = False
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(46)
+        self.setStyleSheet("QPushButton { min-height: 48px; max-height: 48px; }")
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Fixed)
-        self.setStyleSheet(
-            "QPushButton {"
-            "  text-align: left; padding: 6px 10px;"
-            "  background: transparent;"
-            "  border: 1px solid transparent; border-radius: 6px;"
-            f"  color: {COLOR_TEXT_MUTED}; font-size: 12px;"
-            "}"
-            "QPushButton:hover { background: rgba(255,255,255,10); }"
-            "QPushButton:checked {"
-            "  background: rgba(0, 255, 136, 22);"
-            f"  border: 1px solid {COLOR_ACCENT};"
-            f"  color: {COLOR_TEXT}; font-weight: 600;"
-            "}"
-        )
-        self._render()
+        self.setToolTip(subtitle)
 
     def set_subtitle(self, text):
         if text != self._subtitle:
             self._subtitle = text
-            self._render()
+            self.setToolTip(text)
+            self.update()
 
-    def _render(self):
-        self.setText("\n".join([self._title, self._subtitle])
-                     if self._subtitle else self._title)
-        self.setToolTip(self._subtitle)
+    # Высота из QSS (min-height у QPushButton) перебивает setFixedHeight,
+    # поэтому размер задаётся подсказками.
+    def sizeHint(self):
+        return QSize(200, 48)
+
+    def minimumSizeHint(self):
+        return QSize(120, 48)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect())
+        on = self.isChecked()
+        if on or self._hover:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(COLOR_ACCENT) if on else QColor(255, 255, 255, 18))
+            p.drawRoundedRect(r, 8, 8)
+        tile = QRectF(8, (r.height() - 28) / 2, 28, 28)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(self._tint))
+        p.drawRoundedRect(tile, 7, 7)
+        pm = icons.pixmap(self._icon, "#FFFFFF", 16)
+        p.drawPixmap(QRectF(tile.x() + 6, tile.y() + 6, 16, 16), pm,
+                     QRectF(pm.rect()))
+        f = QFont(self.font())
+        f.setPixelSize(13)
+        f.setWeight(QFont.Weight.DemiBold if on else QFont.Weight.Medium)
+        p.setFont(f)
+        p.setPen(QColor("#FFFFFF" if on else COLOR_TEXT))
+        x = tile.right() + 10
+        w = r.width() - x - 8
+        p.drawText(QRectF(x, 6, w, 18), int(Qt.AlignmentFlag.AlignVCenter),
+                   self._title)
+        f.setPixelSize(11)
+        f.setWeight(QFont.Weight.Normal)
+        p.setFont(f)
+        p.setPen(QColor(255, 255, 255, 200) if on else QColor(COLOR_TEXT_MUTED))
+        p.drawText(QRectF(x, 24, w, 16), int(Qt.AlignmentFlag.AlignVCenter),
+                   QFontMetrics(f).elidedText(self._subtitle,
+                                              Qt.TextElideMode.ElideRight,
+                                              int(w)))
+        p.end()
 
 
 class _Swatch(QPushButton):
@@ -450,7 +405,7 @@ class _Swatch(QPushButton):
     def __init__(self, rgb):
         super().__init__()
         self._rgb = tuple(rgb)
-        self.setFixedSize(QSize(26, 22))
+        self.setFixedSize(QSize(30, 24))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clicked.connect(self._pick)
         self._refresh()
@@ -468,10 +423,10 @@ class _Swatch(QPushButton):
         self.setStyleSheet(
             "QPushButton {"
             f"  background-color: rgb({r},{g},{b});"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "  border-radius: 4px;"
+            "  border: 1px solid rgba(255,255,255,40);"
+            "  border-radius: 6px;"
             "}"
-            f"QPushButton:hover {{ border: 1px solid {COLOR_ACCENT}; }}"
+            f"QPushButton:hover {{ border: 2px solid {COLOR_ACCENT}; }}"
         )
 
     def _pick(self):
@@ -519,32 +474,28 @@ class DatasetSettingsDialog(QDialog):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setModal(True)
-        apply_theme(self)
+        # Прозрачный корень: карточка и разделы задают фон сами, а вложенные
+        # контейнеры не должны закрашивать их сплошным цветом.
+        apply_hud_theme(self)
 
         self._backdrop = QFrame(self)
         self._backdrop.setStyleSheet("background-color: rgba(0, 0, 0, 170);")
         self._backdrop.lower()
 
         self.card = QFrame(self)
-        self.card.setObjectName("Overlay")
+        self.card.setObjectName("DsCard")
         self.card.setStyleSheet(
-            "QFrame#Overlay {"
-            "  background-color: rgba(16, 16, 16, 245);"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "  border-radius: 12px;"
+            "QFrame#DsCard {"
+            "  background-color: rgb(30, 30, 32);"
+            "  border: 1px solid rgba(255,255,255,24);"
+            "  border-radius: 14px;"
             "}"
         )
-        shadow = QGraphicsDropShadowEffect(self.card)
-        shadow.setBlurRadius(40)
-        shadow.setOffset(0, 8)
-        shadow.setColor(QColor(0, 0, 0, 220))
-        self.card.setGraphicsEffect(shadow)
 
         card_lay = QVBoxLayout(self.card)
-        card_lay.setContentsMargins(18, 16, 18, 16)
-        card_lay.setSpacing(12)
+        card_lay.setContentsMargins(20, 18, 20, 16)
+        card_lay.setSpacing(14)
         card_lay.addLayout(self._build_header())
-        card_lay.addWidget(_hairline())
         card_lay.addLayout(self._build_body(), 1)
         card_lay.addWidget(_hairline())
         card_lay.addLayout(self._build_footer())
@@ -569,39 +520,40 @@ class DatasetSettingsDialog(QDialog):
     # ------------------------------------------------------------------
     def _build_header(self):
         row = QHBoxLayout()
-        row.setSpacing(10)
-        row.addWidget(_label("●", size=10, color=COLOR_ACCENT), 0,
-                      Qt.AlignmentFlag.AlignVCenter)
-        row.addWidget(_label("ДАТАСЕТ", size=10, color=COLOR_TEXT_MUTED,
-                             bold=True), 0, Qt.AlignmentFlag.AlignVCenter)
-        sep = QFrame()
-        sep.setFixedSize(1, 14)
-        sep.setStyleSheet(f"background-color: {COLOR_HAIRLINE};")
-        row.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
-        row.addWidget(_label("Настройки съёмки", size=14, bold=True), 0,
-                      Qt.AlignmentFlag.AlignVCenter)
+        row.setSpacing(12)
+        tile = QLabel()
+        tile.setFixedSize(34, 34)
+        tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tile.setPixmap(icons.pixmap("stack", "#FFFFFF", 20))
+        tile.setStyleSheet(
+            "QLabel { border-radius: 9px; background: qlineargradient("
+            "x1:0, y1:0, x2:1, y2:1, stop:0 #409CFF, stop:1 #5E5CE6); }")
+        row.addWidget(tile, 0, Qt.AlignmentFlag.AlignVCenter)
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        titles.addWidget(_label("Съёмка датасета", size=17, bold=True))
+        self.lbl_summary = _label("", size=12, color=COLOR_TEXT_MUTED)
+        titles.addWidget(self.lbl_summary)
+        row.addLayout(titles)
         row.addStretch(1)
 
-        self.lbl_summary = _label("", size=11, color=COLOR_TEXT_MUTED,
-                                  mono=True)
-        row.addWidget(self.lbl_summary, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        btn_close = _button("✕", width=32)
-        btn_close.setToolTip("Закрыть без сохранения (Esc)")
+        btn_close = IconButton("close", "Закрыть без сохранения · Esc",
+                               size=30, icon_size=16, filled=True)
         btn_close.clicked.connect(self.reject)
-        row.addWidget(btn_close, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(btn_close, 0, Qt.AlignmentFlag.AlignTop)
         return row
 
     def _build_footer(self):
         row = QHBoxLayout()
         row.setSpacing(8)
 
-        btn_reset = _button("Сбросить")
+        btn_reset = _button("Сбросить", icon="rotate_ccw")
+        btn_reset.setProperty("variant", "ghost")
         btn_reset.setToolTip("Вернуть все настройки к значениям по умолчанию")
         btn_reset.clicked.connect(self._on_reset)
         row.addWidget(btn_reset, 0)
 
-        self.lbl_footer_hint = _label("", size=11, color=COLOR_TEXT_MUTED,
+        self.lbl_footer_hint = _label("", size=12, color=COLOR_TEXT_MUTED,
                                       wrap=True)
         row.addWidget(self.lbl_footer_hint, 1)
 
@@ -614,7 +566,7 @@ class DatasetSettingsDialog(QDialog):
         btn_save.clicked.connect(lambda: self._finish("save"))
         row.addWidget(btn_save, 0)
 
-        self.btn_start = _button("Начать съёмку", accent=True)
+        self.btn_start = _button("Начать съёмку", accent=True, icon="record")
         self.btn_start.clicked.connect(lambda: self._finish("start"))
         row.addWidget(self.btn_start, 0)
         return row
@@ -635,22 +587,24 @@ class DatasetSettingsDialog(QDialog):
         row.setSpacing(14)
 
         self.stack = QStackedWidget()
-        self.stack.setStyleSheet("background: transparent;")
 
         self._nav_buttons = {}
         self.grp_nav = QButtonGroup(self)
         self.grp_nav.setExclusive(True)
 
         nav_holder = QWidget()
-        nav_holder.setStyleSheet("background: transparent;")
-        nav_holder.setFixedWidth(206)
+        nav_holder.setFixedWidth(220)
         nav = QVBoxLayout(nav_holder)
         nav.setContentsMargins(0, 0, 0, 0)
-        nav.setSpacing(4)
-        nav.addWidget(_label("РАЗДЕЛЫ", size=10, color=COLOR_TEXT_MUTED,
-                             bold=True))
-        nav.addSpacing(2)
+        nav.setSpacing(2)
 
+        page_icons = {
+            "scope": ("stack", COLOR_ACCENT),
+            "capture": ("camera", COLOR_WARN),
+            "depth": ("depth", COLOR_TEAL),
+            "segmentation": ("mask", COLOR_PURPLE),
+            "lidar": ("lidar", COLOR_SUCCESS),
+        }
         pages = [
             ("scope", "Съёмка", "объём, выходы, наполнение",
              [self._section_scope(), self._section_outputs(),
@@ -668,7 +622,7 @@ class DatasetSettingsDialog(QDialog):
         ]
 
         for index, (key, title, subtitle, sections) in enumerate(pages):
-            btn = _NavButton(title, subtitle)
+            btn = _NavButton(title, subtitle, *page_icons[key])
             btn.clicked.connect(
                 lambda _=False, i=index: self._go_page(i))
             if key == "depth":
@@ -684,10 +638,6 @@ class DatasetSettingsDialog(QDialog):
         self.grp_nav.button(0).setChecked(True)
 
         row.addWidget(nav_holder, 0)
-        divider = QFrame()
-        divider.setFixedWidth(1)
-        divider.setStyleSheet(f"background-color: {COLOR_HAIRLINE};")
-        row.addWidget(divider, 0)
         row.addWidget(self.stack, 1)
         return row
 
@@ -709,14 +659,7 @@ class DatasetSettingsDialog(QDialog):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(
-            "QScrollArea { background: transparent; border: none; }"
-            "QScrollBar:vertical { background: transparent; width: 8px; }"
-            "QScrollBar::handle:vertical {"
-            f"  background: {COLOR_HAIRLINE}; border-radius: 4px;"
-            "  min-height: 40px; }"
-            "QScrollBar::add-line, QScrollBar::sub-line { height: 0; }"
-        )
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         columns = _Columns()
         for section in sections:
             columns.add(section)
@@ -741,23 +684,22 @@ class DatasetSettingsDialog(QDialog):
 
         # wrap=True: строка длинная, а без переноса она задаёт минимальную
         # ширину всей колонки и ломает раскладку на узком окне.
-        self.lbl_frames = _label("", size=11, color=COLOR_ACCENT, mono=True,
+        self.lbl_frames = _label("", size=12, color=COLOR_ACCENT, mono=True,
                                  wrap=True)
         sec.add(self.lbl_frames)
 
         path_row = QHBoxLayout()
         path_row.setSpacing(6)
         self.edt_out = QLineEdit(self.config["output_dir"])
-        self.edt_out.setFixedHeight(24)
-        self.edt_out.setStyleSheet("QLineEdit {" + _FIELD_CSS + "}")
-        btn_browse = _button("Обзор…", width=78)
+        self.edt_out.setFixedHeight(30)
+        btn_browse = _button("Обзор…", icon="folder")
         btn_browse.clicked.connect(self._on_browse)
         path_row.addWidget(self.edt_out, 1)
         path_row.addWidget(btn_browse, 0)
 
         wrap = QVBoxLayout()
         wrap.setSpacing(2)
-        wrap.addWidget(_label("Каталог вывода", size=12))
+        wrap.addWidget(_label("Каталог вывода"))
         wrap.addLayout(path_row)
         wrap.addWidget(_hint(
             "Все файлы кадра (цвет, глубина, маска, json) складываются сюда "
@@ -801,7 +743,7 @@ class DatasetSettingsDialog(QDialog):
             self.chk_out[key] = box
             sec.add_option(box, hint)
 
-        self.lbl_out_warn = _label("", size=11, color=COLOR_WARN, wrap=True)
+        self.lbl_out_warn = _label("", size=12, color=COLOR_WARN, wrap=True)
         sec.add(self.lbl_out_warn)
         return sec
 
@@ -1019,8 +961,8 @@ class DatasetSettingsDialog(QDialog):
         self.depth_canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
                                         QSizePolicy.Policy.Expanding)
         self.depth_canvas.setStyleSheet(
-            "background-color: #050505; border-radius: 6px;"
-            f"color: {COLOR_TEXT_MUTED}; font-size: 11px;"
+            "background-color: #000000; border-radius: 8px;"
+            f"color: {COLOR_TEXT_MUTED}; font-size: 12px;"
         )
         self.depth_canvas.setText("Превью недоступно")
         sec.add(self.depth_canvas)
@@ -1031,10 +973,10 @@ class DatasetSettingsDialog(QDialog):
         sec.add(self.depth_legend)
 
         legend_row = QHBoxLayout()
-        legend_row.addWidget(_label("дальше", size=10,
+        legend_row.addWidget(_label("дальше", size=11,
                                     color=COLOR_TEXT_MUTED), 0)
         legend_row.addStretch(1)
-        legend_row.addWidget(_label("ближе", size=10,
+        legend_row.addWidget(_label("ближе", size=11,
                                     color=COLOR_TEXT_MUTED), 0)
         sec.add(legend_row)
 
@@ -1077,7 +1019,7 @@ class DatasetSettingsDialog(QDialog):
                       "Дальний край диапазона. Чем уже диапазон, тем больше "
                       "разрешение по глубине внутри кузова.",
                       self.spn_grad_b)
-        self.lbl_grad_meters = _label("", size=11, color=COLOR_ACCENT,
+        self.lbl_grad_meters = _label("", size=12, color=COLOR_ACCENT,
                                       mono=True, wrap=True)
         sec.add(self.lbl_grad_meters)
 
@@ -1138,10 +1080,9 @@ class DatasetSettingsDialog(QDialog):
             grid.addWidget(swatch, row, 0, Qt.AlignmentFlag.AlignTop)
             text = QVBoxLayout()
             text.setSpacing(1)
-            text.addWidget(_label(title, size=12))
+            text.addWidget(_label(title))
             text.addWidget(_hint(hint))
             holder = QWidget()
-            holder.setStyleSheet("background: transparent;")
             holder.setLayout(text)
             grid.addWidget(holder, row, 1)
         grid.setColumnStretch(1, 1)
@@ -1170,7 +1111,7 @@ class DatasetSettingsDialog(QDialog):
         )
         lid = self.config["lidar"]
 
-        self.lbl_lidar_backend = _label("", size=11, color=COLOR_TEXT_MUTED,
+        self.lbl_lidar_backend = _label("", size=12, color=COLOR_TEXT_MUTED,
                                         mono=True, wrap=True)
         sec.add(self.lbl_lidar_backend)
 
@@ -1570,8 +1511,8 @@ class DatasetSettingsDialog(QDialog):
             self.btn_start.setEnabled(can_start)
         if hasattr(self, "lbl_footer_hint"):
             self.lbl_footer_hint.setText(
-                "Съёмка блокирует окно до конца прогона; прогресс виден на "
-                "кнопке в карточке камеры."
+                "Съёмка блокирует окно до конца прогона; прогресс — на "
+                "кнопке «Снять» во вкладке «Датасет»."
                 if can_start else ""
             )
 

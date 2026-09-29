@@ -1,448 +1,488 @@
 # ui_theme.py
 # ---------------------------------------------------------------------------
-# Digital Engineering 2026 — UI Theme for PyQt6
-# Professional AI / Robotics tooling aesthetic.
+# Тема интерфейса в духе macOS (dark appearance).
 # ---------------------------------------------------------------------------
-# Visual language:
-#   * Anthracite background           #101010
-#   * Surfaces / elevated panels      #161616  / #181818
-#   * Hairline dividers               #252525  (NO boxed frames, only lines + whitespace)
-#   * Muted text                      #7A7A7A
-#   * Primary text                    #E8E8E8
-#   * Accent (system-wide, single)    #00FF88  (Vivid Mint)
-#   * Warning                         #FF7A1A  (Cyber Orange, used VERY sparingly)
-#   * Danger                          #FF3355
-# Typography: Geist Sans (fallback: Inter, IBM Plex Sans, Segoe UI Variable).
-# Radii: 8px for surfaces, 6px for controls, 4px for tags/chips.
+# Язык оформления:
+#   * Поверхности — тёмные «материалы» Apple: окно #1C1C1E, контролы #2C2C2E,
+#     приподнятые элементы #3A3A3C; разделители — тонкие и приглушённые.
+#   * Текст — три уровня яркости (label / secondaryLabel / tertiaryLabel).
+#   * Один системный акцент — systemBlue #0A84FF; зелёный / оранжевый /
+#     красный — только для статусов.
+#   * Скругления: 14 px у плавающих панелей, 10 px у карточек, 7 px у
+#     кнопок и полей.
+#   * Шрифт — SF Pro, на Windows — Segoe UI Variable (ближайший по рисунку).
+#
+# Имена констант сохранены со старой темы: их импортируют диалоги и
+# виджеты, и смена значений перекрашивает их без правок.
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
 
-# -- Palette -----------------------------------------------------------------
-COLOR_BG                = "#101010"
-COLOR_SURFACE           = "#161616"
-COLOR_SURFACE_ELEVATED  = "#1B1B1B"
-COLOR_HAIRLINE          = "#252525"
-COLOR_HAIRLINE_HOVER    = "#3A3A3A"
+# -- Палитра -----------------------------------------------------------------
+COLOR_BG                = "#1C1C1E"   # фон окна / диалога
+COLOR_SURFACE           = "#2C2C2E"   # поля, кнопки, карточки
+COLOR_SURFACE_ELEVATED  = "#3A3A3C"   # hover, выделенные сегменты
+COLOR_HAIRLINE          = "#38383A"   # разделители
+COLOR_HAIRLINE_HOVER    = "#4A4A4E"
 
-COLOR_TEXT              = "#E8E8E8"
-COLOR_TEXT_MUTED        = "#7A7A7A"
-COLOR_TEXT_DIM          = "#555555"
+COLOR_TEXT              = "#F5F5F7"   # label
+COLOR_TEXT_MUTED        = "#98989F"   # secondaryLabel
+COLOR_TEXT_DIM          = "#636366"   # tertiaryLabel
 
-COLOR_ACCENT            = "#00FF88"
-COLOR_ACCENT_SOFT       = "#00CC6A"
-COLOR_ACCENT_GLOW       = "rgba(0, 255, 136, 30)"
+COLOR_ACCENT            = "#0A84FF"   # systemBlue (dark)
+COLOR_ACCENT_SOFT       = "#409CFF"   # hover / светлее
+COLOR_ACCENT_GLOW       = "rgba(10, 132, 255, 40)"
 
-COLOR_WARN              = "#FF7A1A"
-COLOR_DANGER            = "#FF3355"
+COLOR_SUCCESS           = "#30D158"
+COLOR_WARN              = "#FF9F0A"
+COLOR_DANGER            = "#FF453A"
+COLOR_PURPLE            = "#BF5AF2"
+COLOR_TEAL              = "#64D2FF"
+COLOR_YELLOW            = "#FFD60A"
 
-# Font stack — Geist Sans first, with solid fallbacks so the file is portable.
-FONT_STACK = "'Geist', 'Geist Sans', 'Inter', 'IBM Plex Sans', " \
-             "'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif"
-FONT_MONO  = "'Geist Mono', 'JetBrains Mono', 'IBM Plex Mono', Consolas, monospace"
+#: Заливка плавающих панелей поверх 3D-вида (RGBA). Почти непрозрачная:
+#: сцена под ней пёстрая, и сквозь сильную прозрачность текст не читается.
+MATERIAL_RGBA           = (30, 30, 32, 238)
+MATERIAL_BORDER_RGBA    = (255, 255, 255, 22)
+
+RADIUS_PANEL   = 8
+RADIUS_CARD    = 8
+RADIUS_CONTROL = 7
+
+FONT_STACK = ("'SF Pro Text', 'Segoe UI Variable Text', 'Segoe UI Variable', "
+              "'Segoe UI', 'Inter', system-ui, sans-serif")
+FONT_DISPLAY = ("'SF Pro Display', 'Segoe UI Variable Display', "
+                "'Segoe UI Variable', 'Segoe UI', sans-serif")
+FONT_MONO  = "'SF Mono', 'Cascadia Mono', 'JetBrains Mono', Consolas, monospace"
 
 
-# -- Master QSS --------------------------------------------------------------
-QSS = f"""
-/* ===== Root ===== */
+def rgba(hex_color: str, alpha: int) -> str:
+    """'#RRGGBB' + альфа 0..255 -> 'rgba(r, g, b, a)' для QSS."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {int(alpha)})"
+
+
+def _icon_url(name: str, color: str, size: int = 16) -> str:
+    """Путь к SVG-иконке для QSS `image:` (лениво, без QApplication)."""
+    try:
+        from src.ui.icons import svg_file
+        return svg_file(name, color, size).replace("\\", "/")
+    except Exception:
+        return ""
+
+
+def build_qss(root_bg: str | None = COLOR_BG) -> str:
+    """
+    Полная таблица стилей. `root_bg=None` — прозрачный корень: так её
+    получают плавающие панели, которые рисуют свой материал сами.
+    """
+    root_fill = root_bg if root_bg else "transparent"
+    chevron = _icon_url("chevron_down", COLOR_TEXT_MUTED, 12)
+    chevron_up = _icon_url("chevron_up", COLOR_TEXT_MUTED, 10)
+    chevron_dn = _icon_url("chevron_down", COLOR_TEXT_MUTED, 10)
+    check = _icon_url("check_bold", "#FFFFFF", 12)
+    arrow_css = f"image: url('{chevron}');" if chevron else ""
+    up_css = f"image: url('{chevron_up}');" if chevron_up else ""
+    dn_css = f"image: url('{chevron_dn}');" if chevron_dn else ""
+    check_css = f"image: url('{check}');" if check else "image: none;"
+
+    return f"""
+/* ===== Корень ===== */
 QWidget {{
-    background-color: {COLOR_BG};
+    background-color: {root_fill};
     color: {COLOR_TEXT};
     font-family: {FONT_STACK};
-    font-size: 12px;
-    font-weight: 400;
-    letter-spacing: 0.1px;
+    font-size: 13px;
     border: none;
     outline: 0;
     selection-background-color: {COLOR_ACCENT};
-    selection-color: {COLOR_BG};
+    selection-color: #FFFFFF;
+}}
+QDialog, QMainWindow, QMessageBox {{
+    background-color: {COLOR_BG};
 }}
 
 QToolTip {{
-    background-color: {COLOR_SURFACE_ELEVATED};
-    color: {COLOR_TEXT};
-    border: 1px solid {COLOR_HAIRLINE};
-    border-radius: 4px;
-    padding: 6px 10px;
-    font-size: 11px;
-}}
-
-/* ===== Surfaces ===== */
-/* Anchor surfaces via objectName so we can get elevation without boxed look. */
-QWidget#RightPanel {{
-    background-color: {COLOR_BG};
-    border-left: 1px solid {COLOR_HAIRLINE};
-}}
-
-QWidget#Surface {{
     background-color: {COLOR_SURFACE};
-    border-radius: 8px;
+    color: {COLOR_TEXT};
+    border: 1px solid {COLOR_HAIRLINE_HOVER};
+    border-radius: 6px;
+    padding: 5px 9px;
+    font-size: 12px;
 }}
 
-QWidget#SurfaceElevated {{
-    background-color: {COLOR_SURFACE_ELEVATED};
-    border-radius: 8px;
-}}
-
-/* Hairline horizontal rule used instead of GroupBox borders */
-QFrame[role="hairline"] {{
-    background-color: {COLOR_HAIRLINE};
-    max-height: 1px;
-    min-height: 1px;
-    border: none;
-    margin: 4px 0;
-}}
-
-/* ===== Typography helpers ===== */
+/* ===== Типографика ===== */
+QLabel {{ background: transparent; }}
 QLabel[role="eyebrow"] {{
     color: {COLOR_TEXT_MUTED};
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 600;
-    letter-spacing: 1.4px;
-    text-transform: uppercase;
-    padding: 0 0 2px 0;
 }}
-
 QLabel[role="title"] {{
+    font-family: {FONT_DISPLAY};
     color: {COLOR_TEXT};
-    font-size: 15px;
+    font-size: 20px;
+    font-weight: 700;
+}}
+QLabel[role="headline"] {{
+    color: {COLOR_TEXT};
+    font-size: 13px;
     font-weight: 600;
-    letter-spacing: -0.2px;
 }}
-
 QLabel[role="metric"] {{
+    font-family: {FONT_DISPLAY};
     color: {COLOR_TEXT};
-    font-family: {FONT_MONO};
-    font-size: 22px;
-    font-weight: 500;
-    letter-spacing: -0.5px;
+    font-size: 28px;
+    font-weight: 600;
 }}
-
 QLabel[role="metric-unit"] {{
     color: {COLOR_TEXT_MUTED};
-    font-family: {FONT_MONO};
-    font-size: 11px;
-    font-weight: 400;
+    font-size: 12px;
 }}
-
 QLabel[role="muted"] {{
     color: {COLOR_TEXT_MUTED};
+    font-size: 12px;
+}}
+QLabel[role="caption"] {{
+    color: {COLOR_TEXT_DIM};
     font-size: 11px;
 }}
-
-/* ===== Status chip (LIVE / IDLE / ERR) ===== */
-QLabel[role="chip-live"] {{
-    color: {COLOR_ACCENT};
-    background-color: rgba(0, 255, 136, 18);
-    border: 1px solid rgba(0, 255, 136, 60);
-    border-radius: 4px;
-    padding: 2px 8px;
+QLabel[role="mono"] {{
     font-family: {FONT_MONO};
-    font-size: 10px;
+    color: {COLOR_TEXT};
+    font-size: 12px;
+}}
+
+/* ===== Чипы статуса ===== */
+QLabel[role="chip-live"] {{
+    color: {COLOR_SUCCESS};
+    background-color: {rgba(COLOR_SUCCESS, 36)};
+    border-radius: 9px;
+    padding: 2px 8px;
+    font-size: 11px;
     font-weight: 600;
-    letter-spacing: 1px;
 }}
 QLabel[role="chip-idle"] {{
     color: {COLOR_TEXT_MUTED};
-    background-color: {COLOR_SURFACE};
-    border: 1px solid {COLOR_HAIRLINE};
-    border-radius: 4px;
+    background-color: {rgba("#FFFFFF", 18)};
+    border-radius: 9px;
     padding: 2px 8px;
-    font-family: {FONT_MONO};
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 600;
-    letter-spacing: 1px;
 }}
 QLabel[role="chip-err"] {{
     color: {COLOR_DANGER};
-    background-color: rgba(255, 51, 85, 18);
-    border: 1px solid rgba(255, 51, 85, 60);
-    border-radius: 4px;
+    background-color: {rgba(COLOR_DANGER, 36)};
+    border-radius: 9px;
     padding: 2px 8px;
-    font-family: {FONT_MONO};
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 600;
-    letter-spacing: 1px;
 }}
 
-/* ===== GroupBox ===== */
-/* No visible frame: just the title as a small caps eyebrow and a hairline below. */
-QGroupBox {{
-    background: transparent;
+/* ===== Карточки (inset grouped) ===== */
+QFrame#Surface, QWidget#Surface {{
+    background-color: {rgba("#FFFFFF", 12)};
+    border-radius: {RADIUS_CARD}px;
+}}
+QFrame#SurfaceElevated, QWidget#SurfaceElevated {{
+    background-color: {COLOR_SURFACE};
+    border-radius: {RADIUS_CARD}px;
+}}
+QFrame[role="hairline"] {{
+    background-color: {rgba("#FFFFFF", 20)};
+    max-height: 1px;
+    min-height: 1px;
     border: none;
-    border-top: 1px solid {COLOR_HAIRLINE};
-    margin-top: 22px;
-    padding: 16px 0 4px 0;
+}}
+
+/* ===== GroupBox — секция в стиле «Системных настроек» ===== */
+QGroupBox {{
+    background-color: {rgba("#FFFFFF", 12)};
+    border: none;
+    border-radius: {RADIUS_CARD}px;
+    margin-top: 26px;
+    padding: 12px 12px 10px 12px;
     font-weight: 600;
 }}
 QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
-    left: 0px;
-    top: 2px;
+    left: 4px;
+    top: 4px;
     padding: 0;
     color: {COLOR_TEXT_MUTED};
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 600;
-    letter-spacing: 1.6px;
-    text-transform: uppercase;
+    background: transparent;
 }}
 
-/* ===== Buttons ===== */
+/* ===== Кнопки ===== */
 QPushButton {{
-    background-color: transparent;
+    background-color: {rgba("#FFFFFF", 26)};
     color: {COLOR_TEXT};
-    border: 1px solid {COLOR_HAIRLINE};
-    border-radius: 6px;
-    padding: 8px 14px;
+    border: none;
+    border-radius: {RADIUS_CONTROL}px;
+    padding: 6px 14px;
     min-height: 18px;
+    font-size: 13px;
     font-weight: 500;
 }}
-QPushButton:hover {{
-    border-color: {COLOR_HAIRLINE_HOVER};
-    background-color: rgba(255, 255, 255, 4);
-}}
-QPushButton:pressed {{
-    background-color: rgba(255, 255, 255, 8);
-}}
+QPushButton:hover {{ background-color: {rgba("#FFFFFF", 38)}; }}
+QPushButton:pressed {{ background-color: {rgba("#FFFFFF", 18)}; }}
 QPushButton:disabled {{
     color: {COLOR_TEXT_DIM};
-    border-color: #1F1F1F;
+    background-color: {rgba("#FFFFFF", 12)};
 }}
 QPushButton:checked {{
-    border-color: {COLOR_ACCENT};
-    color: {COLOR_ACCENT};
-    background-color: rgba(0, 255, 136, 10);
+    background-color: {rgba(COLOR_ACCENT, 60)};
+    color: {COLOR_ACCENT_SOFT};
+}}
+QPushButton:default {{
+    background-color: {COLOR_ACCENT};
+    color: #FFFFFF;
 }}
 
-/* Primary (accent) — used ONCE per screen for the main action */
 QPushButton[variant="primary"] {{
     background-color: {COLOR_ACCENT};
-    color: {COLOR_BG};
-    border: 1px solid {COLOR_ACCENT};
-    font-weight: 700;
-    padding: 10px 16px;
-    letter-spacing: 0.3px;
+    color: #FFFFFF;
+    font-weight: 600;
+    padding: 8px 16px;
 }}
-QPushButton[variant="primary"]:hover {{
-    background-color: {COLOR_ACCENT_SOFT};
-    border-color: {COLOR_ACCENT_SOFT};
-}}
-QPushButton[variant="primary"]:pressed {{
-    background-color: #00B85E;
-}}
+QPushButton[variant="primary"]:hover {{ background-color: {COLOR_ACCENT_SOFT}; }}
+QPushButton[variant="primary"]:pressed {{ background-color: #0060DF; }}
 QPushButton[variant="primary"]:disabled {{
-    background-color: #1F1F1F;
-    border-color: {COLOR_HAIRLINE};
+    background-color: {rgba("#FFFFFF", 16)};
     color: {COLOR_TEXT_DIM};
 }}
 
-/* Danger */
 QPushButton[variant="danger"] {{
     color: {COLOR_DANGER};
-    border-color: rgba(255, 51, 85, 60);
 }}
 QPushButton[variant="danger"]:hover {{
-    background-color: rgba(255, 51, 85, 14);
-    border-color: {COLOR_DANGER};
+    background-color: {rgba(COLOR_DANGER, 40)};
 }}
 
-/* Ghost (text-only) */
 QPushButton[variant="ghost"] {{
-    border-color: transparent;
+    background-color: transparent;
     color: {COLOR_TEXT_MUTED};
     padding: 6px 10px;
 }}
 QPushButton[variant="ghost"]:hover {{
     color: {COLOR_TEXT};
-    background-color: rgba(255, 255, 255, 4);
+    background-color: {rgba("#FFFFFF", 18)};
 }}
+QPushButton[variant="link"] {{
+    background-color: transparent;
+    color: {COLOR_ACCENT_SOFT};
+    padding: 4px 6px;
+}}
+QPushButton[variant="link"]:hover {{ color: #6CB4FF; }}
 
-/* Icon-only square button */
 QPushButton[variant="icon"] {{
     padding: 0;
-    min-width: 28px;
-    max-width: 28px;
-    min-height: 28px;
-    max-height: 28px;
-    border-radius: 6px;
-    font-size: 13px;
+    min-width: 28px; max-width: 28px;
+    min-height: 28px; max-height: 28px;
+    border-radius: 7px;
+    background-color: transparent;
 }}
+QPushButton[variant="icon"]:hover {{ background-color: {rgba("#FFFFFF", 26)}; }}
 
-/* ===== Inputs ===== */
-QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QPlainTextEdit, QTextEdit {{
-    background-color: {COLOR_SURFACE};
+QToolButton {{
+    background-color: transparent;
     color: {COLOR_TEXT};
-    border: 1px solid {COLOR_HAIRLINE};
+    border: none;
     border-radius: 6px;
-    padding: 6px 10px;
+    padding: 4px 8px;
+}}
+QToolButton:hover {{ background-color: {rgba("#FFFFFF", 26)}; }}
+QToolButton:checked {{
+    background-color: {rgba(COLOR_ACCENT, 60)};
+    color: {COLOR_ACCENT_SOFT};
+}}
+QToolButton::menu-indicator {{ image: none; width: 0; }}
+
+/* ===== Поля ввода ===== */
+QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QPlainTextEdit, QTextEdit,
+QDateTimeEdit, QTimeEdit {{
+    background-color: {rgba("#FFFFFF", 18)};
+    color: {COLOR_TEXT};
+    border: 1px solid {rgba("#FFFFFF", 14)};
+    border-radius: {RADIUS_CONTROL}px;
+    padding: 5px 9px;
+    min-height: 18px;
     selection-background-color: {COLOR_ACCENT};
-    selection-color: {COLOR_BG};
+    selection-color: #FFFFFF;
 }}
 QLineEdit:hover, QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover {{
-    border-color: {COLOR_HAIRLINE_HOVER};
+    background-color: {rgba("#FFFFFF", 24)};
 }}
 QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus,
 QPlainTextEdit:focus, QTextEdit:focus {{
-    border-color: {COLOR_ACCENT};
-    background-color: {COLOR_SURFACE_ELEVATED};
+    border: 1px solid {COLOR_ACCENT};
 }}
-QLineEdit:disabled, QComboBox:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled {{
+QLineEdit:disabled, QComboBox:disabled, QDoubleSpinBox:disabled,
+QSpinBox:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {{
     color: {COLOR_TEXT_DIM};
-    background-color: #141414;
+    background-color: {rgba("#FFFFFF", 8)};
 }}
 
-/* SpinBox steppers — flat, minimal */
-QDoubleSpinBox::up-button, QSpinBox::up-button,
-QDoubleSpinBox::down-button, QSpinBox::down-button {{
+QDoubleSpinBox::up-button, QSpinBox::up-button {{
+    subcontrol-origin: border;
+    subcontrol-position: top right;
     background: transparent;
     border: none;
-    width: 18px;
+    width: 16px;
+    margin: 2px 3px 0 0;
+}}
+QDoubleSpinBox::down-button, QSpinBox::down-button {{
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    background: transparent;
+    border: none;
+    width: 16px;
+    margin: 0 3px 2px 0;
+}}
+QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover,
+QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover {{
+    background: {rgba("#FFFFFF", 26)};
+    border-radius: 3px;
 }}
 QDoubleSpinBox::up-arrow, QSpinBox::up-arrow {{
-    width: 8px; height: 8px;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-bottom: 5px solid {COLOR_TEXT_MUTED};
-}}
-QDoubleSpinBox::up-arrow:hover, QSpinBox::up-arrow:hover {{
-    border-bottom-color: {COLOR_ACCENT};
+    {up_css} width: 9px; height: 9px;
 }}
 QDoubleSpinBox::down-arrow, QSpinBox::down-arrow {{
-    width: 8px; height: 8px;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid {COLOR_TEXT_MUTED};
-}}
-QDoubleSpinBox::down-arrow:hover, QSpinBox::down-arrow:hover {{
-    border-top-color: {COLOR_ACCENT};
+    {dn_css} width: 9px; height: 9px;
 }}
 
-/* ComboBox dropdown */
+QComboBox {{ padding-right: 26px; }}
 QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
     border: none;
-    width: 22px;
+    width: 24px;
+    background: transparent;
 }}
 QComboBox::down-arrow {{
-    width: 9px; height: 9px;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid {COLOR_TEXT_MUTED};
-    margin-right: 8px;
+    {arrow_css}
+    width: 11px; height: 11px;
 }}
 QComboBox QAbstractItemView {{
-    background-color: {COLOR_SURFACE_ELEVATED};
+    background-color: {COLOR_SURFACE};
     color: {COLOR_TEXT};
-    border: 1px solid {COLOR_HAIRLINE};
-    border-radius: 6px;
+    border: 1px solid {COLOR_HAIRLINE_HOVER};
+    border-radius: 8px;
     padding: 4px;
     outline: 0;
-    selection-background-color: rgba(0, 255, 136, 18);
-    selection-color: {COLOR_ACCENT};
+    selection-background-color: {COLOR_ACCENT};
+    selection-color: #FFFFFF;
+}}
+QComboBox QAbstractItemView::item {{
+    min-height: 24px;
+    padding: 2px 8px;
+    border-radius: 5px;
 }}
 
 /* ===== CheckBox / Radio ===== */
 QCheckBox, QRadioButton {{
     spacing: 8px;
     color: {COLOR_TEXT};
+    background: transparent;
 }}
-/* Размеры задаются с учётом рамки: Qt считает width/height по содержимому,
-   поэтому у каждого состояния свои значения, чтобы внешний габарит
-   индикатора всегда оставался 16x16 и метки не прыгали. */
 QCheckBox::indicator, QRadioButton::indicator {{
     width: 14px;
     height: 14px;
     border: 1px solid {COLOR_HAIRLINE_HOVER};
-    background-color: {COLOR_SURFACE};
+    background-color: {rgba("#FFFFFF", 22)};
 }}
 QCheckBox::indicator {{ border-radius: 4px; }}
 QRadioButton::indicator {{ border-radius: 8px; }}
 QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
-    border-color: {COLOR_ACCENT};
+    border-color: {COLOR_TEXT_MUTED};
 }}
 QCheckBox::indicator:checked {{
-    width: 14px;
-    height: 14px;
     background-color: {COLOR_ACCENT};
     border: 1px solid {COLOR_ACCENT};
-    image: none;
+    {check_css}
 }}
 QRadioButton::indicator:checked {{
-    width: 8px;
-    height: 8px;
-    background-color: {COLOR_BG};
-    border: 4px solid {COLOR_ACCENT};
+    width: 6px;
+    height: 6px;
+    background-color: #FFFFFF;
+    border: 5px solid {COLOR_ACCENT};
 }}
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
     border-color: {COLOR_HAIRLINE};
-    background-color: {COLOR_BG};
+    background-color: {rgba("#FFFFFF", 8)};
 }}
 QCheckBox::indicator:checked:disabled {{
     background-color: {COLOR_TEXT_DIM};
     border-color: {COLOR_TEXT_DIM};
 }}
 QRadioButton::indicator:checked:disabled {{
-    background-color: {COLOR_BG};
+    background-color: {COLOR_TEXT_MUTED};
     border-color: {COLOR_TEXT_DIM};
 }}
+QCheckBox:disabled, QRadioButton:disabled {{ color: {COLOR_TEXT_DIM}; }}
 
-/* ===== Sliders ===== */
+/* ===== Слайдеры ===== */
+QSlider {{ background: transparent; min-height: 20px; }}
 QSlider::groove:horizontal {{
-    background-color: {COLOR_HAIRLINE};
-    height: 2px;
-    border-radius: 1px;
+    background-color: {rgba("#FFFFFF", 36)};
+    height: 4px;
+    border-radius: 2px;
 }}
 QSlider::sub-page:horizontal {{
     background-color: {COLOR_ACCENT};
-    border-radius: 1px;
+    border-radius: 2px;
 }}
 QSlider::handle:horizontal {{
-    background-color: {COLOR_TEXT};
-    width: 12px;
-    height: 12px;
+    background-color: #FFFFFF;
+    width: 16px;
+    height: 16px;
     margin: -6px 0;
-    border-radius: 6px;
-    border: 2px solid {COLOR_BG};
+    border-radius: 8px;
+    border: none;
 }}
-QSlider::handle:horizontal:hover {{
-    background-color: {COLOR_ACCENT};
-}}
+QSlider::handle:horizontal:hover {{ background-color: #E8E8ED; }}
+QSlider::sub-page:horizontal:disabled {{ background: {COLOR_TEXT_DIM}; }}
+QSlider::handle:horizontal:disabled {{ background-color: {COLOR_TEXT_MUTED}; }}
 
 /* ===== ProgressBar ===== */
 QProgressBar {{
-    background-color: {COLOR_SURFACE};
+    background-color: {rgba("#FFFFFF", 26)};
     border: none;
-    border-radius: 2px;
-    max-height: 4px;
-    min-height: 4px;
+    border-radius: 3px;
+    max-height: 6px;
+    min-height: 6px;
     text-align: center;
     color: transparent;
 }}
 QProgressBar::chunk {{
     background-color: {COLOR_ACCENT};
-    border-radius: 2px;
+    border-radius: 3px;
 }}
 
-/* ===== Scrollbars — slim, overlay-style ===== */
+/* ===== Скроллбары — тонкие, как оверлейные в macOS ===== */
+QScrollArea {{ background: transparent; }}
 QScrollBar:vertical {{
     background: transparent;
-    width: 8px;
-    margin: 4px 2px 4px 0;
+    width: 10px;
+    margin: 2px 2px 2px 0;
 }}
 QScrollBar:horizontal {{
     background: transparent;
-    height: 8px;
-    margin: 0 4px 2px 4px;
+    height: 10px;
+    margin: 0 2px 2px 2px;
 }}
 QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
-    background-color: {COLOR_HAIRLINE_HOVER};
+    background-color: {rgba("#FFFFFF", 50)};
     border-radius: 3px;
-    min-height: 24px;
-    min-width: 24px;
+    min-height: 28px;
+    min-width: 28px;
+    margin: 2px;
 }}
-QScrollBar::handle:hover {{
-    background-color: {COLOR_TEXT_MUTED};
-}}
+QScrollBar::handle:hover {{ background-color: {rgba("#FFFFFF", 90)}; }}
 QScrollBar::add-line, QScrollBar::sub-line,
 QScrollBar::add-page, QScrollBar::sub-page {{
     background: transparent;
@@ -451,69 +491,102 @@ QScrollBar::add-page, QScrollBar::sub-page {{
     width: 0;
 }}
 
-/* ===== Tabs — underline style, no boxed tabs ===== */
+/* ===== Вкладки — как сегментированный контрол ===== */
 QTabWidget::pane {{
     background-color: transparent;
     border: none;
-    border-top: 1px solid {COLOR_HAIRLINE};
-    top: -1px;
+    top: 6px;
 }}
 QTabBar {{
     qproperty-drawBase: 0;
     background: transparent;
 }}
 QTabBar::tab {{
-    background: transparent;
-    color: {COLOR_TEXT_MUTED};
-    padding: 10px 4px;
-    margin-right: 18px;
+    background: {rgba("#767680", 60)};
+    color: {COLOR_TEXT};
+    padding: 5px 14px;
+    margin: 0;
     border: none;
-    border-bottom: 1px solid transparent;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 1.2px;
-    text-transform: uppercase;
+    font-size: 12px;
+    font-weight: 500;
 }}
-QTabBar::tab:hover {{
-    color: {COLOR_TEXT};
-}}
+QTabBar::tab:first {{ border-top-left-radius: 7px; border-bottom-left-radius: 7px; }}
+QTabBar::tab:last  {{ border-top-right-radius: 7px; border-bottom-right-radius: 7px; }}
+QTabBar::tab:hover {{ background: {rgba("#767680", 90)}; }}
 QTabBar::tab:selected {{
-    color: {COLOR_TEXT};
-    border-bottom: 1px solid {COLOR_ACCENT};
+    background: #636366;
+    color: #FFFFFF;
 }}
 
-/* ===== List / Tree ===== */
-QListWidget, QTreeWidget {{
+/* ===== Списки / деревья / таблицы ===== */
+QListWidget, QTreeWidget, QListView, QTreeView, QTableView, QTableWidget {{
     background-color: transparent;
     border: none;
     padding: 0;
     outline: 0;
+    alternate-background-color: {rgba("#FFFFFF", 6)};
 }}
-QListWidget::item, QTreeWidget::item {{
-    padding: 8px 10px;
+QListWidget::item, QTreeWidget::item, QListView::item, QTreeView::item {{
+    padding: 6px 8px;
     border-radius: 6px;
     color: {COLOR_TEXT};
 }}
-QListWidget::item:hover, QTreeWidget::item:hover {{
-    background-color: rgba(255, 255, 255, 6);
+QListWidget::item:hover, QTreeWidget::item:hover,
+QListView::item:hover, QTreeView::item:hover {{
+    background-color: {rgba("#FFFFFF", 14)};
 }}
-QListWidget::item:selected, QTreeWidget::item:selected {{
-    background-color: rgba(0, 255, 136, 14);
-    color: {COLOR_ACCENT};
+QListWidget::item:selected, QTreeWidget::item:selected,
+QListView::item:selected, QTreeView::item:selected {{
+    background-color: {rgba(COLOR_ACCENT, 80)};
+    color: #FFFFFF;
+}}
+QHeaderView {{ background: transparent; }}
+QHeaderView::section {{
+    background: transparent;
+    color: {COLOR_TEXT_MUTED};
+    border: none;
+    border-bottom: 1px solid {COLOR_HAIRLINE};
+    padding: 4px 6px 6px 6px;
+    font-size: 11px;
+    font-weight: 600;
 }}
 
-/* ===== Depth Map Preview frame ===== */
-QFrame#DepthMapFrame {{
-    background-color: #0A0A0A;
-    border: 1px solid {COLOR_HAIRLINE};
+/* ===== Меню ===== */
+QMenu {{
+    background-color: {COLOR_SURFACE};
+    color: {COLOR_TEXT};
+    border: 1px solid {COLOR_HAIRLINE_HOVER};
     border-radius: 8px;
+    padding: 5px;
+}}
+QMenu::item {{
+    padding: 5px 22px 5px 10px;
+    border-radius: 5px;
+    background: transparent;
+}}
+QMenu::item:selected {{ background-color: {COLOR_ACCENT}; color: #FFFFFF; }}
+QMenu::item:disabled {{ color: {COLOR_TEXT_DIM}; }}
+QMenu::separator {{
+    height: 1px;
+    background: {COLOR_HAIRLINE_HOVER};
+    margin: 5px 8px;
+}}
+QMenu::icon {{ padding-left: 6px; }}
+QMenu::indicator {{ width: 14px; height: 14px; left: 4px; }}
+QMenu::indicator:checked {{ {check_css} }}
+
+/* ===== Превью карты глубины ===== */
+QFrame#DepthMapFrame {{
+    background-color: #000000;
+    border: none;
+    border-radius: 10px;
 }}
 QLabel#DepthMapCanvas {{
     background-color: #000000;
-    border-radius: 6px;
+    border-radius: 8px;
 }}
 
-/* ===== Status bar ===== */
+/* ===== Строка статуса ===== */
 QWidget#StatusBar {{
     background-color: transparent;
     border-top: 1px solid {COLOR_HAIRLINE};
@@ -521,20 +594,27 @@ QWidget#StatusBar {{
 QLabel#StatusText {{
     color: {COLOR_TEXT_MUTED};
     font-family: {FONT_MONO};
-    font-size: 10px;
-    letter-spacing: 0.5px;
+    font-size: 11px;
     padding: 6px 12px;
 }}
 
-/* ===== Overlay widgets (floating over 3D scene) ===== */
-QWidget#Overlay {{
-    background-color: rgba(16, 16, 16, 210);
-    border: 1px solid {COLOR_HAIRLINE};
-    border-radius: 8px;
+QWidget#Overlay, QFrame#Overlay {{
+    background-color: rgba({MATERIAL_RGBA[0]}, {MATERIAL_RGBA[1]}, {MATERIAL_RGBA[2]}, {MATERIAL_RGBA[3]});
+    border: 1px solid {rgba("#FFFFFF", 22)};
+    border-radius: {RADIUS_PANEL}px;
 }}
 """
 
 
+#: Совместимость: старый код брал готовую строку.
+QSS = build_qss()
+
+
 def apply_theme(widget) -> None:
-    """Apply the Digital Engineering 2026 theme to a widget (and its children)."""
-    widget.setStyleSheet(QSS)
+    """Тема для обычных окон и диалогов (непрозрачный фон)."""
+    widget.setStyleSheet(build_qss())
+
+
+def apply_hud_theme(widget) -> None:
+    """Тема для плавающих панелей поверх 3D-вида (прозрачный корень)."""
+    widget.setStyleSheet(build_qss(root_bg=None))

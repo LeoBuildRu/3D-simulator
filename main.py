@@ -2836,6 +2836,17 @@ def main():
     import src.ui.panel_data as _panel_data
 
     qt_app = _QApplication(sys.argv)
+    # Стандартные кнопки и диалоги Qt («Да» / «Нет», «Отмена», выбор файла) —
+    # по-русски, как и весь остальной интерфейс.
+    try:
+        from PyQt6.QtCore import QLibraryInfo, QLocale, QTranslator
+        _qt_tr = QTranslator(qt_app)
+        if _qt_tr.load(QLocale(QLocale.Language.Russian), "qtbase", "_",
+                       QLibraryInfo.path(
+                           QLibraryInfo.LibraryPath.TranslationsPath)):
+            qt_app.installTranslator(_qt_tr)
+    except Exception as exc:
+        print(f"[main] перевод Qt не загружен: {exc}")
 
     win = MainWindow()
     win.show()

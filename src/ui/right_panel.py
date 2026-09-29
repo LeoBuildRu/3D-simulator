@@ -1,52 +1,22 @@
 # right_panel.py
 # ---------------------------------------------------------------------------
-# Stub right-side control panel for the Toner simulator.
+# Инспектор справа от 3D-вида.
 #
-# Now built as an OVERLAY WIDGET, exactly like the top-left "Camera ·
-# Telemetry" and bottom-left "Controls" HUDs (see overlay_widgets.py):
+# Плавающая панель на всю высоту (FloatingPanel, см. src/ui/hud.py) с
+# четырьмя вкладками-иконками вместо одной длинной ленты карточек:
 #
-#   * Top-level frameless `Qt.Tool` window OWNED by the main window
-#     (so z-order and visibility follow the owner — no taskbar entry,
-#     no "floats above every desktop app" leakage).
-#   * Translucent background; the visible surface is an inner card with
-#     `objectName="Overlay"` (the same QSS rule the small overlays use)
-#     so it gets the same dark-translucent fill, hairline border, radius,
-#     and drop-shadow as the other HUDs.
-#   * Anchored to the RIGHT EDGE of the embedded Panda3D viewport and
-#     repositioned on every resize / move / show / hide / state-change
-#     event, exactly like SceneOverlay.
+#   ▣ Сцена    — кузов, наполнитель (текстура + объём), «Сгенерировать»,
+#                генератор кузова
+#   ☰ Записи   — список реконструкций, подробности выбранной, «Кино»,
+#                «Реконструировать»
+#   ◉ Камера   — FOV и крен; снимок стенда поверх вида (прозрачность,
+#                показать/скрыть); опорные точки
+#   ≋ Датасет  — сводка съёмки, «Настроить», «Снять»
 #
-# Why a top-level tool window (and not a child widget):
-#   The 3D viewport is a native Panda3D HWND embedded inside `panda_container`.
-#   On Windows, a native child HWND ALWAYS paints over Qt-painted content
-#   of its parent — so a plain Qt child widget placed "on top" is
-#   completely covered by the Panda3D rendering and stays invisible.
-#   This is the same problem the small overlays already solved.
+# Качество графики — в меню под иконкой дисплея в шапке.
 #
-# Why NOT WA_TransparentForMouseEvents (unlike the small overlays):
-#   This panel is INTERACTIVE — combo boxes, list, buttons all need
-#   clicks. We deliberately let mouse events through to it; the small
-#   readout HUDs are click-through because they have no controls.
-#
-# Stub purpose:
-#   Same four sections as before — just a UI placeholder, no backend:
-#     1. Model set         — combo box picking a curated set of meshes
-#     2. Texture set       — combo box picking a PBR material set
-#     3. Reconstructions   — list of 2D→3D reconstruction jobs / outputs
-#     4. Details           — key/value readout for the currently-selected
-#                            reconstruction
-#
-#   Public signals (silent for now — connect them when a real backend
-#   comes online):
-#       modelSetChanged(str)
-#       textureSetChanged(str)
-#       reconstructionSelected(str)
-#       applyClicked()
-#
-# Wiring into MainWindow (mirrors SceneOverlay):
-#   from right_panel import RightPanel
-#   self.right_panel = RightPanel(parent=self.panda_container)
-#   self.right_panel.attach()
+# Панель ничего не делает со сценой сама: всё уходит сигналами в
+# MainWindow (список сигналов — в классе RightPanel).
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -54,49 +24,89 @@ from __future__ import annotations
 import json
 import os
 
-from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent, QSize, QRectF, QTimer, pyqtSignal
-from PyQt6.QtGui import (
-    QColor, QPainter, QPen, QBrush, QPixmap, QIcon, QFontMetrics,
-    QPainterPath,
-)
+from PyQt6.QtCore import Qt, QPoint, QSize, QTimer, pyqtSignal
+from PyQt6.QtGui import QActionGroup, QColor, QFontMetrics, QPixmap
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QComboBox,
-    QListWidget, QListWidgetItem, QGroupBox, QPushButton, QFrame,
-    QScrollArea, QSizePolicy, QGraphicsDropShadowEffect, QDialog,
-    QGridLayout, QDoubleSpinBox, QMenu, QApplication, QSlider, QDial,
-    QToolButton, QCheckBox,
+    QApplication, QComboBox, QDialog, QDoubleSpinBox, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu, QPushButton,
+    QScrollArea, QSizePolicy, QSlider, QStackedWidget, QVBoxLayout, QWidget,
 )
 
+from src.ui import icons
+from src.ui.hud import (
+    Card, Chip, FloatingPanel, IconButton, SegmentedControl, Switch,
+    TileButton,
+    hline, icon_label, label,
+)
 from src.ui.ui_theme import (
-    apply_theme, COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_MUTED, COLOR_TEXT_DIM,
-    COLOR_HAIRLINE, COLOR_HAIRLINE_HOVER, COLOR_WARN, FONT_MONO,
+    COLOR_ACCENT, COLOR_DANGER, COLOR_PURPLE, COLOR_SUCCESS, COLOR_TEAL,
+    COLOR_TEXT, COLOR_TEXT_DIM, COLOR_TEXT_MUTED, COLOR_WARN, FONT_MONO,
+    apply_hud_theme, rgba,
 )
 from src.ui.model_picker import ModelPickerCombo
 from src.ui.panel_data import (
     load_model_sets_detailed, load_texture_sets, get_default_texture_set_key,
     load_reconstructions, Reconstruction, PROJECT_ROOT, HEIGHT_EXAMPLES_DIR,
-    get_model_set_config, get_texture_set_config, download_server_image,
-    SERVER_IMAGE_CACHE_DIR, RECON_PAGE_SIZE,
+    get_model_set_config, download_server_image, SERVER_IMAGE_CACHE_DIR,
+    RECON_PAGE_SIZE,
 )
 from src.core import graphics_settings
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Типы записей: иконка, цвет плитки, подпись для подсказки
 # ---------------------------------------------------------------------------
-def _hline() -> QFrame:
-    """A 1px hairline separator using the theme's `[role="hairline"]` style."""
-    f = QFrame()
-    f.setProperty("role", "hairline")
-    f.setFrameShape(QFrame.Shape.NoFrame)
-    return f
+_DTYPES = {
+    "height": ("bars",   COLOR_ACCENT, "Карта высот"),
+    "ply":    ("points", COLOR_PURPLE, "Облако точек (PLY)"),
+    "stand":  ("camera", COLOR_TEAL,   "Снимок стенда"),
+    "depth":  ("depth",  COLOR_WARN,   "Карта глубины с сервера"),
+}
 
 
-def _make_chip(text: str, role: str = "chip-live") -> QLabel:
-    """Pill-style status chip; `role` is one of chip-live / chip-idle / chip-err."""
-    lbl = QLabel(text)
-    lbl.setProperty("role", role)
-    return lbl
+def _dtype(rec_type: str) -> tuple[str, str, str]:
+    return _DTYPES.get(rec_type or "", ("doc", "#8E8E93",
+                                        (rec_type or "—").upper()))
+
+
+def _type_tile(rec_type: str, size: int = 32) -> QLabel:
+    """Цветная плитка с иконкой типа записи — тип читается без подписи."""
+    ic, color, tip = _dtype(rec_type)
+    tile = QLabel()
+    tile.setFixedSize(size, size)
+    tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    tile.setPixmap(icons.pixmap(ic, color, int(size * 0.6)))
+    tile.setToolTip(tip)
+    tile.setStyleSheet(
+        f"QLabel {{ background: {rgba(color, 46)}; border-radius: {size // 4 + 1}px; }}")
+    return tile
+
+
+def _elide(text: str, font, max_w: int,
+           mode=Qt.TextElideMode.ElideRight) -> str:
+    if not text:
+        return ""
+    return QFontMetrics(font).elidedText(text, mode, max_w)
+
+
+_CINEMATIC_CFG = os.path.join(PROJECT_ROOT, "config", "cinematic.json")
+
+
+def _load_cinematic_enabled() -> bool:
+    try:
+        with open(_CINEMATIC_CFG, "r", encoding="utf-8") as fh:
+            return bool(json.load(fh).get("enabled", True))
+    except (OSError, ValueError):
+        return True
+
+
+def _save_cinematic_enabled(on: bool) -> None:
+    try:
+        os.makedirs(os.path.dirname(_CINEMATIC_CFG), exist_ok=True)
+        with open(_CINEMATIC_CFG, "w", encoding="utf-8") as fh:
+            json.dump({"enabled": bool(on)}, fh)
+    except OSError as exc:
+        print(f"[RightPanel] cinematic.json не сохранён: {exc}")
 
 
 def _format_short_dt(rec: Reconstruction) -> str:
@@ -180,682 +190,197 @@ def _resolve_or_fetch_image_path(rec: Reconstruction) -> str | None:
     return download_server_image(rec.img_file or "")
 
 
-# ---------------------------------------------------------------------------
-# Iconography (programmatic, single-file, theme-aware)
-# ---------------------------------------------------------------------------
-# Drawing icons in code keeps the project free of binary asset dependencies
-# and lets us re-tint them with the active theme color (accent / muted).
-# All icons render onto a 1:1 transparent QPixmap at @2x for sharpness.
-# ---------------------------------------------------------------------------
-
-def _make_dtype_icon(data_type: str, size: int = 18) -> QPixmap:
-    """
-    Render a small data-type icon (left of each list row).
-
-    height → three ascending bars (heightmap profile, accent color)
-    ply    → wireframe cube (point cloud surrogate, muted color)
-    other  → empty hairline-bordered square (warn color)
-    """
-    s = size
-    scale = 2  # @2x supersampling for crisp edges
-    pm = QPixmap(s * scale, s * scale)
-    pm.fill(Qt.GlobalColor.transparent)
-
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    p.scale(scale, scale)
-
-    if data_type == "height":
-        # Three short bars rising left-to-right, like a height profile.
-        col = QColor(COLOR_ACCENT)
-        p.setBrush(QBrush(col))
-        p.setPen(Qt.PenStyle.NoPen)
-        # bar geometry in the s×s box, with 2px outer padding.
-        pad = 3
-        gap = 2
-        bar_w = (s - 2 * pad - 2 * gap) / 3
-        heights = [s * 0.30, s * 0.55, s * 0.80]
-        for i, h in enumerate(heights):
-            x = pad + i * (bar_w + gap)
-            y = s - pad - h
-            p.drawRoundedRect(QRectF(x, y, bar_w, h), 1.2, 1.2)
-    elif data_type == "ply":
-        # Stylized iso wireframe cube — 6 visible edges.
-        col = QColor(COLOR_TEXT_MUTED)
-        pen = QPen(col, 1.2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        # Iso projection of a unit cube, projected into the s×s box.
-        cx, cy = s / 2, s / 2
-        r = s * 0.34  # half-size
-        # Six points of the iso silhouette (top, mid-right, bot-right,
-        # bottom, mid-left, top-left), then internal Y-junction.
-        top   = (cx,         cy - r)
-        tr    = (cx + r,     cy - r * 0.5)
-        br    = (cx + r,     cy + r * 0.5)
-        bot   = (cx,         cy + r)
-        bl    = (cx - r,     cy + r * 0.5)
-        tl    = (cx - r,     cy - r * 0.5)
-        center = (cx, cy)
-        path = QPainterPath()
-        path.moveTo(*top)
-        path.lineTo(*tr)
-        path.lineTo(*br)
-        path.lineTo(*bot)
-        path.lineTo(*bl)
-        path.lineTo(*tl)
-        path.closeSubpath()
-        p.drawPath(path)
-        # Y-junction inner edges.
-        p.drawLine(int(top[0]),    int(top[1]),    int(center[0]), int(center[1]))
-        p.drawLine(int(tr[0]),     int(tr[1]),     int(center[0]), int(center[1]))
-        p.drawLine(int(tl[0]),     int(tl[1]),     int(center[0]), int(center[1]))
-    elif data_type == "stand":
-        # Camera glyph — body + lens — for a captured reference snapshot.
-        col = QColor(COLOR_ACCENT)
-        pen = QPen(col, 1.3)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        pad = 3
-        body = QRectF(pad, pad + s * 0.12,
-                      s - 2 * pad, s - 2 * pad - s * 0.12)
-        p.drawRoundedRect(body, 2, 2)
-        # Viewfinder bump on top-left.
-        p.drawRoundedRect(
-            QRectF(pad + s * 0.12, pad - s * 0.02, s * 0.28, s * 0.16),
-            1, 1,
-        )
-        # Lens.
-        p.drawEllipse(QPointF(s / 2, s / 2 + s * 0.06), s * 0.18, s * 0.18)
-    else:
-        col = QColor(COLOR_WARN)
-        pen = QPen(col, 1.2)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        pad = 3
-        p.drawRoundedRect(QRectF(pad, pad, s - 2 * pad, s - 2 * pad), 2, 2)
-
-    p.end()
-    pm.setDevicePixelRatio(scale)
-    return pm
-
-
-def _make_view_icon(size: int = 14, color: str = COLOR_TEXT_MUTED) -> QIcon:
-    """
-    Magnifying-glass icon (circle + handle + tiny "+" inside) for the
-    per-row preview button.  Reads instantly as "look at this".
-    """
-    s = size
-    scale = 2
-    pm = QPixmap(s * scale, s * scale)
-    pm.fill(Qt.GlobalColor.transparent)
-
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    p.scale(scale, scale)
-
-    pen = QPen(QColor(color), 1.4)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-
-    # Glass body: small circle in upper-left of the icon area.
-    cx = s * 0.42
-    cy = s * 0.42
-    r  = s * 0.30
-    p.drawEllipse(QPointF(cx, cy), r, r)
-
-    # Plus inside the glass.
-    inner = r * 0.55
-    p.drawLine(QPointF(cx - inner, cy), QPointF(cx + inner, cy))
-    p.drawLine(QPointF(cx, cy - inner), QPointF(cx, cy + inner))
-
-    # Handle: short diagonal stroke from the SE rim of the circle.
-    import math
-    angle = math.radians(45)
-    sx = cx + r * math.cos(angle)
-    sy = cy + r * math.sin(angle)
-    ex = cx + (r + s * 0.25) * math.cos(angle)
-    ey = cy + (r + s * 0.25) * math.sin(angle)
-    p.setPen(QPen(QColor(color), 1.8, Qt.PenStyle.SolidLine,
-                  Qt.PenCapStyle.RoundCap))
-    p.drawLine(QPointF(sx, sy), QPointF(ex, ey))
-
-    p.end()
-    pm.setDevicePixelRatio(scale)
-    return QIcon(pm)
-
-
-def _make_copy_icon(size: int = 14, color: str = COLOR_TEXT_MUTED) -> QIcon:
-    """Two overlapping rounded rectangles — the classic 'copy' glyph."""
-    s = size
-    scale = 2
-    pm = QPixmap(s * scale, s * scale)
-    pm.fill(Qt.GlobalColor.transparent)
-
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    p.scale(scale, scale)
-
-    pen = QPen(QColor(color), 1.3)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-
-    # Back sheet (top-right).
-    back = QRectF(s * 0.32, s * 0.16, s * 0.50, s * 0.55)
-    p.drawRoundedRect(back, 1.5, 1.5)
-    # Front sheet (bottom-left), slightly larger to overlap.
-    front = QRectF(s * 0.16, s * 0.30, s * 0.50, s * 0.55)
-    # Clear the part of the back sheet that the front sheet covers so the
-    # two outlines don't visually merge into a single shape.
-    p.save()
-    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-    p.fillRect(front, Qt.GlobalColor.transparent)
-    p.restore()
-    p.drawRoundedRect(front, 1.5, 1.5)
-
-    p.end()
-    pm.setDevicePixelRatio(scale)
-    return QIcon(pm)
-
-
-def _make_close_icon(size: int = 14, color: str = COLOR_TEXT_MUTED) -> QIcon:
-    """Small × glyph for the photo overlay's close button."""
-    s = size
-    scale = 2
-    pm = QPixmap(s * scale, s * scale)
-    pm.fill(Qt.GlobalColor.transparent)
-
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    p.scale(scale, scale)
-
-    pen = QPen(QColor(color), 1.6)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    p.setPen(pen)
-    pad = 3
-    p.drawLine(pad, pad, s - pad, s - pad)
-    p.drawLine(s - pad, pad, pad, s - pad)
-    p.end()
-    pm.setDevicePixelRatio(scale)
-    return QIcon(pm)
-
-
-def _elide(text: str, font, max_w: int,
-           mode=Qt.TextElideMode.ElideRight) -> str:
-    """Return `text` truncated with an ellipsis to fit within `max_w` px."""
-    if not text:
-        return ""
-    fm = QFontMetrics(font)
-    return fm.elidedText(text, mode, max_w)
-
 
 # ---------------------------------------------------------------------------
-# Reconstruction list row — Digital Engineering 2026 styling
+# Строка списка записей
 # ---------------------------------------------------------------------------
-# Layout (renders inside the QListWidget item via setItemWidget):
-#
-#   ┌──────────────────────────────────────────────────────────────┐
-#   │ [▙]  А123ВС777                       HEIGHT             [⤢]  │
-#   │      FAW J6 8x4 · 23 Apr · 15:32                              │
-#   └──────────────────────────────────────────────────────────────┘
-#
-#   * Left icon  : data-type pictogram (heightmap bars / wire cube).
-#   * Top line   : car_number (mono, prominent) + tiny HEIGHT/PLY tag.
-#   * Bottom line: "model · timestamp" (muted; both elided if too long).
-#   * Right side : "open" view-photo button — emits viewRequested.
-#
-# Long text is elided with an ellipsis so nothing ever overflows the
-# panel's fixed inner width. Background is transparent — the
-# QListWidget's item:hover / item:selected rule paints behind us.
+#   ┌────────────────────────────────────────────────┐
+#   │ [▥]  К906ТС190                            (⌕)  │
+#   │      Камаз 6520 · 29 Sep · 18:52                │
+#   └────────────────────────────────────────────────┘
+# Тип — цветом и иконкой плитки, без текстовой метки.
 # ---------------------------------------------------------------------------
-
-_CINEMATIC_CFG = os.path.join(PROJECT_ROOT, "config", "cinematic.json")
-
-
-def _load_cinematic_enabled() -> bool:
-    try:
-        with open(_CINEMATIC_CFG, "r", encoding="utf-8") as fh:
-            return bool(json.load(fh).get("enabled", True))
-    except (OSError, ValueError):
-        return True
-
-
-def _save_cinematic_enabled(on: bool) -> None:
-    try:
-        os.makedirs(os.path.dirname(_CINEMATIC_CFG), exist_ok=True)
-        with open(_CINEMATIC_CFG, "w", encoding="utf-8") as fh:
-            json.dump({"enabled": bool(on)}, fh)
-    except OSError as exc:
-        print(f"[RightPanel] cinematic.json не сохранён: {exc}")
-
 class ReconRowWidget(QWidget):
-    """Custom 2-line row widget for one Reconstruction record."""
+    ROW_FIXED_HEIGHT = 50
 
-    # Inner width budget — rows render inside the right-panel scroll area
-    # whose effective inner width is roughly PANEL_WIDTH (320) minus card
-    # padding (40), list padding (~16), so we cap at ~250 px.
-    ROW_FIXED_HEIGHT = 42
-
-    # Emitted when the user clicks the per-row "open" button.
-    # Signal lives on the widget; the panel re-fans it as a higher-level
-    # `viewRequested(int)` carrying the recon index.
     viewClicked = pyqtSignal()
 
     def __init__(self, rec: Reconstruction, max_text_width: int = 200,
                  parent: QWidget | None = None):
         super().__init__(parent)
         self._rec = rec
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
-        self.setStyleSheet("background: transparent;")
         self.setMinimumHeight(self.ROW_FIXED_HEIGHT)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Preferred)
 
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setContentsMargins(8, 6, 6, 6)
         outer.setSpacing(10)
-        # All three children (icon, text col, view button) should be
-        # vertically centred regardless of their natural height.
-        outer.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        # ---- Left: data-type icon ----------------------------------
-        self.icon = QLabel()
-        self.icon.setPixmap(_make_dtype_icon(rec.data_type or "", size=18))
-        self.icon.setFixedSize(20, 20)
-        self.icon.setStyleSheet("background: transparent;")
-        self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.addWidget(self.icon, 0,
+        outer.addWidget(_type_tile(rec.data_type, 32), 0,
                         Qt.AlignmentFlag.AlignVCenter)
 
-        # ---- Middle: two-line text block ----------------------------
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(2)
-
-        # ----- Top line: car_number (left) + type tag (right).
-        top_row = QHBoxLayout()
-        top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.setSpacing(8)
-
+        text_col.setSpacing(1)
         self.car = QLabel()
         self.car.setStyleSheet(
             f"color: {COLOR_TEXT}; font-family: {FONT_MONO};"
-            f"font-size: 12px; font-weight: 600;"
-            f"background: transparent;"
-        )
-        self.car.setText(_elide(
-            rec.car_number or "—", self.car.font(), max_text_width - 70
-        ))
+            "font-size: 13px; font-weight: 600; background: transparent;")
+        self.car.setText(_elide(rec.car_number or "—", self.car.font(),
+                                max_text_width))
+        text_col.addWidget(self.car)
 
-        type_text = (rec.data_type or "—").upper()
-        # Color-code the tag like the icon: accent for height, muted for ply.
-        tag_color = (
-            COLOR_ACCENT if rec.data_type in ("height", "stand")
-            else COLOR_TEXT_MUTED if rec.data_type == "ply"
-            else COLOR_WARN
-        )
-        self.tag = QLabel(type_text)
-        self.tag.setStyleSheet(
-            f"color: {tag_color}; font-family: {FONT_MONO};"
-            f"font-size: 9px; font-weight: 600; letter-spacing: 1.2px;"
-            f"background: transparent;"
-        )
-        self.tag.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-
-        top_row.addWidget(self.car, 1)
-        top_row.addWidget(self.tag, 0)
-        text_col.addLayout(top_row)
-
-        # ----- Bottom line: "model · timestamp" (single label, elided).
         meta_text = " · ".join(filter(None, [
-            (rec.model or "").strip(),
-            _format_short_dt(rec),
-        ])) or "—"
-
+            (rec.model or "").strip(), _format_short_dt(rec)])) or "—"
         self.meta = QLabel()
         self.meta.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font-size: 11px;"
-            f"background: transparent;"
-        )
-        self.meta.setText(_elide(
-            meta_text, self.meta.font(), max_text_width
-        ))
+            f"color: {COLOR_TEXT_MUTED}; font-size: 11px; background: transparent;")
+        self.meta.setText(_elide(meta_text, self.meta.font(), max_text_width))
+        self.meta.setToolTip(meta_text)
         text_col.addWidget(self.meta)
-
         outer.addLayout(text_col, 1)
 
-        # ---- Right: "view photo" icon button ------------------------
-        self.btn_view = QPushButton(self)
-        self.btn_view.setProperty("variant", "icon")
-        self.btn_view.setIcon(_make_view_icon(14, COLOR_TEXT_MUTED))
-        self.btn_view.setIconSize(QSize(14, 14))
-        self.btn_view.setFixedSize(24, 24)
-        self.btn_view.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_view.setToolTip("Просмотр фото и подробной информации")
-        # Make it visually lighter than the standard icon button so it
-        # blends into the row but reveals on hover.
-        self.btn_view.setStyleSheet(
-            f"QPushButton {{ background: transparent;"
-            f"  border: 1px solid transparent; border-radius: 6px;"
-            f"  padding: 0; min-width: 24px; max-width: 24px;"
-            f"  min-height: 24px; max-height: 24px; }}"
-            f"QPushButton:hover {{ background-color: rgba(255,255,255,10);"
-            f"  border-color: {COLOR_HAIRLINE}; }}"
-            f"QPushButton:pressed {{ background-color: rgba(0,255,136,18);"
-            f"  border-color: {COLOR_ACCENT}; }}"
-        )
-        # `clicked(bool)` → 0-arg `viewClicked()`. Use a lambda to drop the
-        # extra arg explicitly (avoids any PyQt arg-count edge-cases).
-        self.btn_view.clicked.connect(lambda _checked=False: self.viewClicked.emit())
+        self.btn_view = IconButton("zoom_in", "Снимок и подробности",
+                                   size=28, icon_size=16,
+                                   color=COLOR_TEXT_MUTED)
+        self.btn_view.clicked.connect(lambda _c=False: self.viewClicked.emit())
         outer.addWidget(self.btn_view, 0, Qt.AlignmentFlag.AlignVCenter)
 
 
 # ---------------------------------------------------------------------------
-# Photo viewer overlay — fullscreen modal with image + metadata
+# Просмотр снимка записи — полноэкранная модальная карточка
 # ---------------------------------------------------------------------------
 class RecordPhotoOverlay(QDialog):
-    """
-    Full-screen modal photo viewer.
+    """Затемнение окна + карточка: шапка, снимок, строка фактов. Esc / клик
+    мимо — закрыть."""
 
-    Visual contract matches the rest of the simulator HUD:
-        * Translucent dark backdrop dimming the main window
-        * Single `QFrame#Overlay` card sized to the WHOLE window minus
-          a 16-px margin on every side (same as SceneOverlay /
-          DepthMapOverlay).
-        * Compact header strip: accent dot + small-caps eyebrow + title
-          + close button.
-        * The image fills the bulk of the card, scaled to fit.
-        * A short "info strip" at the bottom carries CAR / MODEL / TYPE
-          / TARGET / TIME / FILE inline (no two-column grid).
-
-    Click on the dim backdrop or press Esc to dismiss.
-    """
-
-    OUTER_MARGIN = 16   # same as the other overlays
+    OUTER_MARGIN = 28
 
     def __init__(self, rec: Reconstruction, parent: QWidget | None = None):
         super().__init__(parent)
         self._rec = rec
-
-        self.setWindowFlags(
-            Qt.WindowType.Dialog
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.NoDropShadowWindowHint
-        )
+        self.setWindowFlags(Qt.WindowType.Dialog
+                            | Qt.WindowType.FramelessWindowHint
+                            | Qt.WindowType.NoDropShadowWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setModal(True)
-        apply_theme(self)
+        apply_hud_theme(self)
 
-        # ---- Backdrop fills the whole parent window -----------------
         self._backdrop = QFrame(self)
-        self._backdrop.setStyleSheet(
-            "background-color: rgba(0, 0, 0, 180);"
-        )
-        self._backdrop.lower()
+        self._backdrop.setStyleSheet("background-color: rgba(0, 0, 0, 170);")
 
-        # ---- Card: spans the whole window minus OUTER_MARGIN --------
         self.card = QFrame(self)
-        self.card.setObjectName("Overlay")
-        # Slightly larger radius than the SceneOverlay default so this
-        # full-screen card visually matches the right-panel cards.
+        self.card.setObjectName("PhotoCard")
         self.card.setStyleSheet(
-            "QFrame#Overlay {"
-            "  background-color: rgba(16, 16, 16, 230);"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "  border-radius: 10px;"
-            "}"
-        )
-
-        shadow = QGraphicsDropShadowEffect(self.card)
-        shadow.setBlurRadius(36)
-        shadow.setOffset(0, 6)
-        shadow.setColor(QColor(0, 0, 0, 200))
-        self.card.setGraphicsEffect(shadow)
-
+            "QFrame#PhotoCard { background-color: rgba(30, 30, 32, 250);"
+            " border: 1px solid rgba(255,255,255,22); border-radius: 16px; }")
         card_lay = QVBoxLayout(self.card)
-        card_lay.setContentsMargins(16, 14, 16, 14)
-        card_lay.setSpacing(10)
-
-        # Header strip.
+        card_lay.setContentsMargins(20, 16, 16, 18)
+        card_lay.setSpacing(14)
         card_lay.addLayout(self._build_header())
-
-        # Image takes everything else (1 weight).
         card_lay.addWidget(self._build_image_preview(), 1)
-
-        # Compact horizontal info strip at the bottom.
         card_lay.addLayout(self._build_info_strip())
 
-        # Outer fills the dialog with the card pinned to window minus
-        # 16 px on each side.
         outer = QGridLayout(self)
-        outer.setContentsMargins(
-            self.OUTER_MARGIN, self.OUTER_MARGIN,
-            self.OUTER_MARGIN, self.OUTER_MARGIN,
-        )
-        outer.addWidget(self._backdrop, 0, 0, 1, 1)
-        outer.addWidget(self.card, 0, 0, 1, 1)
+        m = self.OUTER_MARGIN
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self._backdrop, 0, 0)
+        inner = QVBoxLayout()
+        inner.setContentsMargins(m, m, m, m)
+        inner.addWidget(self.card)
+        outer.addLayout(inner, 0, 0)
 
-    # ------------------------------------------------------------------
-    # Section builders
-    # ------------------------------------------------------------------
     def _build_header(self) -> QHBoxLayout:
-        """
-        Compact header strip identical in voice to the other overlays:
-        accent dot + small-caps eyebrow + monospace title + × button.
-        """
         rec = self._rec
         h = QHBoxLayout()
-        h.setContentsMargins(2, 0, 2, 0)
-        h.setSpacing(10)
-
-        # Accent dot (same glyph used by every other HUD card).
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color: {COLOR_ACCENT}; font-size: 10px;")
-
-        # Eyebrow: "RECON · PLY"
-        eyebrow = QLabel(f"ЗАПИСЬ · {(rec.data_type or '—').upper()}")
-        eyebrow.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font-size: 10px;"
-            f" font-weight: 600; letter-spacing: 1.2px;"
-        )
-
-        # Title: car number or filename, monospace, accent-toned for emphasis.
-        title_text = rec.car_number or rec.name or "—"
-        title = QLabel(title_text)
+        h.setSpacing(12)
+        h.addWidget(_type_tile(rec.data_type, 36))
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        title = QLabel(rec.car_number or rec.name or "—")
         title.setStyleSheet(
             f"color: {COLOR_TEXT}; font-family: {FONT_MONO};"
-            f"font-size: 13px; font-weight: 600;"
-        )
-
-        # × close button.
-        btn_x = QPushButton()
-        btn_x.setIcon(_make_close_icon(14, COLOR_TEXT_MUTED))
-        btn_x.setIconSize(QSize(14, 14))
-        btn_x.setFixedSize(26, 26)
-        btn_x.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_x.setToolTip("Закрыть")
-        btn_x.setStyleSheet(
-            "QPushButton {"
-            "  background: transparent;"
-            "  border: 1px solid transparent; border-radius: 6px;"
-            "  padding: 0; min-width: 26px; max-width: 26px;"
-            "  min-height: 26px; max-height: 26px;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: rgba(255,255,255,12);"
-            f"  border-color: {COLOR_HAIRLINE};"
-            "}"
-            "QPushButton:pressed {"
-            "  background-color: rgba(255,51,85,22);"
-            "}"
-        )
-        btn_x.clicked.connect(self.close)
-
-        h.addWidget(dot, 0, Qt.AlignmentFlag.AlignVCenter)
-        h.addWidget(eyebrow, 0, Qt.AlignmentFlag.AlignVCenter)
-        # Vertical hairline spacer between eyebrow and title.
-        sep = QFrame()
-        sep.setFixedSize(1, 14)
-        sep.setStyleSheet(f"background-color: {COLOR_HAIRLINE};")
-        h.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
-        h.addWidget(title, 0, Qt.AlignmentFlag.AlignVCenter)
+            " font-size: 17px; font-weight: 600;")
+        col.addWidget(title)
+        sub = QLabel(" · ".join(filter(None, [
+            _dtype(rec.data_type)[2], (rec.model or "").strip()])))
+        sub.setProperty("role", "muted")
+        col.addWidget(sub)
+        h.addLayout(col)
         h.addStretch(1)
-        h.addWidget(btn_x, 0, Qt.AlignmentFlag.AlignVCenter)
+        btn_x = IconButton("close", "Закрыть · Esc", size=30, icon_size=16,
+                           filled=True)
+        btn_x.clicked.connect(self.close)
+        h.addWidget(btn_x, 0, Qt.AlignmentFlag.AlignTop)
         return h
 
     def _build_image_preview(self) -> QWidget:
-        """
-        Bare image canvas - no dark frame, no inner border. The photo
-        sits directly on the card's surface.
-        """
         rec = self._rec
-        frame = QFrame()
-        frame.setStyleSheet("background: transparent; border: none;")
-        frame.setMinimumHeight(280)
-
-        lay = QVBoxLayout(frame)
-        lay.setContentsMargins(0, 0, 0, 0)
-
         canvas = QLabel()
         canvas.setStyleSheet("background: transparent; border: none;")
         canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
         canvas.setMinimumHeight(260)
         canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
                              QSizePolicy.Policy.Expanding)
-
         path = _resolve_or_fetch_image_path(rec)
-        if path:
-            pm = QPixmap(path)
-            if pm.isNull():
-                canvas.setText("Файл изображения повреждён")
-                canvas.setStyleSheet(
-                    f"background: transparent; border: none;"
-                    f"color: {COLOR_WARN}; font-family: {FONT_MONO};"
-                    f"font-size: 11px;"
-                )
-            else:
-                self._original_pm = pm
-                canvas.setPixmap(self._scale_pixmap(pm, 800, 480))
-                # Re-scale on resize.
-                self._image_canvas = canvas
+        pm = QPixmap(path) if path else QPixmap()
+        if path and not pm.isNull():
+            canvas.setPixmap(self._scale_pixmap(pm, 800, 480))
 
-                def _on_resize(_e, c=canvas, p=pm):
-                    c.setPixmap(self._scale_pixmap(
-                        p, c.width() - 8, c.height() - 8
-                    ))
+            def _on_resize(_e, c=canvas, p=pm):
+                c.setPixmap(self._scale_pixmap(p, c.width() - 8, c.height() - 8))
 
-                canvas.resizeEvent = _on_resize  # type: ignore[assignment]
+            canvas.resizeEvent = _on_resize  # type: ignore[assignment]
         else:
-            placeholder = (
-                "Не удалось загрузить изображение\n"
-                "(сервер недоступен или файл отсутствует)"
-                if not rec.is_local
-                else "Файл изображения не найден локально"
-            )
-            canvas.setText(placeholder)
+            if path:
+                text = "Файл изображения повреждён"
+            elif rec.is_local:
+                text = "Изображение не найдено локально"
+            else:
+                text = "Не удалось загрузить изображение\nсервер недоступен или файла нет"
+            canvas.setText(text)
             canvas.setStyleSheet(
-                f"background: transparent; border: none;"
-                f"color: {COLOR_TEXT_MUTED}; font-family: {FONT_MONO};"
-                f"font-size: 11px; padding: 24px;"
-            )
-
-        lay.addWidget(canvas)
-        return frame
+                f"background: transparent; color: {COLOR_TEXT_MUTED}; font-size: 13px;")
+        return canvas
 
     @staticmethod
     def _scale_pixmap(pm: QPixmap, w: int, h: int) -> QPixmap:
         if w <= 0 or h <= 0:
             return pm
-        return pm.scaled(
-            w, h,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        return pm.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
 
     def _build_info_strip(self) -> QHBoxLayout:
-        """
-        Single horizontal strip carrying every metadata pair as a tiny
-        "KEY  value" cell separated by hairline dots.  Replaces the
-        old 2-column grid that ate vertical space.
-        """
         rec = self._rec
-        target_str = (
-            f"{rec.target_volume:.2f} m³"
-            if rec.target_volume is not None
-            else "—"
+        target = (f"{rec.target_volume:.2f} м³"
+                  if rec.target_volume is not None else "—")
+        cells = (
+            ("truck", "Модель", rec.model or "—"),
+            ("heap", "Наполнитель", rec.filler or "—"),
+            ("cube", "Целевой объём", target),
+            ("clock", "Время", _format_short_dt(rec)),
+            ("doc", "Файл", rec.name or "—"),
         )
-        time_str = _format_short_dt(rec)
-        # FILE can be very long; keep just the trailing 24 chars for
-        # the strip - the full thing is in the row tooltip.
-        file_short = rec.name or "—"
-        if len(file_short) > 28:
-            file_short = "..." + file_short[-24:]
-
-        cells: list[tuple[str, str, str | None]] = [
-            ("А/Н",    rec.car_number or "—",            None),
-            ("МОДЕЛЬ", rec.model or "—",                 None),
-            ("ТИП",    (rec.data_type or "—").upper(),   COLOR_ACCENT),
-            ("НАПОЛНИТЕЛЬ", rec.filler or "—",           None),
-            ("ЦЕЛЬ",   target_str,                       None),
-            ("ВРЕМЯ",  time_str,                         None),
-            ("ФАЙЛ",   file_short,                       None),
-        ]
-
         h = QHBoxLayout()
-        h.setContentsMargins(2, 4, 2, 0)
-        h.setSpacing(0)
-
-        for i, (label, value, hi) in enumerate(cells):
+        h.setSpacing(22)
+        for ic, tip, value in cells:
             cell = QHBoxLayout()
-            cell.setContentsMargins(0, 0, 0, 0)
-            cell.setSpacing(8)
-
-            k = QLabel(label)
-            k.setStyleSheet(
-                f"color: {COLOR_TEXT_MUTED}; font-size: 10px;"
-                f" font-weight: 600; letter-spacing: 1.2px;"
-            )
-            v = QLabel(value)
-            v.setToolTip(value)
-            v.setStyleSheet(
-                f"color: {hi or COLOR_TEXT}; font-family: {FONT_MONO};"
-                f"font-size: 11.5px; font-weight: 500;"
-            )
-            cell.addWidget(k)
+            cell.setSpacing(7)
+            cell.addWidget(icon_label(ic, COLOR_TEXT_MUTED, 15, tip))
+            v = QLabel(value if len(value) <= 36 else "…" + value[-32:])
+            v.setToolTip(f"{tip}: {value}")
+            v.setStyleSheet(f"color: {COLOR_TEXT}; font-size: 12px;")
+            if ic == "doc":
+                v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             cell.addWidget(v)
-            wrapper = QWidget()
-            wrapper.setLayout(cell)
-            h.addWidget(wrapper)
-
-            if i < len(cells) - 1:
-                # Hairline · between cells.
-                dot = QLabel("·")
-                dot.setStyleSheet(
-                    f"color: {COLOR_HAIRLINE}; padding: 0 12px;"
-                )
-                h.addWidget(dot)
-
+            h.addLayout(cell)
         h.addStretch(1)
         return h
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
     def showEvent(self, event):
-        # Re-cover the parent window on every show — handles re-use.
         parent = self.parentWidget()
-        if parent is not None:
-            top = parent.window()
-            if top is not None:
-                self.setGeometry(top.geometry())
+        if parent is not None and parent.window() is not None:
+            self.setGeometry(parent.window().geometry())
         super().showEvent(event)
 
     def keyPressEvent(self, event):
@@ -865,10 +390,6 @@ class RecordPhotoOverlay(QDialog):
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
-        # Click on the dim backdrop dismisses the dialog. Clicks on the
-        # card itself bubble up here only if their target had no own
-        # mousePressEvent — which is the case for QFrame, QLabel.
-        # Filter by checking the global pos against card geometry.
         gp = event.globalPosition().toPoint()
         if not self.card.geometry().contains(self.mapFromGlobal(gp)):
             self.close()
@@ -877,166 +398,202 @@ class RecordPhotoOverlay(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Right-side control panel — overlay edition
+# Инспектор
 # ---------------------------------------------------------------------------
-class RightPanel(QWidget):
-    """
-    HUD-style right-edge control panel built on the same overlay pattern
-    as `SceneOverlay`: a top-level frameless `Qt.Tool` window owned by
-    the main window, anchored to the right edge of the viewport.
-    """
+class RightPanel(FloatingPanel):
+    """Правая панель-инспектор с вкладками (см. шапку модуля)."""
 
     modelSetChanged          = pyqtSignal(str)
-    # Emitted when the user asks to delete a model set from disk (генератор
-    # кузовов или локальная модель в assets/models/trucks). Payload — ключ
-    # набора. Панель сама ничего не удаляет: подтверждение показывает
-    # MainWindow, потому что удаляемый набор может быть сейчас в сцене.
+    # Удаление набора моделей с диска (генератор / assets/models/trucks).
+    # Подтверждение показывает MainWindow: набор может быть сейчас в сцене.
     modelSetDeleteRequested  = pyqtSignal(str)
-    # Emitted when the user asks to push a model set to the photo-to-volume
-    # model registry (ПКМ по строке -> «Загрузить на сервер…»). Payload —
-    # ключ набора; диалог показывает MainWindow, у которого есть и камера
-    # сцены для пресета съёмки, и перечитывание списка после загрузки.
+    # Отправка набора в реестр моделей на сервере (диалог — в MainWindow).
     modelSetUploadRequested  = pyqtSignal(str)
     textureSetChanged        = pyqtSignal(str)
     reconstructionSelected   = pyqtSignal(str)
-    # Emitted when the user CLICKS a reconstruction row (not just
-    # selects programmatically) - payload is the Reconstruction
-    # dataclass. MainWindow consumes this to drive
-    # `panda_app.mesh_reconstruction.run_2d_to_3d_reconstruction_from`.
+    # Кнопка «Реконструировать» — payload: Reconstruction.
     reconstructionRunRequested = pyqtSignal(object)
-    # Emitted when the selected recon is (or stops being) a "stand"
-    # snapshot. Payload is the Reconstruction when a stand row is
-    # selected, or None when selection moves to a non-stand row. The
-    # MainWindow uses it to show/hide the full-screen camera-alignment
-    # reference overlay.
+    # Выбрана запись-снимок (stand / depth) — Reconstruction, иначе None.
     standReferenceSelected     = pyqtSignal(object)
-    # Emitted when the FOV slider moves. Payload is the new FOV (degrees).
     fovChanged                 = pyqtSignal(float)
-    # Emitted when the roll dial moves. Payload is the new roll (degrees,
-    # rotation about the view axis / centre of the screen).
     rollChanged                = pyqtSignal(float)
-    # Emitted when the reference-overlay opacity slider moves (0..1).
     referenceOpacityChanged    = pyqtSignal(float)
-    # Emitted when the reference-overlay visibility toggle flips.
     referenceVisibleToggled    = pyqtSignal(bool)
-    # Emitted when the "pick bed corners" toggle flips (start/stop the
-    # 4-point picking mode used for depth-fill reconstruction).
     pointPickingToggled        = pyqtSignal(bool)
-    # Emitted when the user asks to clear the picked points / reconstruction.
     pointsResetRequested       = pyqtSignal()
-    # Emitted when the anchor-point visualization toggle flips.
     pointVizToggled            = pyqtSignal(bool)
-    # Emitted when the user requests the automatic anchor-point search + build.
     autoPointsRequested        = pyqtSignal()
-    # Emitted when the user presses "Run Simulation". Payload is a dict:
-    #   {
-    #     "model_key":     str | None,   # current model set key
-    #     "texture_key":   str | None,   # current texture set key
-    #     "target_volume": float,        # cubic-metre target
-    #   }
-    # MainWindow consumes this and orchestrates the equivalent of the
-    # legacy `run_full_process` (target volume → texture set → ground
-    # plane → AABB plane → Perlin mesh from CSG).
+    # «Сгенерировать»: {"model_key", "texture_key", "target_volume"}.
     runRequested             = pyqtSignal(dict)
-    # Emitted when the user asks to open the body generator. MainWindow shows
-    # the dialog and runs the build in a worker thread — the panel itself knows
-    # nothing about body_builder, so the module stays optional.
     bodyGenRequested         = pyqtSignal()
-    # Emitted when the user picks a graphics preset (ultra/medium/performance).
-    # MainWindow persists it and prompts for a restart (the rendering engine
-    # is chosen before the window exists).
+    # ultra / medium / performance — MainWindow сохраняет и просит перезапуск.
     graphicsPresetChanged    = pyqtSignal(str)
+    # Вкладка «Датасет».
+    datasetSettingsRequested = pyqtSignal()
+    datasetStartRequested    = pyqtSignal()
 
-    PANEL_WIDTH = 320
+    PANEL_WIDTH = 344
 
-    # ------------------------------------------------------------------
+    _FOV_MIN = 20
+    _FOV_MAX = 150
+    _FOV_DEFAULT = 100
+    _ROLL_MIN = -180
+    _ROLL_MAX = 180
+
     def __init__(self, parent: QWidget, margin: int = 16):
-        assert parent is not None, "RightPanel must have an anchor widget"
+        super().__init__(parent, anchor="right-stretch", margin=margin,
+                         padding=(14, 14, 14, 14), width=self.PANEL_WIDTH)
+        col = self.body_layout
+        col.setSpacing(12)
 
-        # Top-level frameless tool window OWNED by the parent's top-level
-        # window (NOT by the inner container) — that way z-order and
-        # visibility properly follow the main window.
-        owner_window = parent.window() or parent
-        flags = (
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.NoDropShadowWindowHint
-        )
-        super().__init__(owner_window, flags)
-
-        self._owner = parent       # widget we anchor against (panda_container)
-        self._margin = margin
-
-        # Translucent painting so the inner card's rounded translucent
-        # fill shows correctly. Do NOT set WA_TransparentForMouseEvents
-        # here — this panel is interactive (combos, list, buttons).
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-
-        apply_theme(self)
-
-        # ---- The visible card (same QSS rule as SceneOverlay) -------
-        self.card = QFrame(self)
-        self.card.setObjectName("Overlay")
-
-        shadow = QGraphicsDropShadowEffect(self.card)
-        shadow.setBlurRadius(28)
-        shadow.setOffset(0, 6)
-        shadow.setColor(QColor(0, 0, 0, 180))
-        self.card.setGraphicsEffect(shadow)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self.card)
-
-        # ---- Card body: scroll area wrapping the actual content -----
-        card_lay = QVBoxLayout(self.card)
-        card_lay.setContentsMargins(0, 0, 0, 0)
-        card_lay.setSpacing(0)
-
-        scroll = QScrollArea(self.card)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        # Make the scroll area pick up the translucent overlay fill from
-        # its parent card (otherwise it would paint a solid bg).
-        scroll.setStyleSheet("background: transparent;")
-        scroll.viewport().setStyleSheet("background: transparent;")
-        card_lay.addWidget(scroll)
-
-        body = QWidget()
-        body.setObjectName("RightPanelBody")
-        body.setStyleSheet("background: transparent;")
-        # Constrain body width to the panel — guarantees children clip
-        # via word wrap / elision rather than overflowing the card.
-        body.setMaximumWidth(self.PANEL_WIDTH)
-        scroll.setWidget(body)
-
-        col = QVBoxLayout(body)
-        col.setContentsMargins(14, 14, 14, 14)
-        col.setSpacing(10)
-
-        # ---- Header (compact: brand dot + small caps) ---------------
         col.addLayout(self._build_header())
 
-        # ---- Load configs --------------------------------------------
-        # Model sets come from the TLS server's `models_geometry_config.json`
-        # (with a local `models_config.yaml` fallback); texture sets come
-        # from the TLS server's `textures_napolnitel_config.json`, which
-        # `main.py` pre-loads into panel_data's in-memory cache before
-        # this panel is constructed. Both lists carry the canonical
-        # backend key alongside the human-readable display name so we
-        # can emit the key on selection.
-        model_infos  = load_model_sets_detailed()
-        texture_sets = load_texture_sets()
-        default_tex  = get_default_texture_set_key()
+        self.tabs = SegmentedControl([
+            ("scene", "cube", "Сцена: кузов и наполнение"),
+            ("records", "list", "Записи реконструкций"),
+            ("camera", "camera", "Камера и совмещение со снимком"),
+            ("dataset", "stack", "Съёмка датасета"),
+        ], height=32, icon_size=17)
+        col.addWidget(self.tabs)
 
-        # ---- Section: Model set --------------------------------------
-        # Не QComboBox: имена наборов в 320-пиксельную панель не влезают, а
-        # выбирать кузов приходится по объёму / шасси / комплектности —
-        # см. src/ui/model_picker.py (поиск + таблица характеристик).
+        self.pages = QStackedWidget()
+        self.pages.setStyleSheet("QStackedWidget { background: transparent; }")
+        col.addWidget(self.pages, 1)
+
+        self._page_keys: list[str] = []
+        self._add_page("scene", self._build_scene_page(), scroll=True)
+        self._add_page("records", self._build_records_page(), scroll=False)
+        self._add_page("camera", self._build_camera_page(), scroll=True)
+        self._add_page("dataset", self._build_dataset_page(), scroll=True)
+        self.tabs.changed.connect(self._on_tab)
+
+        # Подписка — только когда построены все вкладки: выбор записи
+        # трогает и подробности, и вкладку «Камера».
+        self.lst_recon.currentItemChanged.connect(self._on_recon_changed)
+        self.lst_recon.itemClicked.connect(self._on_recon_clicked)
+
+        # Стартовое состояние списка записей.
+        if self._recons:
+            self.lst_recon.setCurrentRow(0)
+            self._selected_rec = self._recons[0]
+            self._populate_details(self._recons[0])
+        else:
+            self._selected_rec = None
+            self._populate_details(None)
+            self.btn_run_recon.setEnabled(False)
+
+    # ==================================================================
+    # Каркас
+    # ==================================================================
+    def _add_page(self, key: str, page: QWidget, scroll: bool) -> None:
+        if scroll:
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.Shape.NoFrame)
+            area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            area.setWidget(page)
+            self.pages.addWidget(area)
+        else:
+            self.pages.addWidget(page)
+        self._page_keys.append(key)
+
+    def _on_tab(self, key: str) -> None:
+        if key in self._page_keys:
+            self.pages.setCurrentIndex(self._page_keys.index(key))
+        if key == "camera":
+            self.tabs.set_badge("camera", False)
+
+    def show_tab(self, key: str) -> None:
+        self.tabs.set_current(key)
+        self._on_tab(key)
+
+    @staticmethod
+    def _page() -> tuple[QWidget, QVBoxLayout]:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 2, 0, 0)
+        lay.setSpacing(8)
+        return w, lay
+
+    @staticmethod
+    def _title(text: str) -> QLabel:
+        t = QLabel(text)
+        t.setProperty("role", "title")
+        return t
+
+    @staticmethod
+    def _section(text: str, trailing: QWidget | None = None) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(4, 8, 0, 0)
+        row.setSpacing(6)
+        lbl = QLabel(text)
+        lbl.setProperty("role", "eyebrow")
+        row.addWidget(lbl, 0, Qt.AlignmentFlag.AlignBottom)
+        row.addStretch(1)
+        if trailing is not None:
+            row.addWidget(trailing, 0, Qt.AlignmentFlag.AlignBottom)
+        return row
+
+    @staticmethod
+    def _field_row(icon_name: str, tip: str, widget: QWidget,
+                   trailing: QWidget | None = None) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        row.addWidget(icon_label(icon_name, COLOR_TEXT_MUTED, 17, tip), 0,
+                      Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(widget, 1, Qt.AlignmentFlag.AlignVCenter)
+        if trailing is not None:
+            row.addWidget(trailing, 0, Qt.AlignmentFlag.AlignVCenter)
+        return row
+
+    @staticmethod
+    def _value_label(text: str, width: int = 44) -> QLabel:
+        v = label(text, mono=True, size=12, color=COLOR_TEXT)
+        v.setFixedWidth(width)
+        v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return v
+
+    def _build_header(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(2, 0, 0, 0)
+        row.setSpacing(10)
+        mark = QLabel()
+        mark.setFixedSize(30, 30)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setPixmap(icons.pixmap("cube", "#FFFFFF", 18))
+        mark.setStyleSheet(
+            "QLabel { border-radius: 8px; background: qlineargradient("
+            "x1:0, y1:0, x2:1, y2:1, stop:0 #409CFF, stop:1 #5E5CE6); }")
+        row.addWidget(mark)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        names.addWidget(label("IQoko", size=15, weight=700))
+        names.addWidget(label("3D-симулятор", role="caption"))
+        row.addLayout(names)
+        row.addStretch(1)
+
+        self.btn_graphics = IconButton("display", "Качество графики", size=30)
+        self.btn_graphics.clicked.connect(self._show_graphics_menu)
+        row.addWidget(self.btn_graphics)
+        return row
+
+    # ==================================================================
+    # Вкладка «Сцена»
+    # ==================================================================
+    def _build_scene_page(self) -> QWidget:
+        page, lay = self._page()
+        lay.addWidget(self._title("Сцена"))
+
+        model_infos = load_model_sets_detailed()
+        texture_sets = load_texture_sets()
+        default_tex = get_default_texture_set_key()
+
+        # ---- Кузов ------------------------------------------------------
+        self._model_count = label("", role="caption")
+        lay.addLayout(self._section("Кузов", self._model_count))
+        # Не QComboBox: имена наборов длинные, а выбирать приходится по
+        # объёму / шасси / комплекту — см. src/ui/model_picker.py.
         self.cmb_model = ModelPickerCombo()
         self.cmb_model.set_details(model_infos)
         for info in model_infos:
@@ -1044,21 +601,50 @@ class RightPanel(QWidget):
         if model_infos:
             self.cmb_model.setCurrentIndex(0)
         else:
-            self.cmb_model.addItem("— модели не найдены —", userData=None)
+            self.cmb_model.addItem("Модели не найдены", userData=None)
             self.cmb_model.setEnabled(False)
         self.cmb_model.currentIndexChanged.connect(self._on_model_index_changed)
         self.cmb_model.deleteRequested.connect(
             lambda key: self.modelSetDeleteRequested.emit(str(key)))
         self.cmb_model.uploadRequested.connect(
             lambda key: self.modelSetUploadRequested.emit(str(key)))
-        self._model_card = self._make_card(
-            "Набор моделей",
-            self.cmb_model,
-            status=self._model_count_label(len(model_infos)),
-        )
-        col.addWidget(self._model_card)
+        self._model_count.setText(self._model_count_label(len(model_infos)))
 
-        # ---- Section: Texture set ------------------------------------
+        self.btn_bodygen = IconButton("wand", "Собрать кузов по скану…",
+                                      size=34, icon_size=18, filled=True)
+        self.btn_bodygen.clicked.connect(self.bodyGenRequested.emit)
+        pick_row = QHBoxLayout()
+        pick_row.setSpacing(6)
+        pick_row.addWidget(self.cmb_model, 1)
+        pick_row.addWidget(self.btn_bodygen)
+        lay.addLayout(pick_row)
+
+        # Строка состояния: итог удаления / загрузки, ход сборки кузова.
+        self.lbl_model_status = label("", role="caption")
+        self.lbl_model_status.setWordWrap(True)
+        self.lbl_model_status.setContentsMargins(4, 0, 0, 0)
+        self.lbl_model_status.hide()
+        lay.addWidget(self.lbl_model_status)
+        self.lbl_bodygen = self.lbl_model_status
+        self._init_bodygen_state()
+
+        # Характеристики выбранного кузова — то, по чему его и выбирают.
+        self._spec = Card(spacing=7)
+        self._spec_rows: dict[str, tuple[QLabel, QLabel]] = {}
+        for key, ic, tip in (("volume", "cube", "Вместимость кузова"),
+                             ("axles", "truck", "Колёсная формула"),
+                             ("dims", "expand", "Внутренние габариты, м"),
+                             ("kit", "stack", "Состав набора")):
+            v = label("—", size=12)
+            note = label("", role="caption")
+            self._spec.add(self._field_row(ic, tip, v, note))
+            self._spec_rows[key] = (v, note)
+        lay.addWidget(self._spec)
+        self._refresh_model_spec()
+
+        # ---- Наполнитель -------------------------------------------------
+        lay.addLayout(self._section("Наполнитель"))
+        card = Card(spacing=10)
         self.cmb_texture = QComboBox()
         default_index = 0
         for i, (key, display) in enumerate(texture_sets):
@@ -1068,44 +654,17 @@ class RightPanel(QWidget):
         if texture_sets:
             self.cmb_texture.setCurrentIndex(default_index)
         else:
-            self.cmb_texture.addItem("— текстуры не найдены —", userData=None)
+            self.cmb_texture.addItem("Текстуры не найдены", userData=None)
             self.cmb_texture.setEnabled(False)
         self.cmb_texture.currentIndexChanged.connect(self._on_texture_index_changed)
-        col.addWidget(self._make_card(
-            "Текстуры",
-            self._make_row("Текстура", self.cmb_texture),
-        ))
+        card.add(self._field_row("texture", "Текстура наполнителя",
+                                 self.cmb_texture))
 
-        # ---- Section: Graphics preset --------------------------------
-        # ultra / medium use RenderPipeline; performance uses simplepbr.
-        # Switching the engine requires a restart (RP is built before the
-        # window), so MainWindow only persists the choice + asks to restart.
-        self.cmb_graphics = QComboBox()
-        cur_preset = (graphics_settings.load_saved()
-                      or graphics_settings.DEFAULT_PRESET)
-        graphics_index = 0
-        for i, pkey in enumerate(graphics_settings.PRESET_ORDER):
-            self.cmb_graphics.addItem(
-                graphics_settings.PRESETS[pkey]["name"], userData=pkey
-            )
-            if pkey == cur_preset:
-                graphics_index = i
-        self.cmb_graphics.setCurrentIndex(graphics_index)
-        self.cmb_graphics.currentIndexChanged.connect(
-            self._on_graphics_index_changed
-        )
-        col.addWidget(self._make_card(
-            "Графика",
-            self._make_row("Качество", self.cmb_graphics),
-            status="Перезапуск",
-        ))
-
-        # ---- Section: Fill (target volume) --------------------------
         self.spn_target = QDoubleSpinBox()
         self.spn_target.setDecimals(2)
         self.spn_target.setRange(0.1, 999.0)
         self.spn_target.setSingleStep(0.5)
-        self.spn_target.setSuffix(" m³")
+        self.spn_target.setSuffix(" м³")
         initial_volume = 10.0
         cur_model_key = self.cmb_model.itemData(self.cmb_model.currentIndex())
         if cur_model_key:
@@ -1116,758 +675,449 @@ class RightPanel(QWidget):
                 except (TypeError, ValueError):
                     pass
         self.spn_target.setValue(initial_volume)
-        col.addWidget(self._make_card(
-            "Наполнение",
-            self._make_row("Объём", self.spn_target),
-            status="Параметр",
-        ))
+        card.add(self._field_row("cube", "Объём наполнения", self.spn_target))
+        lay.addWidget(card)
 
-        # ---- Section: Body generator --------------------------------
-        # Опциональный модуль: если пакет генератора не найден, кнопка просто
-        # выключена с пояснением — утилита работает как раньше.
-        self.btn_bodygen = QPushButton("Сгенерировать кузов…")
-        self.btn_bodygen.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_bodygen.setStyleSheet(self._soft_accent_button_qss())
-        self.btn_bodygen.clicked.connect(self.bodyGenRequested.emit)
+        lay.addSpacing(6)
+        run_row = QHBoxLayout()
+        run_row.setSpacing(8)
+        btn_reset = IconButton("rotate_ccw", "Сбросить выбор", size=38,
+                               icon_size=18, filled=True)
+        btn_reset.clicked.connect(self._reset_selections)
+        self.btn_run = QPushButton("Сгенерировать")
+        self.btn_run.setProperty("variant", "primary")
+        self.btn_run.setIcon(icons.icon("play", "#FFFFFF", 14,
+                                        active_color="#FFFFFF"))
+        self.btn_run.setIconSize(QSize(14, 14))
+        self.btn_run.setMinimumHeight(38)
+        self.btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_run.setToolTip("Насыпать груз в выбранный кузов")
+        self.btn_run.clicked.connect(self._emit_run_requested)
+        run_row.addWidget(btn_reset)
+        run_row.addWidget(self.btn_run, 1)
+        lay.addLayout(run_row)
+        lay.addStretch(1)
+        return page
 
-        self.lbl_bodygen = QLabel("")
-        self.lbl_bodygen.setWordWrap(True)
-        self.lbl_bodygen.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font-size: 10px;")
-
-        bodygen_box = QWidget()
-        bodygen_lay = QVBoxLayout(bodygen_box)
-        bodygen_lay.setContentsMargins(0, 0, 0, 0)
-        bodygen_lay.setSpacing(6)
-        bodygen_lay.addWidget(self.btn_bodygen)
-        bodygen_lay.addWidget(self.lbl_bodygen)
-
-        self._bodygen_card = self._make_card(
-            "Генератор кузова", bodygen_box, status="из облака")
-        col.addWidget(self._bodygen_card)
-        self._init_bodygen_state()
-
-        # ---- Section: 2D · 3D Reconstructions -----------------------
+    # ==================================================================
+    # Вкладка «Записи»
+    # ==================================================================
+    def _build_records_page(self) -> QWidget:
+        page, lay = self._page()
         self._recons: list[Reconstruction] = load_reconstructions()
 
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        head.addWidget(self._title("Записи"))
+        self.lbl_recon_count = QLabel("")
+        self.lbl_recon_count.setProperty("role", "chip-idle")
+        head.addWidget(self.lbl_recon_count, 0, Qt.AlignmentFlag.AlignVCenter)
+        head.addStretch(1)
+        self.btn_load_more = IconButton("arrow_down_circle", "Загрузить ещё",
+                                        size=30, icon_size=18)
+        self.btn_load_more.clicked.connect(self._on_load_more)
+        head.addWidget(self.btn_load_more)
+        lay.addLayout(head)
+
         self.lst_recon = QListWidget()
-        self.lst_recon.setUniformItemSizes(False)
-        self.lst_recon.setSelectionMode(
-            QListWidget.SelectionMode.SingleSelection
-        )
-        # Local padding override - the global QSS rule "padding: 8px 10px"
-        # was eating uneven slices of every item-widget's vertical space.
-        # Setting it to 0 lets ReconRowWidget's own internal layout (which
-        # already balances top/bottom via stretches) actually centre.
+        self.lst_recon.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.lst_recon.setStyleSheet(
-            "QListWidget::item { padding: 0px; margin: 0px; }"
-        )
-        self.lst_recon.setSpacing(4)
-        self.lst_recon.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        try:
-            from PyQt6.QtWidgets import QListView
-            self.lst_recon.setResizeMode(QListView.ResizeMode.Adjust)
-        except Exception:
-            pass
+            "QListWidget::item { padding: 0px; margin: 0px; border-radius: 9px; }")
+        self.lst_recon.setSpacing(1)
+        self.lst_recon.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.lst_recon.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self.lst_recon.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.lst_recon.customContextMenuRequested.connect(self._on_recon_context_menu)
+        lay.addWidget(self.lst_recon, 1)
+        self._fill_recon_list()
 
-        # Width budget for elision: panel width minus card padding (28),
-        # list padding (~14), icon (20+10), button (24+10).
-        row_text_width = self.PANEL_WIDTH - 28 - 14 - 30 - 34
+        # ---- выбранная запись -------------------------------------------
+        self._details = Card(padding=(12, 10, 10, 10), spacing=6)
+        self._details_rows: dict[str, QLabel] = {}
+        for key, ic, tip in (("model", "truck", "Модель"),
+                             ("filler", "heap", "Наполнитель"),
+                             ("target", "cube", "Целевой объём"),
+                             ("time", "clock", "Время")):
+            v = label("—", size=12)
+            v.setToolTip(tip)
+            self._details.add(self._field_row(ic, tip, v))
+            self._details_rows[key] = v
+        self._file_lbl = label("—", role="caption")
+        self._file_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._btn_copy = IconButton("copy", "Скопировать имя файла", size=24,
+                                    icon_size=14, color=COLOR_TEXT_MUTED)
+        self._btn_copy.clicked.connect(
+            lambda: self._copy_filename_to_clipboard(
+                getattr(self._selected_rec, "name", "") or "", self._btn_copy))
+        self._details.add(self._field_row("doc", "Файл", self._file_lbl,
+                                          self._btn_copy))
+        lay.addWidget(self._details)
 
+        # ---- запуск -------------------------------------------------------
+        foot = QHBoxLayout()
+        foot.setSpacing(8)
+        foot.addWidget(icon_label("film", COLOR_TEXT_MUTED, 16,
+                                  "Кинематографичный показ"))
+        foot.addWidget(label("Кино", size=12, color=COLOR_TEXT_MUTED))
+        self.chk_cinematic = Switch(
+            _load_cinematic_enabled(),
+            "Кино: показывать реконструкцию по проезду кинематографично —\n"
+            "снимок, лидар, поиск кузова, этапы расчёта. Esc — пропустить")
+        self.chk_cinematic.toggled.connect(_save_cinematic_enabled)
+        foot.addWidget(self.chk_cinematic)
+        foot.addStretch(1)
+        self.btn_run_recon = QPushButton("Реконструировать")
+        self.btn_run_recon.setProperty("variant", "primary")
+        self.btn_run_recon.setIcon(icons.icon("sparkles", "#FFFFFF", 15,
+                                              active_color="#FFFFFF"))
+        self.btn_run_recon.setIconSize(QSize(15, 15))
+        self.btn_run_recon.setMinimumHeight(36)
+        self.btn_run_recon.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_run_recon.clicked.connect(self._emit_recon_run_requested)
+        foot.addWidget(self.btn_run_recon)
+        lay.addLayout(foot)
+        return page
+
+    def _row_text_width(self) -> int:
+        return self.PANEL_WIDTH - 28 - 8 - 32 - 20 - 28 - 14
+
+    def _fill_recon_list(self) -> None:
+        self.lst_recon.clear()
         if self._recons:
             for idx, rec in enumerate(self._recons):
-                row_w = ReconRowWidget(rec, max_text_width=row_text_width)
-                row_w.viewClicked.connect(
-                    lambda i=idx: self._on_view_requested(i)
-                )
+                row_w = ReconRowWidget(rec, max_text_width=self._row_text_width())
+                row_w.viewClicked.connect(lambda i=idx: self._on_view_requested(i))
                 item = QListWidgetItem()
                 item.setSizeHint(QSize(0, row_w.ROW_FIXED_HEIGHT))
                 item.setData(Qt.ItemDataRole.UserRole, idx)
                 self.lst_recon.addItem(item)
                 self.lst_recon.setItemWidget(item, row_w)
         else:
-            placeholder = QListWidgetItem("— записей нет —")
+            placeholder = QListWidgetItem("Записей нет")
             placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            placeholder.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.lst_recon.addItem(placeholder)
-
-        self.lst_recon.currentItemChanged.connect(self._on_recon_changed)
-        self.lst_recon.itemClicked.connect(self._on_recon_clicked)
-        self.lst_recon.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
-        self.lst_recon.customContextMenuRequested.connect(
-            self._on_recon_context_menu
-        )
-        # ---- Reset + Generate row (above the Recon list) -----------
-        # Used to live in a footer at the very bottom; moved up so the
-        # primary scene-pipeline trigger sits right next to the controls
-        # that feed it (model / texture / fill).
-        gen_row = QHBoxLayout()
-        gen_row.setContentsMargins(0, 0, 0, 0)
-        gen_row.setSpacing(8)
-
-        btn_reset = QPushButton("Сброс")
-        btn_reset.setProperty("variant", "ghost")
-        btn_reset.clicked.connect(self._reset_selections)
-
-        # Inline accent stylesheet (the property-selector path produced
-        # invisible text on a green border).
-        self.btn_run = QPushButton("Сгенерировать")
-        self.btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_run.setStyleSheet(self._soft_accent_button_qss(strong=True))
-        self.btn_run.clicked.connect(self._emit_run_requested)
-
-        gen_row.addWidget(btn_reset)
-        gen_row.addStretch(1)
-        gen_row.addWidget(self.btn_run)
-        col.addLayout(gen_row)
-
-        # ---- 2D · 3D Reconstruction card (list only) ----------------
-        recon_count = len(self._recons) if self._recons else 0
-        self._recon_card = self._make_card(
-            "2D · 3D Реконструкции",
-            self.lst_recon,
-            status=str(recon_count),
-            stretch=True,
-        )
-        col.addWidget(self._recon_card, 1)
-
-        # ---- Selected record · Details card -------------------------
-        self._details_form = QFormLayout()
-        self._details_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        self._details_form.setHorizontalSpacing(10)
-        self._details_form.setVerticalSpacing(4)
-        self._details_form.setContentsMargins(0, 0, 0, 0)
-        self._details_holder = QWidget()
-        self._details_holder.setLayout(self._details_form)
-
-        col.addWidget(self._make_card(
-            "Выбранная запись",
-            self._details_holder,
-            status="Подробно",
-        ))
-
-        # ---- Camera controls card (FOV + reference overlay) ---------
-        col.addWidget(self._make_card(
-            "Камера · Выравнивание",
-            self._build_camera_controls(),
-        ))
-
-        # ---- Bottom row: Load more + Reconstruct -------------------
-        # Both buttons are kept here so they share the same horizontal
-        # rhythm as the Reset/Generate row above the recon list.
-        bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(0, 2, 0, 0)
-        bottom_row.setSpacing(8)
-
-        self.btn_load_more = QPushButton("Загрузить ещё")
-        self.btn_load_more.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_load_more.setStyleSheet(
-            "QPushButton {"
-            "  background: rgba(255,255,255,4);"
-            f"  color: {COLOR_TEXT_MUTED};"
-            f"  border: 1px dashed {COLOR_HAIRLINE};"
-            "  border-radius: 6px;"
-            "  padding: 6px 12px;"
-            "  font-size: 12px;"
-            "  font-weight: 500;"
-            "  letter-spacing: 0.3px;"
-            "}"
-            "QPushButton:hover {"
-            "  background: rgba(255,255,255,10);"
-            f"  color: {COLOR_TEXT};"
-            f"  border-color: {COLOR_HAIRLINE_HOVER};"
-            "}"
-            "QPushButton:disabled {"
-            f"  color: {COLOR_TEXT_DIM};"
-            "  border-style: solid;"
-            "}"
-        )
-        self.btn_load_more.clicked.connect(self._on_load_more)
-
-        self.btn_run_recon = QPushButton("Реконструировать")
-        self.btn_run_recon.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_run_recon.setStyleSheet(self._soft_accent_button_qss())
-        self.btn_run_recon.clicked.connect(self._emit_recon_run_requested)
-
-        # Кинематографичный показ реконструкции (src/cinematic). Выбор
-        # запоминается в config/cinematic.json.
-        self.chk_cinematic = QCheckBox("Кино")
-        self.chk_cinematic.setToolTip(
-            "Показывать реконструкцию по проезду кинематографично: снимок, "
-            "лидар, поиск кузова, этапы расчёта наполнения. Esc — пропустить.")
-        self.chk_cinematic.setChecked(_load_cinematic_enabled())
-        self.chk_cinematic.setStyleSheet(
-            f"QCheckBox {{ color: {COLOR_TEXT_MUTED}; font-size: 11px; }}")
-        self.chk_cinematic.toggled.connect(_save_cinematic_enabled)
-
-        bottom_row.addWidget(self.btn_load_more)
-        bottom_row.addStretch(1)
-        bottom_row.addWidget(self.chk_cinematic)
-        bottom_row.addWidget(self.btn_run_recon)
-        col.addLayout(bottom_row)
-
-        # ---- Initial selection -------------------------------------
-        if self._recons:
-            self._populate_details(self._recons[0])
-            self.lst_recon.setCurrentRow(0)
-            self._selected_rec = self._recons[0]
-        else:
-            self._populate_details(None)
-            self._selected_rec = None
-            self.btn_run_recon.setEnabled(False)
-
-        # Card width is fixed; height tracks the container in _reposition.
-        self.setFixedWidth(self.PANEL_WIDTH)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed,
-                           QSizePolicy.Policy.Expanding)
+        self._refresh_recon_card_count()
 
     # ==================================================================
-    # Public API (mirrors SceneOverlay.attach)
+    # Вкладка «Камера»
     # ==================================================================
-    def attach(self) -> None:
-        """
-        Install event filters on the anchor widget and on its top-level
-        window, then reposition + show the panel.
-        """
-        owner = self._owner
-        if owner is None:
-            return
+    def _build_camera_page(self) -> QWidget:
+        page, lay = self._page()
+        lay.addWidget(self._title("Камера"))
 
-        # Resize / show / hide events fire on the anchor (panda_container).
-        owner.installEventFilter(self)
-
-        # Move events typically fire on the top-level window when the user
-        # drags the main window across the desktop — those don't reach the
-        # inner container, so we listen there too.
-        top = owner.window()
-        if top is not None and top is not owner:
-            top.installEventFilter(self)
-
-        self._reposition()
-        self.show()
-        self.raise_()
-
-    # ==================================================================
-    # Section builders
-    # ==================================================================
-    def _build_header(self) -> QVBoxLayout:
-        """Compact pill: brand dot + IQOKO label + LIVE chip."""
-        v = QVBoxLayout()
-        v.setContentsMargins(0, 0, 0, 4)
-        v.setSpacing(0)
-
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color: {COLOR_ACCENT}; font-size: 10px;")
-
-        brand = QLabel("IQOKO · 3D СИМУЛЯТОР")
-        brand.setStyleSheet(
-            f"color: {COLOR_TEXT}; font-size: 11px; font-weight: 600;"
-            f" letter-spacing: 1.2px;"
-        )
-
-        chip = _make_chip("LIVE", "chip-live")
-
-        row.addWidget(dot)
-        row.addWidget(brand)
-        row.addStretch(1)
-        row.addWidget(chip)
-        v.addLayout(row)
-        return v
-
-    # ------------------------------------------------------------------
-    # Camera-alignment controls (FOV + reference overlay)
-    # ------------------------------------------------------------------
-    _FOV_MIN = 20
-    _FOV_MAX = 150
-    _FOV_DEFAULT = 100
-
-    # Roll (rotation about the view axis / centre of the screen), degrees.
-    _ROLL_MIN = -180
-    _ROLL_MAX = 180
-
-    @staticmethod
-    def _thin_slider_qss() -> str:
-        return (
-            "QSlider::groove:horizontal {"
-            f"  background: {COLOR_HAIRLINE};"
-            "  height: 3px; border-radius: 1px;"
-            "}"
-            "QSlider::sub-page:horizontal {"
-            f"  background: {COLOR_ACCENT}; height: 3px; border-radius: 1px;"
-            "}"
-            "QSlider::handle:horizontal {"
-            f"  background: {COLOR_ACCENT};"
-            "  width: 10px; height: 10px;"
-            "  margin: -4px 0; border-radius: 5px;"
-            "}"
-            "QSlider::handle:horizontal:hover { background: #00FFAA; }"
-            "QSlider:disabled { }"
-            "QSlider::sub-page:horizontal:disabled {"
-            f"  background: {COLOR_TEXT_DIM};"
-            "}"
-            "QSlider::handle:horizontal:disabled {"
-            f"  background: {COLOR_TEXT_DIM};"
-            "}"
-        )
-
-    def _build_camera_controls(self) -> QWidget:
-        """
-        Build the camera-alignment controls:
-          • FOV slider (20..150°) — always active, drives the live lens.
-          • Reference-overlay opacity slider + show/hide toggle — active
-            only while a `stand` snapshot is selected (the overlay shows
-            that snapshot's colour frame over the 3D viewport so the user
-            can match the camera by hand).
-        """
-        holder = QWidget()
-        holder.setStyleSheet("background: transparent;")
-        v = QVBoxLayout(holder)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(8)
-
-        def _caption(text: str) -> QLabel:
-            lbl = QLabel(text)
-            lbl.setStyleSheet(
-                f"color: {COLOR_TEXT_MUTED}; font-size: 10px;"
-                f" letter-spacing: 1.0px; background: transparent;"
-            )
-            return lbl
-
-        def _value_lbl(text: str) -> QLabel:
-            lbl = QLabel(text)
-            lbl.setStyleSheet(
-                f"color: {COLOR_TEXT}; font-family: {FONT_MONO};"
-                f" font-size: 11px; background: transparent;"
-            )
-            lbl.setMinimumWidth(40)
-            lbl.setAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            return lbl
-
-        # Everything below lives inside the collapsible "Дополнительно"
-        # container (FOV, roll, overlay + point-picking controls). The main
-        # camera card stays minimal — just the disclosure toggle.
-        self._adv_holder = QWidget()
-        self._adv_holder.setStyleSheet("background: transparent;")
-        ah = QVBoxLayout(self._adv_holder)
-        ah.setContentsMargins(0, 0, 0, 0)
-        ah.setSpacing(8)
-
-        # ----- FOV row ------------------------------------------------
-        fov_row = QHBoxLayout()
-        fov_row.setContentsMargins(0, 0, 0, 0)
-        fov_row.setSpacing(8)
-
+        # ---- Объектив ---------------------------------------------------
+        lay.addLayout(self._section("Объектив"))
+        lens = Card(spacing=10)
         self.fov_slider = QSlider(Qt.Orientation.Horizontal)
         self.fov_slider.setRange(self._FOV_MIN, self._FOV_MAX)
         self.fov_slider.setValue(self._FOV_DEFAULT)
-        self.fov_slider.setFixedHeight(18)
-        self.fov_slider.setStyleSheet(self._thin_slider_qss())
-
-        self.fov_value_lbl = _value_lbl(f"{self._FOV_DEFAULT}°")
+        self.fov_value_lbl = self._value_label(f"{self._FOV_DEFAULT}°")
 
         def _on_fov(val: int):
             self.fov_value_lbl.setText(f"{int(val)}°")
             self.fovChanged.emit(float(val))
 
         self.fov_slider.valueChanged.connect(_on_fov)
+        lens.add(self._field_row("angle", "Угол обзора (FOV)", self.fov_slider,
+                                 self.fov_value_lbl))
 
-        fov_row.addWidget(_caption("FOV"), 0, Qt.AlignmentFlag.AlignVCenter)
-        fov_row.addWidget(self.fov_slider, 1, Qt.AlignmentFlag.AlignVCenter)
-        fov_row.addWidget(self.fov_value_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
-        ah.addLayout(fov_row)
-
-        # ----- Roll dial ("крутилка" about the view axis) -------------
-        roll_row = QHBoxLayout()
-        roll_row.setContentsMargins(0, 0, 0, 0)
-        roll_row.setSpacing(8)
-
-        self.roll_dial = QDial()
-        self.roll_dial.setRange(self._ROLL_MIN, self._ROLL_MAX)
-        self.roll_dial.setValue(0)
-        self.roll_dial.setWrapping(True)       # angle wraps -180 <-> 180
-        self.roll_dial.setNotchesVisible(True)
-        self.roll_dial.setFixedSize(46, 46)
-        self.roll_dial.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.roll_dial.setToolTip(
-            "Крен камеры (поворот вокруг центра экрана).\n"
-            "Кнопка ⟲ справа — сбросить в 0"
-        )
-        self.roll_dial.setStyleSheet(
-            "QDial { background: transparent; }"
-        )
-
-        self.roll_value_lbl = _value_lbl("0°")
+        self.roll_slider = QSlider(Qt.Orientation.Horizontal)
+        self.roll_slider.setRange(self._ROLL_MIN, self._ROLL_MAX)
+        self.roll_slider.setValue(0)
+        self.roll_value_lbl = self._value_label("0°")
 
         def _on_roll(val: int):
             self.roll_value_lbl.setText(f"{int(val)}°")
             self.rollChanged.emit(float(val))
 
-        self.roll_dial.valueChanged.connect(_on_roll)
+        self.roll_slider.valueChanged.connect(_on_roll)
+        self.btn_roll_reset = IconButton("rotate_ccw", "Выровнять горизонт",
+                                         size=24, icon_size=14,
+                                         color=COLOR_TEXT_MUTED)
+        # setValue(0) -> valueChanged -> rollChanged: камера выравнивается.
+        self.btn_roll_reset.clicked.connect(lambda: self.roll_slider.setValue(0))
+        roll_trailing = QWidget()
+        rt = QHBoxLayout(roll_trailing)
+        rt.setContentsMargins(0, 0, 0, 0)
+        rt.setSpacing(2)
+        rt.addWidget(self.roll_value_lbl)
+        rt.addWidget(self.btn_roll_reset)
+        lens.add(self._field_row("horizon", "Крен (поворот вокруг центра кадра)",
+                                 self.roll_slider, roll_trailing))
+        lay.addWidget(lens)
 
-        # Reset-to-zero affordance (the default presets also zero it).
-        self.btn_roll_reset = QToolButton()
-        self.btn_roll_reset.setText("⟲")
-        self.btn_roll_reset.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_roll_reset.setToolTip("Сбросить крен в 0")
-        self.btn_roll_reset.setStyleSheet(
-            "QToolButton {"
-            "  background: transparent;"
-            f"  color: {COLOR_TEXT_MUTED};"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "  border-radius: 5px; padding: 2px 6px; font-size: 13px;"
-            "}"
-            "QToolButton:hover {"
-            "  background: rgba(255,255,255,8);"
-            f"  color: {COLOR_TEXT};"
-            "}"
-        )
-        # setValue(0) fires valueChanged -> _on_roll -> emits rollChanged,
-        # so the camera actually rolls back to level.
-        self.btn_roll_reset.clicked.connect(lambda: self.roll_dial.setValue(0))
+        # ---- Снимок стенда поверх вида -----------------------------------
+        self.btn_ref_toggle = IconButton("eye", "Показать / скрыть снимок",
+                                         size=26, icon_size=16, checkable=True)
+        self.btn_ref_toggle.setChecked(True)
 
-        roll_row.addWidget(_caption("КРЕН"), 0, Qt.AlignmentFlag.AlignVCenter)
-        roll_row.addStretch(1)
-        roll_row.addWidget(self.roll_dial, 0, Qt.AlignmentFlag.AlignVCenter)
-        roll_row.addWidget(self.roll_value_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
-        roll_row.addWidget(self.btn_roll_reset, 0, Qt.AlignmentFlag.AlignVCenter)
-        ah.addLayout(roll_row)
+        def _on_toggle(checked: bool):
+            self.btn_ref_toggle.set_icon("eye" if checked else "eye_off")
+            self.referenceVisibleToggled.emit(bool(checked))
 
-        # ----- Top reference-overlay controls (visible without spoiler) --
-        # Слайдер прозрачности и кнопка «Показать/Скрыть снимок» вынесены из
-        # «Дополнительно» наверх — пользователю не нужно разворачивать
-        # секцию, чтобы получить к ним доступ при работе со stand- или
-        # серверной depth-записью.
-        self._top_ref_controls = QWidget()
-        self._top_ref_controls.setStyleSheet("background: transparent;")
-        self._top_ref_controls.setEnabled(False)
-        trc = QVBoxLayout(self._top_ref_controls)
-        trc.setContentsMargins(0, 0, 0, 0)
-        trc.setSpacing(8)
+        self.btn_ref_toggle.toggled.connect(_on_toggle)
+        lay.addLayout(self._section("Снимок поверх вида", self.btn_ref_toggle))
 
-        op_row = QHBoxLayout()
-        op_row.setContentsMargins(0, 0, 0, 0)
-        op_row.setSpacing(8)
-
+        self._top_ref_controls = Card()
         self.ref_opacity_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ref_opacity_slider.setRange(0, 100)   # percent (0 = invisible)
+        self.ref_opacity_slider.setRange(0, 100)
         self.ref_opacity_slider.setValue(50)
-        self.ref_opacity_slider.setFixedHeight(18)
-        self.ref_opacity_slider.setStyleSheet(self._thin_slider_qss())
-
-        self.ref_opacity_lbl = _value_lbl("50%")
+        self.ref_opacity_lbl = self._value_label("50%")
 
         def _on_opacity(val: int):
             self.ref_opacity_lbl.setText(f"{int(val)}%")
             self.referenceOpacityChanged.emit(float(val) / 100.0)
 
         self.ref_opacity_slider.valueChanged.connect(_on_opacity)
+        self._top_ref_controls.add(self._field_row(
+            "halfcircle", "Прозрачность снимка", self.ref_opacity_slider,
+            self.ref_opacity_lbl))
+        lay.addWidget(self._top_ref_controls)
 
-        op_row.addWidget(_caption("ПРОЗР"), 0, Qt.AlignmentFlag.AlignVCenter)
-        op_row.addWidget(self.ref_opacity_slider, 1,
-                         Qt.AlignmentFlag.AlignVCenter)
-        op_row.addWidget(self.ref_opacity_lbl, 0,
-                         Qt.AlignmentFlag.AlignVCenter)
-        trc.addLayout(op_row)
-
-        self.btn_ref_toggle = QPushButton("Скрыть снимок")
-        self.btn_ref_toggle.setCheckable(True)
-        self.btn_ref_toggle.setChecked(True)
-        self.btn_ref_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ref_toggle.setStyleSheet(self._soft_accent_button_qss())
-
-        def _on_toggle(checked: bool):
-            self.btn_ref_toggle.setText(
-                "Скрыть снимок" if checked else "Показать снимок"
-            )
-            self.referenceVisibleToggled.emit(bool(checked))
-
-        self.btn_ref_toggle.toggled.connect(_on_toggle)
-        trc.addWidget(self.btn_ref_toggle)
-
-        # ----- Reference-overlay controls (stand snapshots only) ------
-        # Остаются в «Дополнительно»: точки и кнопки auto/manual picking.
+        # ---- Опорные точки ------------------------------------------------
+        lay.addLayout(self._section("Опорные точки"))
         self._ref_controls_holder = QWidget()
-        self._ref_controls_holder.setStyleSheet("background: transparent;")
-        self._ref_controls_holder.setEnabled(False)
-        rc = QVBoxLayout(self._ref_controls_holder)
-        rc.setContentsMargins(0, 0, 0, 0)
-        rc.setSpacing(8)
-
-        # ----- Bed-corner picking + reconstruction --------------------
-        pick_row = QHBoxLayout()
-        pick_row.setContentsMargins(0, 0, 0, 0)
-        pick_row.setSpacing(6)
-
-        self.btn_pick_points = QPushButton("Выбрать точки")
-        self.btn_pick_points.setCheckable(True)
-        self.btn_pick_points.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_pick_points.setToolTip(
-            "Включите и кликайте опорные точки на кузове (любое число).\n"
-            "ПКМ или Esc — завершить выбор и построить наполнение."
-        )
-        self.btn_pick_points.setStyleSheet(self._soft_accent_button_qss())
+        grid = QGridLayout(self._ref_controls_holder)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        self.btn_pick_points = TileButton(
+            "cursor", "Отметить",
+            "Кликайте опорные точки на кузове (любое число).\n"
+            "ПКМ или Esc — завершить и построить наполнение", checkable=True)
         self.btn_pick_points.toggled.connect(
-            lambda checked: self.pointPickingToggled.emit(bool(checked))
-        )
-
-        self.btn_pick_reset = QToolButton()
-        self.btn_pick_reset.setText("⟲")
-        self.btn_pick_reset.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_pick_reset.setToolTip("Сбросить точки и реконструкцию")
-        self.btn_pick_reset.setStyleSheet(
-            "QToolButton {"
-            "  background: transparent;"
-            f"  color: {COLOR_TEXT_MUTED};"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "  border-radius: 5px; padding: 4px 8px; font-size: 13px;"
-            "}"
-            "QToolButton:hover {"
-            "  background: rgba(255,255,255,8);"
-            f"  color: {COLOR_TEXT};"
-            "}"
-        )
-        self.btn_pick_reset.clicked.connect(
-            lambda _=False: self.pointsResetRequested.emit()
-        )
-
-        pick_row.addWidget(self.btn_pick_points, 1)
-        pick_row.addWidget(self.btn_pick_reset, 0)
-        rc.addLayout(pick_row)
-
-        # ----- Auto anchor-points + visualization toggle --------------
-        pts_row = QHBoxLayout()
-        pts_row.setContentsMargins(0, 0, 0, 0)
-        pts_row.setSpacing(6)
-
-        self.btn_auto_points = QPushButton("Авто-точки")
-        self.btn_auto_points.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_auto_points.setToolTip(
-            "Автоматически найти опорные точки на кузове и построить "
-            "наполнение."
-        )
-        self.btn_auto_points.setStyleSheet(self._soft_accent_button_qss())
+            lambda checked: self.pointPickingToggled.emit(bool(checked)))
+        self.btn_auto_points = TileButton(
+            "sparkles", "Авто",
+            "Найти опорные точки автоматически и построить наполнение")
         self.btn_auto_points.clicked.connect(
-            lambda _=False: self.autoPointsRequested.emit()
-        )
-
-        self.btn_point_viz = QPushButton("Точки")
-        self.btn_point_viz.setCheckable(True)
-        self.btn_point_viz.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_point_viz.setToolTip(
-            "Показать использованные опорные точки на экране (зелёные)."
-        )
-        self.btn_point_viz.setStyleSheet(self._soft_accent_button_qss())
+            lambda _=False: self.autoPointsRequested.emit())
+        self.btn_point_viz = TileButton(
+            "target", "Показать", "Показать использованные опорные точки",
+            checkable=True)
         self.btn_point_viz.toggled.connect(
-            lambda checked: self.pointVizToggled.emit(bool(checked))
-        )
+            lambda checked: self.pointVizToggled.emit(bool(checked)))
+        self.btn_pick_reset = TileButton(
+            "rotate_ccw", "Сброс", "Сбросить точки и реконструкцию")
+        self.btn_pick_reset.clicked.connect(
+            lambda _=False: self.pointsResetRequested.emit())
+        for i, b in enumerate((self.btn_pick_points, self.btn_auto_points,
+                               self.btn_point_viz, self.btn_pick_reset)):
+            grid.addWidget(b, 0, i)
+        lay.addWidget(self._ref_controls_holder)
 
-        pts_row.addWidget(self.btn_auto_points, 1)
-        pts_row.addWidget(self.btn_point_viz, 0)
-        rc.addLayout(pts_row)
+        self._ref_hint = QLabel(
+            "Выберите снимок стенда или карту глубины во вкладке «Записи» — "
+            "здесь станут доступны подложка и опорные точки.")
+        self._ref_hint.setProperty("role", "caption")
+        self._ref_hint.setWordWrap(True)
+        self._ref_hint.setContentsMargins(4, 4, 4, 0)
+        lay.addWidget(self._ref_hint)
+        lay.addStretch(1)
 
-        ah.addWidget(self._ref_controls_holder)
+        self._set_ref_enabled(False)
+        return page
 
-        # ----- Collapsible "Дополнительно" section --------------------
-        # FOV, roll, overlay opacity/visibility, manual/auto point picking and
-        # the point visualisation all live behind a disclosure toggle so the
-        # main camera card stays clean. Collapsed by default.
-        self._adv_toggle = QToolButton()
-        self._adv_toggle.setText("  Дополнительно")
-        self._adv_toggle.setCheckable(True)
-        self._adv_toggle.setChecked(False)
-        self._adv_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._adv_toggle.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
-        )
-        self._adv_toggle.setArrowType(Qt.ArrowType.RightArrow)
-        self._adv_toggle.setToolTip(
-            "FOV, крен, наложение снимка, ручной/авто выбор опорных точек, "
-            "визуализация точек."
-        )
-        self._adv_toggle.setStyleSheet(
-            "QToolButton {"
-            "  background: transparent;"
-            f"  color: {COLOR_TEXT_MUTED};"
-            "  border: none; padding: 2px 0;"
-            "  font-size: 10px; font-weight: 600; letter-spacing: 1.0px;"
-            "}"
-            f"QToolButton:hover {{ color: {COLOR_TEXT}; }}"
-        )
+    def _set_ref_enabled(self, on: bool) -> None:
+        # Заливка слайдера не реагирует на :disabled из общей таблицы
+        # стилей — гасим её явно.
+        self.ref_opacity_slider.setStyleSheet(
+            "" if on else "QSlider::sub-page:horizontal { background: #48484A; }")
+        self._top_ref_controls.setEnabled(on)
+        self._ref_controls_holder.setEnabled(on)
+        self.btn_ref_toggle.setEnabled(on)
+        self._ref_hint.setVisible(not on)
 
-        def _on_adv_toggled(checked: bool):
-            self._adv_holder.setVisible(bool(checked))
-            self._adv_toggle.setArrowType(
-                Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
-            )
-            if hasattr(self, "_reposition"):
-                try:
-                    self._reposition()
-                except Exception:
-                    pass
+    # ==================================================================
+    # Вкладка «Датасет»
+    # ==================================================================
+    _OUTPUT_META = {
+        "color":        ("photo",  "Цвет"),
+        "depth":        ("depth",  "Глубина"),
+        "segmentation": ("mask",   "Маска"),
+        "lidar":        ("lidar",  "Лидар"),
+        "json":         ("braces", "JSON"),
+    }
 
-        self._adv_toggle.toggled.connect(_on_adv_toggled)
+    def _build_dataset_page(self) -> QWidget:
+        page, lay = self._page()
+        lay.addWidget(self._title("Датасет"))
+        lay.addLayout(self._section("Что будет снято"))
 
-        # Collapsed initially: the advanced controls are hidden until expanded.
-        self._adv_holder.setVisible(False)
+        card = Card(padding=(14, 12, 12, 12), spacing=10)
+        metric_row = QHBoxLayout()
+        metric_row.setSpacing(6)
+        self.lbl_ds_total = QLabel("—")
+        self.lbl_ds_total.setProperty("role", "metric")
+        metric_row.addWidget(self.lbl_ds_total, 0, Qt.AlignmentFlag.AlignBottom)
+        unit = QLabel("кадров")
+        unit.setProperty("role", "metric-unit")
+        metric_row.addWidget(unit, 0, Qt.AlignmentFlag.AlignBottom)
+        metric_row.addStretch(1)
+        self.lbl_ds_formula = label("", mono=True, size=12, color=COLOR_TEXT_MUTED)
+        self.lbl_ds_formula.setToolTip("наполнений × кадров с каждого")
+        metric_row.addWidget(self.lbl_ds_formula, 0, Qt.AlignmentFlag.AlignBottom)
+        card.add(metric_row)
 
-        # Top reference controls (ползунок прозрачности + show/hide) — над
-        # «Дополнительно», всегда видимы (включаются при выборе stand/depth).
-        v.addWidget(self._top_ref_controls)
-        v.addWidget(self._adv_toggle)
-        v.addWidget(self._adv_holder)
-        return holder
+        self._ds_chips = QWidget()
+        self._ds_chips_lay = QGridLayout(self._ds_chips)
+        self._ds_chips_lay.setContentsMargins(0, 0, 0, 0)
+        self._ds_chips_lay.setHorizontalSpacing(6)
+        self._ds_chips_lay.setVerticalSpacing(6)
+        card.add(self._ds_chips)
+        card.add(hline())
 
+        self.lbl_ds_dir = label("", role="caption")
+        self.lbl_ds_dir.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.btn_ds_open = IconButton("arrow_up_right", "Открыть папку",
+                                      size=24, icon_size=14,
+                                      color=COLOR_TEXT_MUTED)
+        self.btn_ds_open.clicked.connect(self._open_dataset_dir)
+        card.add(self._field_row("folder", "Папка датасета", self.lbl_ds_dir,
+                                 self.btn_ds_open))
+        lay.addWidget(card)
+
+        lay.addSpacing(6)
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        self.btn_dataset_setup = QPushButton("Настроить")
+        self.btn_dataset_setup.setIcon(icons.icon("sliders", COLOR_TEXT, 15))
+        self.btn_dataset_setup.setIconSize(QSize(15, 15))
+        self.btn_dataset_setup.setMinimumHeight(38)
+        self.btn_dataset_setup.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dataset_setup.setToolTip(
+            "Что сохранять, куда, как варьировать наполнение, камеру и свет")
+        self.btn_dataset_setup.clicked.connect(self.datasetSettingsRequested.emit)
+        self.btn_dataset_start = QPushButton("Снять")
+        self.btn_dataset_start.setProperty("variant", "primary")
+        self.btn_dataset_start.setIcon(icons.icon("record", "#FFFFFF", 15,
+                                                  active_color="#FFFFFF"))
+        self.btn_dataset_start.setIconSize(QSize(15, 15))
+        self.btn_dataset_start.setMinimumHeight(38)
+        self.btn_dataset_start.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dataset_start.setToolTip("Запустить съёмку с текущими настройками")
+        self.btn_dataset_start.clicked.connect(self.datasetStartRequested.emit)
+        btns.addWidget(self.btn_dataset_setup, 1)
+        btns.addWidget(self.btn_dataset_start, 1)
+        lay.addLayout(btns)
+        lay.addStretch(1)
+        self._ds_dir_full = ""
+        return page
+
+    def set_dataset_summary(self, count: int, per_fill: int, total: int,
+                            outputs, out_dir: str) -> None:
+        """Сводка на вкладке «Датасет» (зовёт MainWindow после правки конфига)."""
+        self.lbl_ds_total.setText(str(total))
+        self.lbl_ds_formula.setText(f"{count} × {per_fill}")
+        while self._ds_chips_lay.count():
+            item = self._ds_chips_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        row = None
+        for i, key in enumerate(outputs):
+            ic, text = self._OUTPUT_META.get(key, ("doc", key))
+            if i % 3 == 0:
+                holder = QWidget()
+                row = QHBoxLayout(holder)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(6)
+                row.addStretch(1)
+                self._ds_chips_lay.addWidget(holder, i // 3, 0)
+                # новые чипы встают перед распоркой — ряд прижат влево
+            chip = Chip(ic, text)
+            row.insertWidget(row.count() - 1, chip)
+        self._ds_dir_full = str(out_dir or "")
+        self.lbl_ds_dir.setText(_elide(self._ds_dir_full, self.lbl_ds_dir.font(),
+                                       self.PANEL_WIDTH - 130,
+                                       Qt.TextElideMode.ElideMiddle))
+        self.lbl_ds_dir.setToolTip(self._ds_dir_full)
+
+    def set_dataset_error(self, text: str) -> None:
+        self.lbl_ds_total.setText("—")
+        self.lbl_ds_formula.setText("")
+        self.lbl_ds_dir.setText(text)
+
+    def _open_dataset_dir(self) -> None:
+        path = self._ds_dir_full
+        if not path:
+            return
+        if not os.path.isabs(path):
+            path = os.path.join(PROJECT_ROOT, path)
+        try:
+            os.makedirs(path, exist_ok=True)
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception as exc:
+            print(f"[RightPanel] папка датасета не открылась: {exc}")
+
+    # ==================================================================
+    # Качество графики
+    # ==================================================================
+    def _show_graphics_menu(self) -> None:
+        cur = graphics_settings.load_saved() or graphics_settings.DEFAULT_PRESET
+        menu = QMenu(self)
+        head = menu.addAction("Качество графики")
+        head.setEnabled(False)
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for pkey in graphics_settings.PRESET_ORDER:
+            act = menu.addAction(graphics_settings.PRESETS[pkey]["name"])
+            act.setCheckable(True)
+            act.setChecked(pkey == cur)
+            act.setData(pkey)
+            group.addAction(act)
+        menu.addSeparator()
+        note = menu.addAction("Применится после перезапуска")
+        note.setEnabled(False)
+        chosen = menu.exec(self.btn_graphics.mapToGlobal(
+            QPoint(self.btn_graphics.width() - 4, self.btn_graphics.height() + 4))
+            - QPoint(menu.sizeHint().width(), 0))
+        if chosen is not None and chosen.data() and chosen.data() != cur:
+            self.graphicsPresetChanged.emit(str(chosen.data()))
+
+    # ==================================================================
+    # Состояние выбора точек / объектива (зовёт MainWindow)
+    # ==================================================================
     def set_point_count(self, n: int) -> None:
-        """Update the pick-button label with the current point count."""
-        btn = getattr(self, "btn_pick_points", None)
-        if btn is not None:
-            n = max(0, int(n))
-            btn.setText("Выбрать точки" if n == 0
-                        else f"Выбрать точки ({n})")
+        n = max(0, int(n))
+        self.btn_pick_points.set_badge(str(n) if n else "")
 
     def set_picking_active(self, active: bool) -> None:
-        """Reflect picking state on the toggle without re-emitting."""
-        btn = getattr(self, "btn_pick_points", None)
-        if btn is None:
-            return
+        btn = self.btn_pick_points
         blocked = btn.blockSignals(True)
         btn.setChecked(bool(active))
         btn.blockSignals(blocked)
+        btn.update()
 
     def set_fov_value(self, fov: float) -> None:
-        """Sync the FOV slider to an externally-applied lens FOV without
-        re-emitting `fovChanged` (used when camera modes change FOV)."""
-        sl = getattr(self, "fov_slider", None)
-        if sl is None:
-            return
+        """Отразить FOV, выставленный кодом, без повторного fovChanged."""
         try:
             v = int(round(float(fov)))
         except (TypeError, ValueError):
             return
         v = max(self._FOV_MIN, min(self._FOV_MAX, v))
-        blocked = sl.blockSignals(True)
-        sl.setValue(v)
-        sl.blockSignals(blocked)
-        if hasattr(self, "fov_value_lbl"):
-            self.fov_value_lbl.setText(f"{v}°")
+        blocked = self.fov_slider.blockSignals(True)
+        self.fov_slider.setValue(v)
+        self.fov_slider.blockSignals(blocked)
+        self.fov_value_lbl.setText(f"{v}°")
 
     def set_roll_value(self, roll: float) -> None:
-        """Sync the roll dial to an externally-applied camera roll without
-        re-emitting `rollChanged` (used when camera modes / presets set
-        roll)."""
-        d = getattr(self, "roll_dial", None)
-        if d is None:
-            return
+        """Отразить крен, выставленный кодом, без повторного rollChanged."""
         try:
             v = int(round(float(roll)))
         except (TypeError, ValueError):
             return
-        # Normalise into the dial's [-180, 180] wrapping range.
         while v > self._ROLL_MAX:
             v -= 360
         while v < self._ROLL_MIN:
             v += 360
-        blocked = d.blockSignals(True)
-        d.setValue(v)
-        d.blockSignals(blocked)
-        if hasattr(self, "roll_value_lbl"):
-            self.roll_value_lbl.setText(f"{v}°")
-
-    # ------------------------------------------------------------------
-    # IQoko-style card builders (replacing the old QGroupBox approach).
-    # ------------------------------------------------------------------
-    def _make_card(self, title: str, content: QWidget,
-                   status: str = "", stretch: bool = False) -> QFrame:
-        """
-        Card = small QFrame with translucent fill + hairline border +
-        radius. Header is a small-caps eyebrow on the left and an
-        optional monospace status string on the right (e.g. "v1.4",
-        "Target", record count).
-        """
-        card = QFrame()
-        card.setObjectName("PanelCard")
-        card.setStyleSheet(
-            "QFrame#PanelCard {"
-            "  background-color: rgba(22, 22, 22, 0.55);"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "  border-radius: 10px;"
-            "}"
-        )
-        v = QVBoxLayout(card)
-        v.setContentsMargins(12, 10, 12, 12)
-        v.setSpacing(8)
-
-        head = QHBoxLayout()
-        head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(8)
-
-        t = QLabel(title.upper())
-        t.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font-size: 10px;"
-            f" font-weight: 600; letter-spacing: 1.2px;"
-        )
-        head.addWidget(t)
-        head.addStretch(1)
-        if status:
-            s = QLabel(status)
-            s.setStyleSheet(
-                f"color: {COLOR_TEXT_DIM}; font-size: 10px;"
-                f" font-family: 'Geist Mono','JetBrains Mono',monospace;"
-            )
-            head.addWidget(s)
-            # Ссылка на ярлык статуса: некоторым карточкам (например, счётчику
-            # наборов моделей) его приходится обновлять на лету.
-            card.status_label = s
-        v.addLayout(head)
-
-        if stretch:
-            v.addWidget(content, 1)
-        else:
-            v.addWidget(content)
-        return card
-
-    def _make_row(self, label: str, widget: QWidget) -> QWidget:
-        """88px-label + field row, no hint underneath. Mirrors IQoko's
-        `.row { grid-template-columns: 88px 1fr }` block."""
-        w = QWidget()
-        from PyQt6.QtWidgets import QGridLayout
-        g = QGridLayout(w)
-        g.setContentsMargins(0, 0, 0, 0)
-        g.setHorizontalSpacing(10)
-        g.setVerticalSpacing(0)
-
-        lbl = QLabel(label)
-        lbl.setStyleSheet(
-            f"color: {COLOR_TEXT_MUTED}; font-size: 11px;"
-        )
-        g.addWidget(lbl, 0, 0, Qt.AlignmentFlag.AlignVCenter)
-        g.addWidget(widget, 0, 1, Qt.AlignmentFlag.AlignVCenter)
-        g.setColumnMinimumWidth(0, 70)
-        g.setColumnStretch(1, 1)
-        return w
-
-    # ---- Legacy stubs (kept for backwards compatibility) ------------
-    def _wrap_group(self, title: str, content: QWidget,
-                    content_height: int | None = None) -> QFrame:
-        return self._make_card(title, content)
-
-    def _build_combo_section(self, combo: QComboBox, hint: str = "") -> QWidget:
-        return self._make_row("", combo)
-
-    def _build_target_section(self, spin: QDoubleSpinBox) -> QWidget:
-        return self._make_row("Volume", spin)
+        blocked = self.roll_slider.blockSignals(True)
+        self.roll_slider.setValue(v)
+        self.roll_slider.blockSignals(blocked)
+        self.roll_value_lbl.setText(f"{v}°")
 
     # ==================================================================
-    # Reconstruction list helpers
+    # Список записей
     # ==================================================================
     def _on_recon_changed(self, current: QListWidgetItem | None, _prev) -> None:
         if current is None:
@@ -1878,17 +1128,12 @@ class RightPanel(QWidget):
         rec = self._recons[idx]
         self._selected_rec = rec
         self._populate_details(rec)
-        if hasattr(self, "btn_run_recon"):
-            self.btn_run_recon.setEnabled(True)
+        self.btn_run_recon.setEnabled(True)
         self.reconstructionSelected.emit(str(rec.name))
         self._emit_stand_reference(rec)
 
     def _on_recon_clicked(self, item: QListWidgetItem) -> None:
-        """
-        Click on a row now ONLY selects (caches the rec for the Details
-        card + Run-reconstruction button) - the actual reconstruction
-        pipeline is triggered explicitly by `btn_run_recon`.
-        """
+        """Клик только выбирает запись; реконструкцию запускает кнопка."""
         if item is None:
             return
         idx = item.data(Qt.ItemDataRole.UserRole)
@@ -1896,26 +1141,22 @@ class RightPanel(QWidget):
             return
         self._selected_rec = self._recons[idx]
         self._populate_details(self._selected_rec)
-        if hasattr(self, "btn_run_recon"):
-            self.btn_run_recon.setEnabled(True)
+        self.btn_run_recon.setEnabled(True)
         self._emit_stand_reference(self._selected_rec)
 
     def _emit_stand_reference(self, rec: Reconstruction | None) -> None:
-        """Tell the MainWindow to show the alignment overlay for `stand`
-        snapshots ИЛИ серверных depth-записей (data_type='depth' — поведение
-        в UI такое же: выбор + кнопка «Реконструировать»)."""
+        """Снимок стенда или серверная карта глубины включает подложку и
+        опорные точки на вкладке «Камера» (на её иконке — точка-подсказка)."""
         is_ref = bool(rec is not None and rec.data_type in ("stand", "depth"))
         self.standReferenceSelected.emit(rec if is_ref else None)
-        if hasattr(self, "_ref_controls_holder"):
-            self._ref_controls_holder.setEnabled(is_ref)
-        # Внешний (top) блок с ползунком прозрачности и кнопкой
-        # show/hide — синхронно включается/выключается с тем же набором
-        # типов записей.
-        if hasattr(self, "_top_ref_controls"):
-            self._top_ref_controls.setEnabled(is_ref)
+        was = self._top_ref_controls.isEnabled()
+        self._set_ref_enabled(is_ref)
+        if is_ref and not was and self.tabs.current() != "camera":
+            self.tabs.set_badge("camera", True)
+        if not is_ref:
+            self.tabs.set_badge("camera", False)
 
     def _on_recon_context_menu(self, pos: QPoint) -> None:
-        """Right-click menu on a recon row: copy its file name to clipboard."""
         item = self.lst_recon.itemAt(pos)
         if item is None:
             return
@@ -1924,293 +1165,107 @@ class RightPanel(QWidget):
             return
         rec = self._recons[idx]
         name = str(rec.name or "").strip()
-        if not name:
-            return
-
         menu = QMenu(self.lst_recon)
-        act_copy = menu.addAction("Скопировать имя файла")
+        act_view = menu.addAction(icons.icon("zoom_in", COLOR_TEXT, 16),
+                                  "Снимок и подробности")
+        act_copy = menu.addAction(icons.icon("copy", COLOR_TEXT, 16),
+                                  "Скопировать имя файла")
+        act_copy.setEnabled(bool(name))
         chosen = menu.exec(self.lst_recon.viewport().mapToGlobal(pos))
         if chosen is act_copy:
             QApplication.clipboard().setText(name)
+        elif chosen is act_view:
+            self._on_view_requested(idx)
 
     def _on_view_requested(self, idx: int) -> None:
-        """
-        Per-row "open" button handler — pops the photo viewer modal over
-        the main window. Selects the row first so the side panel's
-        Details section stays in sync.
-        """
         if not (0 <= idx < len(self._recons)):
             return
         self.lst_recon.setCurrentRow(idx)
-        rec = self._recons[idx]
-        # Anchor the dialog on the main top-level window so its modality
-        # blocks the right tool app correctly and `geometry()` covers the
-        # full window.
         owner_top = self._owner.window() if self._owner else None
-        dlg = RecordPhotoOverlay(rec, parent=owner_top)
-        # The dialog is modal-app — input is blocked everywhere else,
-        # but the right panel is allowed to stay visible behind it
-        # (looks cleaner: the user keeps their context).
+        dlg = RecordPhotoOverlay(self._recons[idx], parent=owner_top)
         try:
             dlg.exec()
         finally:
             self._reposition()
             self.raise_()
 
-    # ==================================================================
-    # Details population
-    # ==================================================================
-    # ------------------------------------------------------------------
     def cinematic_enabled(self) -> bool:
-        chk = getattr(self, "chk_cinematic", None)
-        return bool(chk is not None and chk.isChecked())
+        return bool(self.chk_cinematic.isChecked())
 
     def _emit_recon_run_requested(self) -> None:
-        """Fire the reconstructionRunRequested signal for the selected row."""
         rec = getattr(self, "_selected_rec", None)
-        if rec is None:
-            return
-        self.reconstructionRunRequested.emit(rec)
+        if rec is not None:
+            self.reconstructionRunRequested.emit(rec)
 
-    # ------------------------------------------------------------------
     def _on_load_more(self) -> None:
-        """
-        Pull a larger page of reconstructions from the server and rebuild
-        the list widget with the merged set, preserving the current
-        selection if possible.
-        """
-        # Track current paging cap on the panel - bumps by RECON_PAGE_SIZE
-        # each click.
-        new_limit = getattr(self, "_recon_limit",
-                            RECON_PAGE_SIZE) + RECON_PAGE_SIZE
+        """Подтянуть ещё страницу записей, сохранив выбор."""
+        new_limit = getattr(self, "_recon_limit", RECON_PAGE_SIZE) + RECON_PAGE_SIZE
         self._recon_limit = new_limit
+        self.btn_load_more.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.btn_load_more.setEnabled(False)
-            self.btn_load_more.setText("Загрузка...")
             new_recons = load_reconstructions(limit=new_limit)
         except Exception as exc:
             print(f"[RightPanel] load_reconstructions failed: {exc}")
-            self.btn_load_more.setEnabled(True)
-            self.btn_load_more.setText("Загрузить ещё")
             return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.btn_load_more.setEnabled(True)
 
-        # Rebuild the list widget contents.
-        sel_name = (self._selected_rec.name
-                    if getattr(self, "_selected_rec", None) else None)
-        self.lst_recon.clear()
+        sel_name = getattr(self._selected_rec, "name", None) if self._selected_rec else None
         self._recons = new_recons
-        row_text_width = self.PANEL_WIDTH - 28 - 14 - 30 - 34
+        self._fill_recon_list()
         if self._recons:
-            for idx, rec in enumerate(self._recons):
-                row_w = ReconRowWidget(rec, max_text_width=row_text_width)
-                row_w.viewClicked.connect(
-                    lambda i=idx: self._on_view_requested(i)
-                )
-                item = QListWidgetItem()
-                item.setSizeHint(QSize(0, row_w.ROW_FIXED_HEIGHT))
-                item.setData(Qt.ItemDataRole.UserRole, idx)
-                self.lst_recon.addItem(item)
-                self.lst_recon.setItemWidget(item, row_w)
-
-            # Restore selection by name if possible.
+            row = 0
             if sel_name:
                 for i, r in enumerate(self._recons):
                     if r.name == sel_name:
-                        self.lst_recon.setCurrentRow(i)
+                        row = i
                         break
-                else:
-                    self.lst_recon.setCurrentRow(0)
-            else:
-                self.lst_recon.setCurrentRow(0)
-
-        # Refresh the recon card header status.
-        try:
-            self._refresh_recon_card_count()
-        except Exception:
-            pass
-
-        self.btn_load_more.setEnabled(True)
-        self.btn_load_more.setText("Load more")
+            self.lst_recon.setCurrentRow(row)
 
     def _refresh_recon_card_count(self) -> None:
-        """Update the small status label on the Recon card header."""
-        if not hasattr(self, "_recon_card"):
-            return
-        # The card header is `head -> [title, addStretch, status_label]`
-        # (see _make_card). We just rewalk it to find the second QLabel.
-        try:
-            head = self._recon_card.layout().itemAt(0).layout()
-            for i in range(head.count()):
-                w = head.itemAt(i).widget()
-                if isinstance(w, QLabel) and w.styleSheet().find(
-                        "Geist Mono") != -1:
-                    w.setText(str(len(self._recons)))
-                    return
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _soft_accent_button_qss(strong: bool = False) -> str:
-        """
-        IQoko-style soft accent button. `strong=True` for the primary
-        Run footer button (more saturated fill so it reads as the main
-        action); the default flavour is for secondary actions like
-        "Run reconstruction".
-        """
-        bg_a = "rgba(0, 255, 136, 50)" if strong else "rgba(0, 255, 136, 30)"
-        bg_h = "rgba(0, 255, 136, 90)" if strong else "rgba(0, 255, 136, 55)"
-        return (
-            "QPushButton {"
-            f"  background-color: {bg_a};"
-            f"  color: {COLOR_TEXT};"
-            f"  border: 1px solid {COLOR_ACCENT};"
-            "  border-radius: 6px;"
-            "  padding: 6px 14px;"
-            "  font-weight: 600;"
-            "  letter-spacing: 0.3px;"
-            "}"
-            "QPushButton:hover {"
-            f"  background-color: {bg_h};"
-            "}"
-            "QPushButton:pressed {"
-            "  background-color: rgba(0, 255, 136, 110);"
-            "}"
-            "QPushButton:disabled {"
-            "  background-color: rgba(255, 255, 255, 4);"
-            f"  color: {COLOR_TEXT_DIM};"
-            f"  border: 1px solid {COLOR_HAIRLINE};"
-            "}"
-        )
+        self.lbl_recon_count.setText(str(len(self._recons or [])))
 
     def _populate_details(self, rec: Reconstruction | None) -> None:
-        """Render the Details form for one reconstruction (or empty state)."""
-        # Clear existing rows.
-        while self._details_form.rowCount():
-            self._details_form.removeRow(0)
-
         if rec is None:
-            empty = QLabel("Выберите запись, чтобы увидеть подробности.")
-            empty.setProperty("role", "muted")
-            empty.setWordWrap(True)
-            self._details_form.addRow(empty)
+            self._details.hide()
             return
-
-        # Type chip — accent for height/stand, idle for ply, warn otherwise.
-        type_chip_role = (
-            "chip-live" if rec.data_type in ("height", "stand")
-            else "chip-idle" if rec.data_type == "ply"
-            else "chip-err"
-        )
-
-        target_str = (
-            f"{rec.target_volume:.2f} m³"
-            if rec.target_volume is not None
-            else "—"
-        )
-        time_str = _format_short_dt(rec)
-
-        rows: list[tuple[str, str, str | None]] = [
-            ("А/Н",     rec.car_number or "—",                None),
-            ("МОДЕЛЬ",  rec.model or "—",                     None),
-            ("ТИП",     (rec.data_type or "—").upper(),       type_chip_role),
-            ("НАПОЛНИТЕЛЬ", rec.filler or "—",                None),
-            ("ЦЕЛЕВОЙ ОБЪЁМ", target_str,                     None),
-            ("ВРЕМЯ",   time_str,                             None),
-            ("ФАЙЛ",    rec.name or "—",                      None),
-        ]
-        # Cap value-cell width so long strings wrap inside the panel
-        # instead of pushing the form rightwards.
-        value_cap = self.PANEL_WIDTH - 40 - 70  # card margins + label col
-
-        # Map chip-role -> colour so TYPE keeps its visual cue without
-        # a bordered chip (the bordered pill clashed with the rest of
-        # the borderless rows in the Details card).
-        _chip_color = {
-            "chip-live": COLOR_ACCENT,
-            "chip-idle": COLOR_TEXT_MUTED,
-            "chip-err":  COLOR_WARN,
+        self._details.show()
+        target = (f"{rec.target_volume:.2f} м³"
+                  if rec.target_volume is not None else "—")
+        values = {
+            "model": rec.model or "—",
+            "filler": rec.filler or "—",
+            "target": target,
+            "time": _format_short_dt(rec),
         }
+        width = self.PANEL_WIDTH - 28 - 24 - 30
+        for key, v in values.items():
+            lbl = self._details_rows[key]
+            lbl.setText(_elide(v, lbl.font(), width))
+            lbl.setToolTip(v)
+        name = rec.name or "—"
+        self._file_lbl.setText(_elide(name, self._file_lbl.font(), width - 34,
+                                      Qt.TextElideMode.ElideMiddle))
+        self._file_lbl.setToolTip(name)
+        self._btn_copy.setEnabled(bool(rec.name))
 
-        for label, value, chip_role in rows:
-            k = QLabel(label)
-            k.setProperty("role", "eyebrow")
-
-            v = QLabel(value)
-            v.setWordWrap(True)
-            v.setMaximumWidth(value_cap)
-
-            if chip_role is not None and chip_role in _chip_color:
-                col = _chip_color[chip_role]
-                v.setStyleSheet(
-                    f"color: {col}; font-family: {FONT_MONO};"
-                    f"font-size: 11px; font-weight: 600;"
-                    f"background: transparent; border: none; padding: 0;"
-                )
-            else:
-                v.setProperty("role", "muted")
-
-            if label == "ФАЙЛ" and value and value != "—":
-                # Pair the file name with a small copy-to-clipboard button.
-                # The button is allowed to be QLabel-sized so it lines up
-                # with the first text line even when the file name wraps.
-                v.setTextInteractionFlags(
-                    Qt.TextInteractionFlag.TextSelectableByMouse
-                )
-                cell = QWidget()
-                cell_lay = QHBoxLayout(cell)
-                cell_lay.setContentsMargins(0, 0, 0, 0)
-                cell_lay.setSpacing(6)
-                cell_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
-                cell_lay.addWidget(v, 1)
-
-                btn_copy = QPushButton()
-                btn_copy.setIcon(_make_copy_icon(14, COLOR_TEXT_MUTED))
-                btn_copy.setIconSize(QSize(14, 14))
-                btn_copy.setFixedSize(22, 22)
-                btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn_copy.setToolTip("Скопировать имя файла")
-                btn_copy.setStyleSheet(
-                    "QPushButton {"
-                    "  background: transparent;"
-                    "  border: 1px solid transparent; border-radius: 5px;"
-                    "  padding: 0; min-width: 22px; max-width: 22px;"
-                    "  min-height: 22px; max-height: 22px;"
-                    "}"
-                    "QPushButton:hover {"
-                    "  background-color: rgba(255,255,255,12);"
-                    f"  border-color: {COLOR_HAIRLINE};"
-                    "}"
-                    "QPushButton:pressed {"
-                    "  background-color: rgba(0,255,136,18);"
-                    f"  border-color: {COLOR_ACCENT};"
-                    "}"
-                )
-                btn_copy.clicked.connect(
-                    lambda _checked=False, _name=value, _b=btn_copy:
-                        self._copy_filename_to_clipboard(_name, _b)
-                )
-                cell_lay.addWidget(btn_copy, 0, Qt.AlignmentFlag.AlignTop)
-                self._details_form.addRow(k, cell)
-            else:
-                self._details_form.addRow(k, v)
-
-    def _copy_filename_to_clipboard(self, name: str,
-                                    btn: QPushButton) -> None:
-        """Copy `name` to clipboard and briefly flash the button tooltip."""
+    def _copy_filename_to_clipboard(self, name: str, btn) -> None:
+        if not name:
+            return
         QApplication.clipboard().setText(name)
+        btn.set_icon("check")
         btn.setToolTip("Скопировано")
-        QTimer.singleShot(
-            1200,
-            lambda b=btn: b.setToolTip("Скопировать имя файла"),
-        )
+        QTimer.singleShot(1200, lambda b=btn: (
+            b.set_icon("copy"), b.setToolTip("Скопировать имя файла")))
 
     # ==================================================================
-    # Combo handlers
+    # Модели / текстуры
     # ==================================================================
     @staticmethod
     def _model_count_label(count: int) -> str:
-        """«12 наборов» с правильным падежом — статус карточки моделей."""
+        """«12 наборов» с правильным падежом."""
         tail = count % 100
         if 11 <= tail <= 14:
             word = "наборов"
@@ -2222,26 +1277,40 @@ class RightPanel(QWidget):
             word = "наборов"
         return f"{count} {word}"
 
-    def _set_model_card_status(self, text: str) -> None:
-        label = getattr(getattr(self, "_model_card", None),
-                        "status_label", None)
-        if label is not None:
-            label.setText(text)
+    def _refresh_model_spec(self) -> None:
+        spec = getattr(self, "_spec_rows", None)
+        if not spec:
+            return
+        info = self.cmb_model.current_info()
+        if info is None:
+            self._spec.hide()
+            return
+        self._spec.show()
+        vol = (f"{info.volume:.2f}".rstrip("0").rstrip(".") + " м³"
+               if info.volume is not None else "—")
+        dims = (" × ".join(f"{v:.2f}" for v in info.dims)
+                if info.dims else "—")
+        values = {
+            "volume": (vol, info.volume_kind or ""),
+            "axles": (info.axles or info.chassis or "—", ""),
+            "dims": (dims, "Д × Ш × В" if info.dims else ""),
+            "kit": (info.kit, info.source_label),
+        }
+        for key, (text, note) in values.items():
+            v, n = spec[key]
+            v.setText(text)
+            n.setText(note)
 
     def _on_model_index_changed(self, idx: int) -> None:
-        """
-        Translate combo index to backend key, sync the target-volume
-        spinbox to the new model's `max_volume`, and emit modelSetChanged.
-        """
+        self._refresh_model_spec()
         key = self.cmb_model.itemData(idx)
-        if key and hasattr(self, "spn_target"):
+        if key:
             mc = get_model_set_config(str(key))
             if mc and mc.get("max_volume") is not None:
                 try:
                     self.spn_target.setValue(float(mc["max_volume"]))
                 except (TypeError, ValueError):
                     pass
-        if key:
             self.modelSetChanged.emit(str(key))
 
     def _on_texture_index_changed(self, idx: int) -> None:
@@ -2249,31 +1318,11 @@ class RightPanel(QWidget):
         if key:
             self.textureSetChanged.emit(str(key))
 
-    def _on_graphics_index_changed(self, idx: int) -> None:
-        key = self.cmb_graphics.itemData(idx)
-        if key:
-            self.graphicsPresetChanged.emit(str(key))
-
-    # ==================================================================
-    # External hook: пересборка списка текстурных наборов
-    # ==================================================================
     def update_texture_sets(self, texture_sets_list, default_key=None) -> None:
         """
-        Перезалить выпадающий список текстурных наборов.
-
-        Принимает список пар (key, display_name); если есть `default_key`
-        и он встречается среди ключей — именно этот элемент становится
-        выбранным. Сигнал textureSetChanged во время перезалива не
-        эмитится: подписчики получают только финальное состояние
-        (если оно отличается от исходного — через стандартный
-        currentIndexChanged).
-
-        Используется из MainWindow.attach_panda после того, как клиент
-        получил с сервера актуальный textures_napolnitel_config.json.
+        Перезалить список текстур (пары key, display). Сигнал на время
+        перезалива заблокирован — подписчики увидят только итог.
         """
-        if not hasattr(self, "cmb_texture"):
-            return
-
         items = []
         for entry in (texture_sets_list or []):
             try:
@@ -2296,64 +1345,59 @@ class RightPanel(QWidget):
                 self.cmb_texture.setEnabled(True)
                 self.cmb_texture.setCurrentIndex(target_index)
             else:
-                self.cmb_texture.addItem("— текстуры не найдены —",
-                                         userData=None)
+                self.cmb_texture.addItem("Текстуры не найдены", userData=None)
                 self.cmb_texture.setEnabled(False)
         finally:
             self.cmb_texture.blockSignals(False)
 
     # ==================================================================
-    # Public accessors
+    # Генератор кузова
     # ==================================================================
     def _init_bodygen_state(self) -> None:
-        """Спросить у модуля, доступен ли он, и оформить карточку."""
         try:
             from src.bodygen import probe
             info = probe()
         except Exception as exc:
             info = {"available": False, "reason": f"модуль не загружен: {exc}"}
-
         if info.get("available"):
             chassis = ", ".join(info.get("chassis") or []) or "нет"
-            self.lbl_bodygen.setText(f"шасси: {chassis}")
+            self.btn_bodygen.setToolTip(
+                f"Собрать кузов по скану…\nШасси: {chassis}")
         else:
             self.btn_bodygen.setEnabled(False)
-            self.lbl_bodygen.setText(info.get("reason") or "недоступен")
+            self.btn_bodygen.setToolTip(
+                "Генератор кузова недоступен: "
+                + (info.get("reason") or "нет модуля"))
 
     def set_bodygen_status(self, text: str, busy: bool = False) -> None:
-        """Строка состояния под кнопкой; на время сборки кнопка блокируется."""
-        self.lbl_bodygen.setText(text)
+        """Ход сборки под выбором кузова; на время сборки кнопка заблокирована."""
         self.btn_bodygen.setEnabled(not busy)
-        self.btn_bodygen.setText("Сборка…" if busy else "Сгенерировать кузов…")
+        self.btn_bodygen.set_icon("clock" if busy else "wand")
+        self._set_status_line(text)
 
     def set_model_status(self, text: str) -> None:
-        """
-        Короткое сообщение в шапке карточки «Набор моделей» (например, итог
-        удаления). Держится до следующего `reload_model_sets`, который вернёт
-        туда счётчик наборов.
-        """
-        self._set_model_card_status(text)
+        """Короткое сообщение под выбором кузова (итог удаления, загрузки)."""
+        self._set_status_line(text)
+
+    def _set_status_line(self, text: str) -> None:
+        text = str(text or "").strip()
+        self.lbl_model_status.setText(text)
+        self.lbl_model_status.setVisible(bool(text))
 
     def reload_model_sets(self, select_key: str | None = None) -> None:
-        """
-        Перечитать список наборов моделей.
-
-        Нужен после генерации: новый комплект появляется в
-        `assets/models/trucks` уже после того, как панель построила список.
-        """
+        """Перечитать наборы моделей (после генерации / удаления / загрузки)."""
         try:
             infos = load_model_sets_detailed()
         except Exception as exc:
             print(f"[RightPanel] не удалось перечитать модели: {exc}")
             return
-
         self.cmb_model.blockSignals(True)
         self.cmb_model.clear()
         self.cmb_model.set_details(infos)
         for info in infos:
             self.cmb_model.addItem(info.display, userData=info.key)
         self.cmb_model.setEnabled(bool(infos))
-        self._set_model_card_status(self._model_count_label(len(infos)))
+        self._model_count.setText(self._model_count_label(len(infos)))
         index = 0
         if select_key:
             found = self.cmb_model.findData(select_key)
@@ -2361,6 +1405,7 @@ class RightPanel(QWidget):
                 index = found
         self.cmb_model.setCurrentIndex(index)
         self.cmb_model.blockSignals(False)
+        self._refresh_model_spec()
         if select_key and self.cmb_model.currentData() == select_key:
             self.modelSetChanged.emit(str(select_key))
 
@@ -2368,27 +1413,13 @@ class RightPanel(QWidget):
         return self.cmb_model.itemData(self.cmb_model.currentIndex())
 
     def model_info(self, key):
-        """
-        Характеристики набора по ключу (`ModelSetInfo`) или None.
-
-        Нужны диалогу загрузки в реестр: он собирает по ним и файлы комплекта,
-        и заготовку `meta`.
-        """
+        """Характеристики набора (`ModelSetInfo`) или None."""
         return self.cmb_model.info_for(key)
 
     def set_current_model_key(self, key) -> bool:
         """
-        Програмно выставить выбранный model set в комбо-боксе.
-        Используется, когда модель загружается в сцену в обход юзера
-        (например, при запуске реконструкции из JSON) — комбо тогда
-        отставал, и current_model_key() возвращал устаревшее значение.
-
-        Сигналы блокируются, чтобы не триггерить повторный
-        cache_and_load_model_set (модель уже загружена вызывающим кодом).
-        Однако спинбокс target-volume и details-форму синхронизируем
-        вручную — как это сделал бы _on_model_index_changed.
-
-        Возвращает True, если ключ найден в комбо и индекс выставлен.
+        Выставить набор в выборе без сигнала (модель уже загружена
+        вызывающим кодом), синхронизировав целевой объём.
         """
         if key is None:
             return False
@@ -2399,13 +1430,13 @@ class RightPanel(QWidget):
                     self.cmb_model.setCurrentIndex(i)
                 finally:
                     self.cmb_model.blockSignals(False)
-                if hasattr(self, "spn_target"):
-                    mc = get_model_set_config(str(key))
-                    if mc and mc.get("max_volume") is not None:
-                        try:
-                            self.spn_target.setValue(float(mc["max_volume"]))
-                        except (TypeError, ValueError):
-                            pass
+                mc = get_model_set_config(str(key))
+                if mc and mc.get("max_volume") is not None:
+                    try:
+                        self.spn_target.setValue(float(mc["max_volume"]))
+                    except (TypeError, ValueError):
+                        pass
+                self._refresh_model_spec()
                 return True
         return False
 
@@ -2419,12 +1450,11 @@ class RightPanel(QWidget):
             return 0.0
 
     def _emit_run_requested(self) -> None:
-        payload = {
+        self.runRequested.emit({
             "model_key":     self.current_model_key(),
             "texture_key":   self.current_texture_key(),
             "target_volume": self.current_target_volume(),
-        }
-        self.runRequested.emit(payload)
+        })
 
     def _reset_selections(self) -> None:
         if self.cmb_model.count():
@@ -2441,40 +1471,3 @@ class RightPanel(QWidget):
             self.cmb_texture.setCurrentIndex(0)
         if self._recons:
             self.lst_recon.setCurrentRow(0)
-
-    # ==================================================================
-    # Overlay positioning + event tracking (mirrors SceneOverlay)
-    # ==================================================================
-    def _reposition(self) -> None:
-        owner = self._owner
-        if owner is None:
-            return
-        pw, ph = owner.width(), owner.height()
-        w = self.width()
-        m = self._margin
-        h = max(120, ph - 2 * m)
-        local = QPoint(pw - w - m, m)
-        gp = owner.mapToGlobal(local)
-        self.setGeometry(gp.x(), gp.y(), w, h)
-        self.raise_()
-
-    def eventFilter(self, obj, event):
-        owner = self._owner
-        if owner is None:
-            return super().eventFilter(obj, event)
-        et = event.type()
-        top = owner.window()
-        if et in (
-            QEvent.Type.Resize,
-            QEvent.Type.Move,
-            QEvent.Type.Show,
-            QEvent.Type.WindowStateChange,
-        ):
-            self._reposition()
-        if obj is top:
-            if et == QEvent.Type.Hide:
-                self.hide()
-            elif et == QEvent.Type.Show:
-                self.show()
-                self._reposition()
-        return super().eventFilter(obj, event)

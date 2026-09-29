@@ -91,8 +91,8 @@ SOURCE_COLORS = {
     # колонка на 18 строк перетягивает на себя всё внимание.
     "server":    COLOR_ACCENT_SOFT,
     "yaml":      COLOR_TEXT_MUTED,
-    "generated": "#9B8CFF",
-    "local":     "#FFB020",
+    "generated": "#BF5AF2",
+    "local":     "#FF9F0A",
 }
 
 _EM_DASH = "—"
@@ -213,7 +213,7 @@ class _FieldButton(QPushButton):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(32)
+        self.setMinimumHeight(34)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Fixed)
         self._primary = "—"
@@ -231,48 +231,44 @@ class _FieldButton(QPushButton):
         self.update()
 
     def paintEvent(self, _event) -> None:                # noqa: N802 (Qt API)
+        from src.ui import icons
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
 
         enabled = self.isEnabled()
         hot = self._open or self.underMouse()
-        border = QColor(COLOR_ACCENT if self._open else
-                        (COLOR_HAIRLINE_HOVER if hot else COLOR_HAIRLINE))
         path = QPainterPath()
-        path.addRoundedRect(rect, 6, 6)
-        p.fillPath(path, QColor(COLOR_SURFACE_ELEVATED if hot
-                                else COLOR_SURFACE))
-        p.strokePath(path, QPen(border, 1))
+        path.addRoundedRect(rect, 7, 7)
+        p.fillPath(path, QColor(255, 255, 255, 26 if hot else 18))
+        p.strokePath(path, QPen(QColor(COLOR_ACCENT) if self._open
+                                else QColor(255, 255, 255, 16), 1))
 
-        # Левый маркер-полоска цветом источника: видно, серверный это набор
-        # или локальный, не читая текста.
+        # Точка цветом источника: серверный набор, генератор или локальный —
+        # видно, не читая текста.
+        left = rect.left() + 10
         if enabled and self._accent:
-            bar = QPainterPath()
-            bar.addRoundedRect(QRectF(rect.left() + 4, rect.center().y() - 7,
-                                      2.5, 14), 1.2, 1.2)
-            p.fillPath(bar, QColor(self._accent))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self._accent))
+            p.drawEllipse(QPointF(left + 3, rect.center().y()), 3.2, 3.2)
+            left += 13
 
-        # Правый блок: сводка + треугольник.
-        p.setFont(QFont(self.font()))
-        caret_w = 16
+        # Справа: сводка (шасси · объём) + шеврон.
         right = rect.right() - 8
-        tri = QPolygonF([QPointF(right - caret_w + 3, rect.center().y() - 2),
-                         QPointF(right - 3, rect.center().y() - 2),
-                         QPointF(right - caret_w / 2, rect.center().y() + 3.5)])
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(COLOR_ACCENT if self._open else COLOR_TEXT_MUTED))
-        p.drawPolygon(tri)
-        right -= caret_w + 2
+        chev = icons.pixmap("chevron_down",
+                            COLOR_ACCENT if self._open else COLOR_TEXT_MUTED, 12)
+        p.drawPixmap(QRectF(right - 12, rect.center().y() - 6, 12, 12), chev,
+                     QRectF(chev.rect()))
+        right -= 20
 
         if self._secondary:
             f = QFont(self.font())
-            f.setPointSizeF(max(7.0, self.font().pointSizeF() - 1))
+            f.setPixelSize(11)
             p.setFont(f)
             fm = QFontMetrics(f)
             w = min(fm.horizontalAdvance(self._secondary) + 2,
-                    rect.width() * 0.6)
-            p.setPen(QColor(COLOR_TEXT_DIM))
+                    rect.width() * 0.45)
+            p.setPen(QColor(COLOR_TEXT_MUTED))
             p.drawText(QRectF(right - w, rect.top(), w, rect.height()),
                        int(Qt.AlignmentFlag.AlignRight
                            | Qt.AlignmentFlag.AlignVCenter),
@@ -282,7 +278,6 @@ class _FieldButton(QPushButton):
 
         p.setFont(self.font())
         fm = QFontMetrics(self.font())
-        left = rect.left() + 13
         avail = max(10, right - left)
         p.setPen(QColor(COLOR_TEXT if enabled else COLOR_TEXT_DIM))
         p.drawText(QRectF(left, rect.top(), avail, rect.height()),
@@ -321,70 +316,68 @@ class _PickerPopup(QFrame):
     def _build(self) -> None:
         self.setStyleSheet(f"""
             QFrame#ModelPickerPopup {{
-                background-color: {COLOR_BG};
+                background-color: {COLOR_SURFACE};
                 border: 1px solid {COLOR_HAIRLINE_HOVER};
-                border-radius: 10px;
+                border-radius: 8px;
             }}
             QLineEdit {{
-                background-color: {COLOR_SURFACE};
-                border: 1px solid {COLOR_HAIRLINE};
-                border-radius: 6px;
+                background-color: rgba(255, 255, 255, 18);
+                border: 1px solid rgba(255, 255, 255, 14);
+                border-radius: 7px;
                 padding: 6px 10px;
                 color: {COLOR_TEXT};
             }}
             QLineEdit:focus {{ border-color: {COLOR_ACCENT}; }}
             QToolButton {{
-                background: transparent;
-                border: 1px solid {COLOR_HAIRLINE};
-                border-radius: 4px;
-                padding: 3px 9px;
-                color: {COLOR_TEXT_MUTED};
-                font-size: 11px;
+                background: rgba(118, 118, 128, 56);
+                border: none;
+                border-radius: 6px;
+                padding: 4px 10px;
+                color: {COLOR_TEXT};
+                font-size: 12px;
             }}
-            QToolButton:hover {{ border-color: {COLOR_HAIRLINE_HOVER};
-                                 color: {COLOR_TEXT}; }}
+            QToolButton:hover {{ background: rgba(118, 118, 128, 90); }}
             QToolButton:checked {{
-                border-color: {COLOR_ACCENT};
-                color: {COLOR_ACCENT};
-                background: rgba(0, 255, 136, 18);
+                background: {COLOR_ACCENT};
+                color: #FFFFFF;
             }}
             QToolButton:disabled {{
                 color: {COLOR_TEXT_DIM};
-                border-color: {COLOR_HAIRLINE};
+                background: rgba(118, 118, 128, 30);
             }}
-            QToolButton#PickerDelete:enabled {{ color: {COLOR_TEXT_MUTED}; }}
+            QToolButton#PickerDelete:enabled {{ color: {COLOR_DANGER}; }}
             QToolButton#PickerDelete:hover:enabled {{
-                border-color: {COLOR_DANGER};
-                color: {COLOR_DANGER};
+                background: rgba(255, 69, 58, 50);
             }}
             QTreeWidget {{
                 background: transparent;
                 border: none;
                 outline: 0;
                 font-size: 12px;
+                alternate-background-color: rgba(255, 255, 255, 6);
             }}
-            QTreeWidget::item {{ padding: 5px 4px; border: none; }}
-            QTreeWidget::item:hover {{ background: rgba(255, 255, 255, 10); }}
+            QTreeWidget::item {{ padding: 6px 4px; border: none; }}
+            QTreeWidget::item:hover {{ background: rgba(255, 255, 255, 12); }}
             QTreeWidget::item:selected {{
-                background: rgba(0, 255, 136, 22);
+                background: rgba(10, 132, 255, 90);
+                color: #FFFFFF;
             }}
             QHeaderView::section {{
                 background: transparent;
-                color: {COLOR_TEXT_DIM};
+                color: {COLOR_TEXT_MUTED};
                 border: none;
                 border-bottom: 1px solid {COLOR_HAIRLINE};
                 padding: 4px 4px 6px 4px;
-                font-size: 10px;
+                font-size: 11px;
                 font-weight: 600;
-                letter-spacing: 0.6px;
             }}
-            QHeaderView::section:hover {{ color: {COLOR_TEXT_MUTED}; }}
+            QHeaderView::section:hover {{ color: {COLOR_TEXT}; }}
             QScrollBar:vertical {{
-                background: transparent; width: 8px; margin: 0;
+                background: transparent; width: 10px; margin: 2px;
             }}
             QScrollBar::handle:vertical {{
-                background: {COLOR_HAIRLINE_HOVER};
-                border-radius: 4px; min-height: 28px;
+                background: rgba(255, 255, 255, 50);
+                border-radius: 3px; min-height: 28px;
             }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0;
