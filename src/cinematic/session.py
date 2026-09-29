@@ -57,12 +57,75 @@ class CineSession:
         return getattr(app, "render_pipeline", None) is not None
 
     # ------------------------------------------------------------------ #
+    #: сколько ждать подготовки, прежде чем сдаться и показать без кино, с
+    PREPARE_TIMEOUT = 240.0
+
     def start(self) -> None:
+        """
+        Подготовка: всё скачивается и считается ДО показа (интерфейс на
+        месте, на кнопке — ход подготовки), чтобы в самой сцене не было ни
+        одного ожидания. Показ начинается, когда готово всё.
+        """
         if CineSession.current is not None:
             CineSession.current.skip()
         CineSession.current = self
         app = self.app
+        # этот запуск перекрывает любой штатный, начатый раньше
+        self.win._recon_seq = getattr(self.win, "_recon_seq", 0) + 1
+        self.recon_seq = self.win._recon_seq
+        self.loader = Loader(self.win, self.rec)
+        self.data = self.loader.start()
+        self.playing = False
+        self._prep_time = 0.0
+        btn = getattr(getattr(self.win, "right_panel", None), "btn_run_recon", None)
+        self._btn = btn
+        self._btn_text = btn.text() if btn is not None else ""
+        app.accept("escape", self.skip)
+        app.taskMgr.add(self._prepare_task, "cine_prepare")
+        print(f"[cine] подготовка: {self.rec.name}")
+
+    _PARTS = (("photo_ready", "снимок"), ("scene_ready", "анализ снимка и облака"),
+              ("fetch_ready", "модель и наполнение"), ("fill_ready", "этапы наполнения"),
+              ("bodies_ready", "кузова"))
+
+    def _prepare_task(self, task):
+        if self._done:
+            return task.done
+        from panda3d.core import ClockObject
+        self._prep_time += ClockObject.get_global_clock().get_dt()
+        d = self.data
+        ready = [flag for flag, _ in self._PARTS if getattr(d, flag)]
+        if self._btn is not None:
+            left = [name for flag, name in self._PARTS if not getattr(d, flag)]
+            self._btn.setText(f"Подготовка {len(ready)}/{len(self._PARTS)}"
+                              + (f": {d.status or left[0]}" if left else ""))
+            self._btn.setEnabled(False)
+        if d.error and not d.fetch_ready:
+            return task.cont                  # штатная выборка ещё может успеть
+        if len(ready) == len(self._PARTS):
+            self._restore_button()
+            self._play()
+            return task.done
+        if self._prep_time > self.PREPARE_TIMEOUT or (d.error and d.fetch_ready and not d.fetched):
+            print(f"[cine] подготовка не удалась ({d.error or 'таймаут'}) — без кино")
+            self.skip()
+            return task.done
+        return task.cont
+
+    def _restore_button(self) -> None:
+        if self._btn is not None:
+            self._btn.setText(self._btn_text)
+            self._btn.setEnabled(True)
+
+    def _play(self) -> None:
+        """Всё готово: гасим интерфейс, забираем камеру, запускаем сцену."""
+        app = self.app
+        self.playing = True
         speed = float(os.environ.get("IQOKO_CINE_SPEED", "1") or 1)
+        try:
+            self.win.fade_overlays(False)
+        except Exception:
+            traceback.print_exc()
         self.comp = Compositor.shared(app, app.render_pipeline)
         self.comp._claimed = True
         self.comp._owner = self
@@ -73,15 +136,9 @@ class CineSession:
         self.seq.every_frame(lambda t, dt: self.comp.set_time(t))
         self.rig = CinematicCamera(app)
         self.rig.acquire()
-        # этот запуск перекрывает любой штатный, начатый раньше
-        self.win._recon_seq = getattr(self.win, "_recon_seq", 0) + 1
-        self.recon_seq = self.win._recon_seq
-        self.loader = Loader(self.win, self.rec)
-        self.data = self.loader.start()
         self.director = Director(self)
         self.seq.spawn(self._run(), "cinematic")
-        app.accept("escape", self.skip)
-        print(f"[cine] старт: {self.rec.name}")
+        print(f"[cine] показ: {self.rec.name} (подготовка {self._prep_time:.1f} с)")
 
     def _run(self):
         try:
@@ -147,6 +204,12 @@ class CineSession:
         self._done = True
         app = self.app
         app.ignore("escape")
+        self._restore_button()
+        if getattr(self, "playing", False):
+            try:
+                self.win.fade_overlays(True, 700)
+            except Exception:
+                traceback.print_exc()
         d = self.data
         if d is not None and not self.pbr_applied and d.fetch_ready:
             self.apply_pbr_hidden()

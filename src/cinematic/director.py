@@ -82,6 +82,8 @@ class Director:
         self.hud = None
         self.center = Vec3(0, 0, 3)
         self.floor_z = 0.0
+        #: угол планов перед PBR и после (градусы от +X): сторона −X, сзади
+        self.SAFE_SIDE = -128.0
         #: имя текущего этапа — для журнала и диагностики просадок
         self.stage = "init"
 
@@ -252,6 +254,8 @@ class Director:
                 n["curtain"] = cu
 
     def build_detection(self):
+        if "det" in self.nodes:
+            return self.nodes["det"]
         sc = self.d.scene
         if sc is None or not sc.has("det_corners"):
             return None
@@ -315,6 +319,8 @@ class Director:
         return m
 
     def build_heightfield(self):
+        if "hf" in self.nodes:
+            return self.nodes["hf"]
         fa = self.d.fill
         if fa is None or not fa.has("h_raw", "grid_origin"):
             return None
@@ -337,8 +343,9 @@ class Director:
             hf.set_shader_input("u_box", Vec4(nv[:, 0].min(), nv[:, 0].max(),
                                               nv[:, 1].min(), nv[:, 1].max()))
         holder = self.root.attach_new_node("fill_space")
-        if self.d.direction_yaw:
-            holder.set_h(180)          # как сервер развернул результат (Entry)
+        # Система модели как есть: разворот сервера (Direction=Entry) снимается
+        # уже при загрузке результата (MeshReconstruction.prepare), так что и
+        # этапы, и итоговый меш совпадают с облаком и кузовом.
         hf.reparent_to(holder)
         hf.set_bin("fixed", 25)
         hf.hide()
@@ -349,6 +356,8 @@ class Director:
         return hf
 
     def build_result_holo(self):
+        if "result_holo" in self.nodes:
+            return self.nodes["result_holo"]
         f = self.d.fetched or {}
         mesh = f.get("mesh")
         if mesh is None:
@@ -383,33 +392,28 @@ class Director:
         self.make_hud()
         # из PBR-мира — в пустоту
         yield tween(0.8, lambda v: setattr(comp, "abstract", v), 0.0, 1.0, E.in_out_cubic)
+        # Экран полностью чёрный — здесь вся тяжёлая работа: реконструкция
+        # встаёт в PBR-сцену (её не видно) и строятся узлы всех этапов. Пауза
+        # на чёрном кадре незаметна, дальше сцена идёт без задержек.
+        yield wait(0.05)
+        self.s.apply_pbr_hidden()
+        self.prebuild()
+        yield wait(0.15)
         car = d.rec.car_number if getattr(d.rec, "car_number", "") else ""
         title = self.hud_text(f"ПРОЕЗД  {car}".strip(), 0.0, 0.14, 0.13)
         sub = self.hud_text(f"{d.rec.model}   ·   {d.rec.time}", 0.0, -0.04, 0.065,
                             (0.6, 0.8, 1.0, 0.8))
         yield self.type_in(title, 0.9)
         yield self.type_in(sub, 0.6)
-        status = self.hud_text("", 0.0, -0.88, 0.055, (0.5, 0.8, 1.0, 0.8))
-        status_track = self.seq.spawn(self._status_loop(status))
-
-        yield until(lambda: d.photo_ready or bool(d.error), timeout=30)
+        yield wait(0.6)
         yield tween(0.5, lambda v: (title.set_alpha(1 - v), sub.set_alpha(1 - v)), 0, 1)
         title.destroy()
         sub.destroy()
-
-        have_photo = bool(d.photo_path)
-        if have_photo:
-            tex = self.app.loader.loadTexture(Filename.from_os_specific(d.photo_path))
-            comp.intro_tex = tex
+        if "photo_tex" in self.nodes:
+            comp.intro_tex = self.nodes["photo_tex"]
             comp.undistort = 0.0
             yield tween(0.8, lambda v: setattr(comp, "intro_mix", v), 0.0, 1.0, E.out_cubic)
-        # анализ идёт — ждём (на экране снимок и ход работы)
-        yield until(lambda: d.scene_ready or bool(d.error), timeout=180)
-        self.setup_frames()
-        self.build_scene_nodes()
-        status_track.cancel()
-        yield tween(0.4, lambda v: status.set_alpha(1 - v), 0, 1)
-        status.destroy()
+            yield wait(0.4)
         for name, stage in (("photo", self.stage_photo_to_3d), ("lidar", self.stage_lidar),
                             ("detection", self.stage_detection),
                             ("background", self.stage_background),
@@ -418,18 +422,32 @@ class Director:
                             ("pbr", self.stage_pbr), ("finale", self.stage_finale)):
             self.stage = name
             if name == "lidar":
-                self.rig.shake = 0.035       # лёгкое «дыхание» ручной камеры
+                # лёгкое «дыхание» ручной камеры — нарастает плавно
+                self.seq.spawn(tween(2.0, lambda v: setattr(self.rig, "shake", v),
+                                     0.0, 0.035, E.in_out_sine))
             yield from stage()
 
-    def _status_loop(self, label):
-        last = None
-        while True:
-            txt = self.d.status or ""
-            if txt != last:
-                last = txt
-                label.set_text(txt.upper())
-                label.set_reveal(1.0)
-            yield wait(0.1)
+    def prebuild(self):
+        """Построить узлы всех этапов заранее (данные уже готовы)."""
+        self.setup_frames()
+        self.build_scene_nodes()
+        self.build_detection()
+        self.build_heightfield()
+        self.build_result_holo()
+        self.body_holos = {}
+        for b in self.d.bodies:
+            if b.model is None:
+                continue
+            h = P.holo_model(b.model, (0.35, 0.8, 1.0, 0.0))
+            # у кузова тысячи граней друг за другом: полный френель и сетка
+            # складывались в сплошную засветку
+            h.set_shader_input("u_style", Vec4(0.45, 0.25, 0.12, 0.05))
+            # на переходе в PBR кузов уходит вместе со сценой — фронтом глубины
+            h.set_shader_input("u_waveCut", 1.0)
+            h.reparent_to(self.root)
+            h.set_bin("fixed", 24)
+            h.hide()
+            self.body_holos[b.key] = h
 
     # ------------------------------------------------------------------ #
     def stage_photo_to_3d(self):
@@ -469,10 +487,24 @@ class Director:
         floor.set_bin("fixed", 0)
         floor.set_shader_input("u_alpha", 0.0)
         n["floor"] = floor
-        rise = Shot(station.pos + Vec3(0, 0, 3.0), self.center + Vec3(0, 0, -0.5), (0, 0, 1), 55)
-        side = self.side_shot(-62.0)
-        look = self.seq.spawn(self._grade_to_holo(3.5))
-        yield rig.move([rise, side], 5.0, E.in_out_quint)
+        # Отлёт как у дрона, в два такта. Сначала камера поднимается, всё ещё
+        # глядя вниз, и доворачивает кадр так, что его «верх» смотрит туда,
+        # куда она дальше полетит; потом — чистый наклон и перелёт вбок, уже
+        # без крена. Прямая интерполяция от вида сверху (верх кадра — вдоль
+        # кузова) к виду сбоку (верх — вертикаль) закручивала кадр по всем
+        # трём осям сразу.
+        side = self.side_shot(-62.0, fov=45.0)
+        fwd = side.target - side.pos
+        heading = Vec3(fwd.x, fwd.y, 0)
+        heading.normalize()
+        from src.vfx.camera import look_quat
+        up_pos = station.pos + Vec3(0, 0, 4.0)
+        down = Vec3(0, 0, -1)
+        crane = Shot(up_pos, up_pos + down * 10.0, heading, station.fov,
+                     quat=look_quat(down, heading))
+        look = self.seq.spawn(self._grade_to_holo(4.0))
+        yield rig.move(crane, 2.4, E.in_out_sine)
+        yield rig.move(side, 3.6, E.in_out_cubic)
         yield look
 
     def _grade_to_holo(self, dur):
@@ -480,7 +512,7 @@ class Director:
 
         def grade(v):
             comp.tonemap = v
-            comp.bloom = v
+            comp.bloom = 0.6 * v
             comp.vignette = 0.35 * v
             if "floor" in n:
                 n["floor"].set_shader_input("u_alpha", v)
@@ -496,7 +528,7 @@ class Director:
 
         def grade(v):
             comp.tonemap = v
-            comp.bloom = v
+            comp.bloom = 0.6 * v
             comp.vignette = 0.35 * v
         yield tween(dur, grade, 0.0, 1.0)
         floor = P.grid_floor((self.center.x, self.center.y), z=self.floor_z)
@@ -528,8 +560,8 @@ class Director:
         self.seq.spawn(spin())
         yield tween(0.6, lambda v: glyph.set_scale(max(v, 0.001)), 0.0, 1.0, E.out_back)
         self.burst([tuple(self.sensor_origin)], 80, 1.2, 0.9, hue=0.55)
-        orbit = self.seq.spawn(rig.orbit(self.center, max(11.0, self.body_len * 1.5),
-                                         7.5, -62, -20, 7.5, E.in_out_sine))
+        orbit = self.seq.spawn(rig.orbit_from(self.center, 42.0, 7.5,
+                                              height=7.5, curve=E.in_out_sine))
         cl.set_shader_input("u_alphas", Vec4(1, 1, 1, 1))
         yield tween(6.0, lambda v: cl.set_shader_input("u_throw", v), 0.0, 1.02, E.linear)
         yield orbit
@@ -689,7 +721,6 @@ class Director:
     # ------------------------------------------------------------------ #
     def stage_bodies(self):
         d = self.d
-        yield until(lambda: d.bodies_ready or bool(d.error), timeout=25)
         bodies = [b for b in d.bodies if b.model is not None]
         kp = getattr(self, "kp_root", None)
         if not bodies or kp is None:
@@ -703,11 +734,14 @@ class Director:
         yield self.type_in(cap, 0.4)
         chosen = None
         for b in bodies:
-            holo = P.holo_model(b.model, (0.35, 0.8, 1.0, 0.0))
-            holo.reparent_to(self.root)
+            holo = getattr(self, "body_holos", {}).get(b.key)
+            if holo is None:
+                holo = P.holo_model(b.model, (0.35, 0.8, 1.0, 0.0))
+                holo.reparent_to(self.root)
+                holo.set_bin("fixed", 24)
+            holo.show()
             holo.set_z(below)
             holo.set_shader_input("u_dissolve", 1.0)
-            holo.set_bin("fixed", 24)
             top = below + 3.4
             try:
                 lo, hi = b.model.get_tight_bounds()
@@ -718,34 +752,31 @@ class Director:
             dims = self.label(f"{b.width:.2f} × {b.length:.2f} м",
                               Vec3(self.center.x, self.center.y, top + 0.55), 0.3,
                               (1.0, 0.8, 0.4, 1.0))
-            yield [tween(0.8, lambda v, h=holo: h.set_shader_input("u_dissolve", 1 - v), 0, 1),
-                   self.fade_node(holo, "u_color", 0.0, 0.55, 0.8),
-                   self.type_in(name, 0.6), self.type_in(dims, 0.6)]
             if not b.correct:
-                yield wait(0.7)
-                holo.set_shader_input("u_color", Vec4(1.0, 0.3, 0.25, 0.6))
-                dims.set_text(f"{b.width:.2f} × {b.length:.2f} м  ·  НЕ ПОДХОДИТ")
+                # ложные кандидаты — быстро, по полсекунды: вспыхнул и растаял
+                name.set_reveal(1.0)
                 dims.set_reveal(1.0)
-                dims.color = Vec4(*RED)
-                dims.set_alpha(1)
-                yield wait(0.5)
-                yield [tween(0.7, lambda v, h=holo: h.set_shader_input("u_dissolve", v), 0, 1),
-                       tween(0.5, lambda v, a=name, b2=dims: (a.set_alpha(1 - v), b2.set_alpha(1 - v)), 0, 1)]
-                holo.remove_node()
+                yield [tween(0.22, lambda v, h=holo: h.set_shader_input("u_dissolve", 1 - v), 0, 1),
+                       self.fade_node(holo, "u_color", 0.0, 0.55, 0.22)]
+                yield wait(0.08)
+                holo.set_shader_input("u_color", Vec4(1.0, 0.3, 0.25, 0.55))
+                yield [tween(0.22, lambda v, h=holo: h.set_shader_input("u_dissolve", v), 0, 1),
+                       tween(0.22, lambda v, a=name, b2=dims: (a.set_alpha(1 - v), b2.set_alpha(1 - v)), 0, 1)]
+                holo.hide()
                 name.destroy()
                 dims.destroy()
-            else:
-                chosen = (b, holo, name, dims)
-                break
+                continue
+            yield [tween(0.8, lambda v, h=holo: h.set_shader_input("u_dissolve", 1 - v), 0, 1),
+                   self.fade_node(holo, "u_color", 0.0, 0.3, 0.8),
+                   self.type_in(name, 0.6), self.type_in(dims, 0.6)]
+            chosen = (b, holo, name, dims)
+            break
         if chosen is None:
             yield tween(0.4, lambda v: cap.set_alpha(1 - v), 0, 1)
             cap.destroy()
             return
         b, holo, name, dims = chosen
-        holo.set_shader_input("u_color", Vec4(0.35, 1.0, 0.6, 0.6))
-        dims.color = Vec4(*GREEN)
-        dims.set_text(f"{b.width:.2f} × {b.length:.2f} м  ·  ПОДХОДИТ")
-        dims.set_reveal(1.0)
+        holo.set_shader_input("u_color", Vec4(0.35, 1.0, 0.6, 0.32))
         # опорные точки кузова (points_3d) загораются
         bm = [self.build_marker(p, GREEN, parent=holo) for p in b.points_3d]
         for m in bm:
@@ -802,8 +833,10 @@ class Director:
             return
         rig = self.rig
         c = self.center
-        yield rig.move(self.side_shot(-55.0, radius=self.body_len * 1.05,
-                                      height=self.body_len * 0.55, fov=46), 2.0, E.in_out_cubic)
+        # Отсюда и до конца — с борта −X: на PBR-сцене у борта +X стоит
+        # вышка станции (x ≈ +3.5 м), и после перехода она закрыла бы кузов.
+        yield rig.move(self.side_shot(self.SAFE_SIDE, radius=self.body_len * 1.05,
+                                      height=self.body_len * 0.55, fov=46), 2.6, E.in_out_cubic)
         cap = self.hud_text("РЕКОНСТРУКЦИЯ НАПОЛНЕНИЯ", -0.92, 0.82, 0.085, CYAN, "left")
         step = self.hud_text("", -0.92, 0.7, 0.058, (0.6, 0.85, 1.0, 0.9), "left")
         yield self.type_in(cap, 0.5)
@@ -817,9 +850,8 @@ class Director:
                      if cm is not None else None, 0, 1)]
         if cm is not None:
             cm.remove_node()
-        orbit = self.seq.spawn(rig.orbit(c, self.body_len * 1.05, self.body_len * 0.55,
-                                         -55, -5, 2.2 * (len(stages) - 1) + 1.0, E.in_out_sine,
-                                         fov=46))
+        orbit = self.seq.spawn(rig.orbit_from(c, -50.0, 2.2 * (len(stages) - 1) + 1.0,
+                                              curve=E.in_out_sine))
         for i in range(1, len(stages)):
             hf.set_shader_input("u_hA", stages[i - 1][0])
             hf.set_shader_input("u_hB", stages[i][0])
@@ -894,36 +926,38 @@ class Director:
         if holo is not None:
             holo.show()
             holo.set_shader_input("u_color", Vec4(0.35, 0.8, 1.0, 0.0))
-            yield self.fade_node(holo, "u_color", 0.0, 0.4, 1.0)
+            yield self.fade_node(holo, "u_color", 0.0, 0.22, 1.0)
 
     # ------------------------------------------------------------------ #
     def stage_pbr(self):
         comp, n = self.comp, self.nodes
-        yield until(lambda: self.s.pbr_applied or bool(self.d.error), timeout=30)
         self.s.apply_pbr_hidden()
-        uv = comp.project(self.center) or Vec2(0.5, 0.5)
-        comp.wave = Vec3(uv.x, uv.y, 0.0)
-        comp.wave_width = 0.18
         floor = n.get("floor")
-        cap = self.hud_text("ПЕРЕХОД В ФИЗИЧЕСКИЙ МИР", 0.0, 0.82, 0.075, CYAN)
+        cap = self.hud_text("PBR ТЕКСТУРИРОВАНИЕ", -0.92, 0.82, 0.085, CYAN, "left")
         yield self.type_in(cap, 0.5)
+        # PBR-мир проявляется фронтом по глубине: ближние к камере пиксели
+        # раньше дальних; по фронту — тонкая светящаяся линия и цифровые
+        # изолинии глубины.
+        cam_d = (self.rig.shot.pos - self.center).length()
+        near, far = max(0.5, cam_d - self.body_len * 0.9), 140.0
+        comp.depth_wave = Vec3(near, 1.6, 1.0)
 
         def wave(v):
-            comp.wave = Vec3(uv.x, uv.y, v * 2.3)
+            comp.depth_wave = Vec3(near + (far - near) * v, 1.2 + 10.0 * v, 1.0)
             if floor is not None:
                 floor.set_shader_input("u_alpha", 1 - v)
-        yield tween(2.6, wave, 0.0, 1.0, E.in_out_cubic)
-        comp.abstract = 0.0
-        comp.wave = Vec3(0.5, 0.5, 0.0)
-        if floor is not None:
-            floor.remove_node()
+        yield tween(3.4, wave, 0.0, 1.0, E.in_cubic)
+        # голограмма кузова уже целиком срезана фронтом — PBR-кузов на месте
         holo = n.get("body_holo")
         if holo is not None:
-            yield self.fade_node(holo, "u_color", 0.4, 0.0, 0.7)
             holo.remove_node()
-        yield tween(0.4, lambda v: cap.set_alpha(1 - v), 0, 1)
-        cap.destroy()
+        comp.abstract = 0.0
+        comp.depth_wave = Vec3(0, 1, 0)
+        if floor is not None:
+            floor.remove_node()
         yield from self.stage_texture_sweep()
+        yield tween(0.5, lambda v: cap.set_alpha(1 - v), 0, 1)
+        cap.destroy()
 
     def stage_texture_sweep(self):
         res = self.nodes.get("result_holo")
@@ -981,9 +1015,15 @@ class Director:
     # ------------------------------------------------------------------ #
     def stage_finale(self):
         rig = self.rig
-        yield rig.orbit(self.center, self.body_len * 1.15, self.body_len * 0.95, -40, -18, 3.0,
-                        E.out_cubic, fov=48)
-        self.rig.shake = 0.0
+        # облёт из текущей позы, в конце объектив плавно становится
+        # пользовательским — после сцены камера не прыгает
+        yield [rig.orbit_from(self.center, -20.0, 3.0, radius=self.body_len * 1.15,
+                              height=self.body_len * 0.95, curve=E.in_out_sine),
+               tween(3.0, lambda v: setattr(self.rig, "shake", v), self.rig.shake, 0.0)]
+        if rig.user_fov:
+            cur = rig.shot
+            yield rig.move(Shot(cur.pos, cur.target, (0, 0, 1), rig.user_fov), 1.3,
+                           E.in_out_cubic)
         comp = self.comp
         yield tween(0.8, lambda v: (setattr(comp, "vignette", 0.35 * (1 - v)),
                                     setattr(comp, "grain", 0.03 * (1 - v))), 0, 1)

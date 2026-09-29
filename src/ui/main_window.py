@@ -1122,11 +1122,49 @@ class MainWindow(QMainWindow):
             return
         try:
             from src.cinematic.session import CineSession
+            from src.cinematic import scan_analysis
             from src.vfx.compositor import Compositor
             if CineSession.supported(app) and CineSession.current is None:
                 Compositor.shared(app, app.render_pipeline).warmup()
+                # Depth Anything, open3d, детектор кузова — в постоянном
+                # процессе, прогретые заранее
+                scan_analysis.warm_up()
         except Exception as exc:
             print(f"[cine] прогрев не удался: {exc}")
+
+    # ------------------------------------------------------------------
+    def fade_overlays(self, visible: bool, duration_ms: int = 450) -> None:
+        """
+        Плавно спрятать / вернуть весь интерфейс поверх 3D-вида на время
+        кинематографичной сцены. Карточки и панели — отдельные окна-Tool,
+        принадлежащие главному окну (см. overlay_widgets), поэтому гасятся
+        прозрачностью окна, а не графическим эффектом.
+        """
+        from PyQt6.QtCore import QPropertyAnimation, QEasingCurve
+        from PyQt6.QtWidgets import QApplication
+
+        if not visible:
+            self._faded_overlays = [
+                w for w in QApplication.topLevelWidgets()
+                if w is not self and w.isVisible()
+                and getattr(w, "_owner", None) is self.panda_container]
+        widgets = list(getattr(self, "_faded_overlays", []))
+        self._overlay_anims = []
+        for w in widgets:
+            if visible:
+                w.setWindowOpacity(0.0)
+                w.show()
+            anim = QPropertyAnimation(w, b"windowOpacity", self)
+            anim.setDuration(duration_ms)
+            anim.setStartValue(w.windowOpacity())
+            anim.setEndValue(1.0 if visible else 0.0)
+            anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            if not visible:
+                anim.finished.connect(w.hide)
+            anim.start()
+            self._overlay_anims.append(anim)
+        if visible:
+            self._faded_overlays = []
 
     def _on_reconstruction_run_plain(self, rec: Reconstruction) -> None:
         """Штатная реконструкция: загрузка в фоне, сцена — в главном потоке."""

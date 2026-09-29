@@ -106,18 +106,22 @@ class Compositor:
         self.root.set_transparency(TransparencyAttrib.M_none)
         self.root.set_shader_input("u_time", 0.0)
         self.root.set_shader_input("u_view", Vec2(1, 1))
+        self.root.set_shader_input("u_dwave", Vec3(0, 1, 0))
+        self.root.set_shader_input("u_camFwd", Vec3(0, 1, 0))
 
         # параметры сведения
         self.abstract = 1.0
         self.wave = Vec3(0.5, 0.5, 0.0)       # центр (uv), радиус
         self.wave_width = 0.12
-        self.bloom = 1.0
-        self.threshold = 0.8
+        self.bloom = 0.6
+        self.threshold = 1.1
         self.exposure = 1.0
         self.aberration = 0.012
         self.grain = 0.03
         self.vignette = 0.35
         self.tonemap = 1.0
+        #: фронт PBR-мира по глубине: (радиус м, ширина м, 1 — включён)
+        self.depth_wave = Vec3(0, 1, 0)
         # слой «плоского» снимка (вступление): текстура, непрозрачность,
         # доля выпрямления линзы и параметры объектива (см. set_intro_lens)
         self.intro_tex: Optional[Texture] = None
@@ -317,6 +321,13 @@ class Compositor:
         q.set_shader_input("u_time", float(self._time))
         q.set_shader_input("u_bg", self.bg)
         q.set_shader_input("u_tonemap", float(self.tonemap))
+        q.set_shader_input("u_dwave", self.depth_wave)
+        # тот же фронт — материалам сцены (голограмма кузова срезается им)
+        self.root.set_shader_input("u_dwave", self.depth_wave)
+        self.root.set_shader_input("u_camFwd", self.base.render.get_relative_vector(
+            self.base.camera, Vec3(0, 1, 0)))
+        lens = self.base.camLens
+        q.set_shader_input("u_nearFar", Vec2(lens.get_near(), lens.get_far()))
         q.set_shader_input("u_intro", self.intro_tex if self.intro_tex is not None else self._blank)
         q.set_shader_input("u_introMix", float(self.intro_mix if self.intro_tex is not None else 0.0))
         q.set_shader_input("u_undistort", float(self.undistort))
@@ -408,10 +419,11 @@ class Compositor:
             child.remove_node()
         for ch in (self.camera.get_children() if self.camera is not None else []):
             ch.remove_node()
-        self.abstract, self.wave, self.bloom = 1.0, Vec3(0.5, 0.5, 0.0), 1.0
+        self.abstract, self.wave, self.bloom = 1.0, Vec3(0.5, 0.5, 0.0), 0.6
         self.exposure, self.tonemap, self.glitch, self.fade = 1.0, 1.0, 0.0, 0.0
         self.aberration, self.grain, self.vignette = 0.012, 0.03, 0.35
         self.intro_tex, self.intro_mix, self.undistort = None, 0.0, 0.0
+        self.depth_wave = Vec3(0, 1, 0)
 
     def set_time(self, t: float) -> None:
         self._time = t

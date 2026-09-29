@@ -141,7 +141,8 @@ def holo_mesh(vertices: np.ndarray, faces: np.ndarray, name="holo",
 def holo_defaults(node: NodePath, color=(0.3, 0.8, 1.0, 0.6)) -> NodePath:
     return apply_inputs(node, u_color=Vec4(*color), u_style=Vec4(1.0, 0.6, 0.35, 0.15),
                         u_hrange=Vec2(0, 4), u_rainbow=0.0, u_dissolve=0.0,
-                        u_reveal=Vec4(0, 0, 1, 1e6), u_highlight=Vec4(0, 0, 0, 0))
+                        u_reveal=Vec4(0, 0, 1, 1e6), u_highlight=Vec4(0, 0, 0, 0),
+                        u_waveCut=0.0)
 
 
 def holo_model(model: NodePath, color=(0.3, 0.8, 1.0, 0.5)) -> NodePath:

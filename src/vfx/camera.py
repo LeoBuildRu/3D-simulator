@@ -20,7 +20,7 @@ import math
 from typing import Optional, Sequence
 
 import numpy as np
-from panda3d.core import LVecBase2f, Point3, Vec2, Vec3
+from panda3d.core import LVecBase2f, Point3, Quat, Vec2, Vec3, lookAt
 
 from . import easing as ease
 from .sequencer import Cmd
@@ -30,21 +30,63 @@ def _v(p) -> Vec3:
     return Vec3(float(p[0]), float(p[1]), float(p[2]))
 
 
-class Shot:
-    """Поза камеры: где стоит, куда смотрит, где верх, объектив."""
+def look_quat(fwd: Vec3, up: Vec3) -> Quat:
+    """Ориентация «смотреть вдоль fwd, верх ≈ up» (без вырождения)."""
+    f = Vec3(fwd)
+    f.normalize()
+    u = Vec3(up)
+    u.normalize()
+    if abs(f.dot(u)) > 0.985:            # взгляд вдоль «верха» — берём другой
+        u = Vec3(0, 1, 0) if abs(f.y) < 0.9 else Vec3(1, 0, 0)
+    q = Quat()
+    lookAt(q, f, u)
+    return q
 
-    __slots__ = ("pos", "target", "up", "fov", "offset")
+
+def slerp(a: Quat, b: Quat, t: float) -> Quat:
+    qa = np.array([a.get_r(), a.get_i(), a.get_j(), a.get_k()])
+    qb = np.array([b.get_r(), b.get_i(), b.get_j(), b.get_k()])
+    d = float(qa @ qb)
+    if d < 0:
+        qb, d = -qb, -d
+    if d > 0.9995:
+        q = qa + (qb - qa) * t
+    else:
+        th = math.acos(min(1.0, d))
+        q = (math.sin((1 - t) * th) * qa + math.sin(t * th) * qb) / math.sin(th)
+    q /= np.linalg.norm(q)
+    return Quat(*q)
+
+
+class Shot:
+    """
+    Поза камеры: где стоит, куда смотрит, где верх, объектив.
+
+    Ориентация между позами интерполируется кватернионом (slerp), а потом
+    доворачивается на цель кратчайшим поворотом. Смесь векторов «вверх» с
+    look_at вырождалась, когда камера смотрела почти вдоль верха (взгляд
+    вниз со станции), — камеру дёргало.
+    """
+
+    __slots__ = ("pos", "target", "up", "fov", "offset", "quat")
 
     def __init__(self, pos, target, up=(0, 0, 1), fov: float = 50.0,
-                 offset=(0.0, 0.0)):
+                 offset=(0.0, 0.0), quat: Optional[Quat] = None):
         self.pos = _v(pos)
         self.target = _v(target)
         self.up = _v(up)
         self.fov = float(fov)            # вертикальный угол, градусы
         self.offset = Vec2(*offset)      # сдвиг плёнки, доли высоты кадра
+        self.quat = quat                 # None — из target/up
+
+    def orientation(self) -> Quat:
+        if self.quat is not None:
+            return self.quat
+        return look_quat(self.target - self.pos, self.up)
 
     def copy(self) -> "Shot":
-        return Shot(self.pos, self.target, self.up, self.fov, self.offset)
+        return Shot(self.pos, self.target, self.up, self.fov, self.offset,
+                    Quat(self.quat) if self.quat is not None else None)
 
     @staticmethod
     def mix(a: "Shot", b: "Shot", t: float) -> "Shot":
@@ -53,7 +95,8 @@ class Shot:
             up = b.up
         up.normalize()
         return Shot(a.pos + (b.pos - a.pos) * t, a.target + (b.target - a.target) * t,
-                    up, a.fov + (b.fov - a.fov) * t, a.offset + (b.offset - a.offset) * t)
+                    up, a.fov + (b.fov - a.fov) * t, a.offset + (b.offset - a.offset) * t,
+                    slerp(a.orientation(), b.orientation(), t))
 
 
 def _catmull(p0, p1, p2, p3, t):
@@ -104,6 +147,44 @@ class _OrbitCmd(Cmd):
         self.t += dt
         k = min(1.0, self.t / self.duration)
         self.rig.shot = self.shot_at(self.curve(k))
+        return k >= 1.0
+
+
+class _OrbitFromCmd(Cmd):
+    """Облёт, начинающийся ровно из текущей позы (без скачка)."""
+
+    def __init__(self, rig, center, degrees, radius, height, duration, curve, fov):
+        self.rig, self.center = rig, _v(center)
+        self.degrees, self.r1, self.h1 = degrees, radius, height
+        self.duration, self.curve, self.fov1 = max(1e-6, duration), curve, fov
+        self.t = 0.0
+
+    def start(self, seq):
+        s = self.rig.shot
+        d = s.pos - self.center
+        self.a0 = math.degrees(math.atan2(d.y, d.x))
+        self.r0 = math.hypot(d.x, d.y)
+        self.h0 = d.z
+        self.fov0 = s.fov
+        self.from_shot = s.copy()
+        if self.r1 is None:
+            self.r1 = self.r0
+        if self.h1 is None:
+            self.h1 = self.h0
+        if self.fov1 is None:
+            self.fov1 = self.fov0
+
+    def step(self, dt):
+        self.t += dt
+        k = min(1.0, self.t / self.duration)
+        e = self.curve(k)
+        a = math.radians(self.a0 + self.degrees * e)
+        r = self.r0 + (self.r1 - self.r0) * e
+        h = self.h0 + (self.h1 - self.h0) * e
+        pos = self.center + Vec3(math.cos(a) * r, math.sin(a) * r, h)
+        # цель съезжает к центру облёта, если до этого смотрели иначе
+        tgt = self.from_shot.target + (self.center - self.from_shot.target) * min(1.0, e * 2)
+        self.rig.shot = Shot(pos, tgt, (0, 0, 1), self.fov0 + (self.fov1 - self.fov0) * e)
         return k >= 1.0
 
 
@@ -172,7 +253,6 @@ class CinematicCamera:
             mat = base.camera.get_mat(s["parent"])
             base.camera.reparent_to(s["parent"])
             base.camera.set_mat(mat)
-            base.camera.set_r(0)
         fly = getattr(base, "fly_cam", None)
         if fly is not None:
             fly.set_frozen(bool(s.get("fly_frozen", False)))
@@ -216,7 +296,7 @@ class CinematicCamera:
         pos = _catmull(*(s.pos for s in p), t)
         tgt = _catmull(*(s.target for s in p), t)
         base = Shot.mix(p[1], p[2], t)
-        return Shot(pos, tgt, base.up, base.fov, base.offset)
+        return Shot(pos, tgt, base.up, base.fov, base.offset, base.quat)
 
     def move(self, shots, duration: float, curve=ease.in_out_cubic) -> Cmd:
         """Команда: проехать через позу/позы за duration секунд."""
@@ -229,6 +309,16 @@ class CinematicCamera:
         """Команда: облёт вокруг center по дуге a0 -> a1 (градусы)."""
         return _OrbitCmd(self, center, radius, height, a0, a1, duration, curve, fov,
                          target_offset)
+
+    def orbit_from(self, center, degrees, duration, radius=None, height=None,
+                   curve=ease.in_out_sine, fov=None) -> Cmd:
+        """Команда: облёт на `degrees` из ТЕКУЩЕЙ позы (радиус/высота — плавно)."""
+        return _OrbitFromCmd(self, center, degrees, radius, height, duration, curve, fov)
+
+    @property
+    def user_fov(self) -> Optional[float]:
+        """Вертикальный угол объектива пользователя (вернётся после сцены)."""
+        return float(self._saved["fov"][1]) if self._saved else None
 
     def cut(self, shot: Shot) -> None:
         self.shot = shot.copy()
@@ -253,7 +343,20 @@ class CinematicCamera:
         cam = base.camera
         cam.reparent_to(ref)
         cam.set_pos(pos)
-        cam.look_at(Point3(tgt), s.up)
+        q = s.orientation()
+        # довернуть на цель кратчайшим поворотом (а не look_at с «верхом»)
+        cur = q.xform(Vec3(0, 1, 0))
+        want = tgt - pos
+        if want.length_squared() > 1e-10:
+            want.normalize()
+            axis = cur.cross(want)
+            sn = axis.length()
+            ang = math.atan2(sn, max(-1.0, min(1.0, cur.dot(want))))
+            if sn > 1e-7 and ang > 1e-5:
+                fix = Quat()
+                fix.set_from_axis_angle_rad(ang, axis / sn)
+                q = q * fix
+        cam.set_quat(q)
         lens = base.camLens
         # вертикальный угол; горизонтальный — по соотношению сторон окна
         win = base.win

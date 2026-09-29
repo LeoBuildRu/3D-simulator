@@ -240,7 +240,8 @@ class Loader:
             if len(chosen) == 2:
                 break
         correct = next((p for p in pool if p[0] == correct_key), None)
-        entries = [(p, False) for p in chosen] + ([(correct, True)] if correct else [])
+        # Случайные кандидаты больше не показываются — только нужный кузов.
+        entries = [(correct, True)] if correct else []
         cache = self.app.get_cache_dir()
         for (key, cfg, pts), ok in entries:
             local = os.path.join(cache, os.path.basename(cfg["cuzov"]))

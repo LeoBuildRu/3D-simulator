@@ -439,11 +439,19 @@ def fill_stages(T, xyz, napolnitel, mesh_before, wall_mask, out, res=0.03):
 
 # --------------------------------------------------------------------------- #
 
+def _add_paths() -> str:
+    repo = find_repo()
+    for sub in ("volume_calculator", "direct_mesh"):
+        path = os.path.join(repo, sub)
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    return repo
+
+
 def run(args) -> int:
     t0 = time.time()
-    repo = find_repo()
-    sys.path.insert(0, os.path.join(repo, "volume_calculator"))
-    sys.path.insert(0, os.path.join(repo, "direct_mesh"))
+    NOTES.clear()
+    repo = _add_paths()
     import scan2mesh as sm
     import appearance as ap
     out: dict = {}
@@ -515,7 +523,45 @@ def detect_stage(meta, xyz, out):
         note(f"detection failed: {exc}")
 
 
-def main() -> int:
+def serve() -> int:
+    """
+    Постоянный режим: всё тяжёлое (torch, Depth Anything на GPU, open3d,
+    детектор кузова) грузится и прогревается ОДИН раз, дальше запросы идут
+    строками JSON через stdin: {"id": ..., "argv": [...]}. Ответ —
+    «@@DONE id» / «@@FAIL id текст». Конец stdin (утилита закрылась) —
+    выход, так что процесс не переживает родителя.
+    """
+    t0 = time.time()
+    _add_paths()
+    import scan2mesh  # noqa: F401
+    import appearance  # noqa: F401
+    import body_geometry  # noqa: F401
+    import photodepth as pdm
+    import cv2
+    pdm.load_model()
+    # первый проход инициализирует CUDA-ядра — делаем его сейчас, не в сцене
+    pdm.relative_depth(np.zeros((270, 480, 3), np.uint8))
+    print(f"@@READY {time.time() - t0:.1f}", flush=True)
+    parser = _parser()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except ValueError:
+            continue
+        rid = req.get("id", "")
+        try:
+            run(parser.parse_args(req.get("argv", [])))
+            print(f"@@DONE {rid}", flush=True)
+        except BaseException as exc:          # argparse бросает SystemExit
+            traceback.print_exc()
+            print(f"@@FAIL {rid} {type(exc).__name__}: {exc}", flush=True)
+    return 0
+
+
+def _parser() -> argparse.ArgumentParser:
     a = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     a.add_argument("--ply", required=True)
     a.add_argument("--photo")
@@ -527,7 +573,13 @@ def main() -> int:
     a.add_argument("--parts", default="scene,fill",
                    help="что считать: scene (снимок, облако, поиск кузова), fill "
                         "(этапы наполнителя) — через запятую")
-    return run(a.parse_args())
+    return a
+
+
+def main() -> int:
+    if "--serve" in sys.argv:
+        return serve()
+    return run(_parser().parse_args())
 
 
 if __name__ == "__main__":

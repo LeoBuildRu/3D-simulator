@@ -191,6 +191,18 @@ class MeshReconstruction:
 
         self.log(f"✅ Меш загружен: {len(vertices)} вершин, {len(faces)} треугольников")
 
+        # Сервер (mesh_reconstruction.cpp) при "Direction": "Entry" разворачивает
+        # ГОТОВЫЙ наполнитель на 180° вокруг вертикали (x,y -> -x,-y), хотя сам
+        # рельеф посчитан по облаку, уже совмещённому с кузовом по опорным
+        # точкам. Развёрнутый груз садится в кузов задом наперёд — у
+        # несимметричных кузовов (MAN 8 м) это видно сразу, и с облаком он не
+        # совпадает (проверено: до разворота невязка 2 см, после — 10–11 см).
+        # Разворот снимаем: это поворот, объём и ориентация граней не меняются.
+        if data.get("direction_yaw_applied"):
+            vertices = vertices.copy()
+            vertices[:, :2] *= -1.0
+            self.log("↩️ Разворот сервера (Direction=Entry) снят")
+
         normals = mesh_io.vertex_normals(vertices, faces)
         uv = mesh_io.planar_uv(vertices, *uv_scale)
         # Текстуры материала — в TexturePool заранее: декодирование 4k-карт

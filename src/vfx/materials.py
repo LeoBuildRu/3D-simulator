@@ -117,12 +117,22 @@ uniform float u_dissolve;      // 0..1
 uniform vec4 u_reveal;         // xyz — нормаль плоскости, w — положение; всё,
                                // что «за» плоскостью, скрыто (горящий шов)
 uniform vec4 u_highlight;      // xyz — центр, w — радиус подсветки
+uniform vec3 u_dwave;          // фронт PBR по глубине (ставит компоновщик на корень)
+uniform vec3 u_camFwd;         // направление взгляда камеры (мир)
+uniform float u_waveCut;       // 1 — голограмма уходит вместе с проявлением PBR
 in vec3 v_world;
 in vec3 v_normal;
 out vec4 o;
 void main() {
     float side = dot(v_world, u_reveal.xyz) - u_reveal.w;
     if (side > 0.0) discard;
+    float wseam = 0.0;
+    if (u_waveCut > 0.5 && u_dwave.z > 0.5) {
+        // та же глубина вдоль взгляда, что и у фронта в сведении
+        float passed = u_dwave.x - dot(v_world - camera_pos(), u_camFwd);
+        if (passed > u_dwave.y * 0.5) discard;
+        wseam = exp(-pow(passed / max(u_dwave.y * 0.12, 1e-3), 2.0));
+    }
     float seam = 1.0 - smoothstep(0.0, 0.12, -side);
     vec2 d = dissolve(v_world, u_dissolve, 0.08);
     if (d.x < 0.5) discard;
@@ -133,6 +143,8 @@ void main() {
     float hl = u_highlight.w > 0.0
              ? 1.0 - smoothstep(0.0, u_highlight.w, distance(v_world, u_highlight.xyz)) : 0.0;
     c.rgb += base * (seam * 4.0 + d.y * 3.0 + hl * 1.5) * u_color.a;
+    c.rgb += vec3(0.4, 0.9, 1.0) * wseam * 2.5;
+    c.a = clamp(c.a + wseam * 0.4, 0.0, 1.0);
     c.a = clamp(c.a + seam * 0.5 * u_color.a, 0.0, 1.0);
     o = c;
 }
@@ -628,6 +640,8 @@ uniform float u_time;
 uniform vec4 u_bg;             // цвет пустоты (rgb) и сила её свечения
 uniform vec2 u_view;
 uniform float u_tonemap;       // 0 — только гамма (снимок 1:1), 1 — ACES
+uniform vec3 u_dwave;          // фронт PBR по глубине: радиус (м), ширина (м), вкл.
+uniform vec2 u_nearFar;        // ближняя/дальняя плоскости камеры
 // «плоский» снимок станции поверх всего (вступление)
 uniform sampler2D u_intro;
 uniform float u_introMix;      // непрозрачность слоя снимка
@@ -683,6 +697,23 @@ void main() {
         ring = exp(-pow((r - u_wave.z) / max(edge * 0.12, 1e-3), 2.0)) * step(0.001, u_abstract);
     }
 
+    // фронт по глубине: пиксель PBR-мира ближе радиуса — уже открыт
+    vec3 dfront = vec3(0.0);
+    if (u_dwave.z > 0.5) {
+        float dz = texture(u_worldDepth, v_uv).r * 2.0 - 1.0;
+        float n = u_nearFar.x, f = u_nearFar.y;
+        float lin = 2.0 * n * f / (f + n - dz * (f - n));
+        float w = u_dwave.y;
+        float k = smoothstep(u_dwave.x - w, u_dwave.x, lin);   // 1 — ещё пустота
+        mask *= k;
+        float edge = exp(-pow((lin - u_dwave.x) / max(w * 0.12, 1e-3), 2.0));
+        // цифровые изолинии глубины сразу за фронтом
+        float behind = clamp((u_dwave.x - lin) / (w * 2.5), 0.0, 1.0);
+        float iso = 1.0 - smoothstep(0.02, 0.07, abs(fract(lin * 2.0) - 0.5));   // каждые 0.5 м
+        float trail = (1.0 - behind) * step(lin, u_dwave.x) * iso;
+        dfront = vec3(0.35, 0.85, 1.0) * (edge * 2.2 + trail * 0.35);
+    }
+
     // голограмма за объектом PBR-мира не видна — там, где этот мир открыт
     float coverage = sc.a;
     if (u_useWorldDepth > 0.5 && mask < 0.999) {
@@ -704,7 +735,8 @@ void main() {
     // пустота: глубокий фон с лёгким виньетированным свечением
     vec2 c = (v_uv - 0.5) * vec2(u_view.x / u_view.y, 1.0);
     vec3 voidc = u_bg.rgb * (1.0 + u_bg.a * exp(-dot(c, c) * 3.0));
-    vec3 under = mix(world, filmic(voidc), mask);
+    vec3 under = mix(world, filmic(voidc), mask) + dfront * (1.0 - coverage);
+    bloom += dfront * 0.6;
     vec3 over = filmic(sc.rgb + bloom);
     // предумноженное наложение в тонмапленном пространстве
     vec3 col = over + under * (1.0 - clamp(coverage, 0.0, 1.0));
