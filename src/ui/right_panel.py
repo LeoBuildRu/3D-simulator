@@ -426,6 +426,8 @@ class RightPanel(FloatingPanel):
     # «Сгенерировать»: {"model_key", "texture_key", "target_volume"}.
     runRequested             = pyqtSignal(dict)
     bodyGenRequested         = pyqtSignal()
+    #: «Каких кузовов не хватает на сервере» — очередь на генерацию.
+    bodyWorklistRequested    = pyqtSignal()
     # ultra / medium / performance — MainWindow сохраняет и просит перезапуск.
     graphicsPresetChanged    = pyqtSignal(str)
     # Вкладка «Датасет».
@@ -610,12 +612,25 @@ class RightPanel(FloatingPanel):
             lambda key: self.modelSetUploadRequested.emit(str(key)))
         self._model_count.setText(self._model_count_label(len(model_infos)))
 
+        # Две кнопки рядом с выбором кузова: «список» — очередь с сервера,
+        # «палочка» — ручная сборка по своему файлу. Очередь слева, потому
+        # что обычный сценарий начинается именно с неё: сначала смотрим, чего
+        # не хватает, и только потом собираем.
+        self.btn_worklist = IconButton("list", "Кузова к генерации…",
+                                       size=34, icon_size=18)
+        self.btn_worklist.setToolTip(
+            "Кузова к генерации…\nМодели, которые сервер уже снимает, но "
+            "геометрии под них нет: объём у таких снимков считается по "
+            "чужому кузову.")
+        self.btn_worklist.clicked.connect(self.bodyWorklistRequested.emit)
+
         self.btn_bodygen = IconButton("wand", "Собрать кузов по скану…",
                                       size=34, icon_size=18, filled=True)
         self.btn_bodygen.clicked.connect(self.bodyGenRequested.emit)
         pick_row = QHBoxLayout()
         pick_row.setSpacing(6)
         pick_row.addWidget(self.cmb_model, 1)
+        pick_row.addWidget(self.btn_worklist)
         pick_row.addWidget(self.btn_bodygen)
         lay.addLayout(pick_row)
 
@@ -1373,6 +1388,9 @@ class RightPanel(FloatingPanel):
         """Ход сборки под выбором кузова; на время сборки кнопка заблокирована."""
         self.btn_bodygen.setEnabled(not busy)
         self.btn_bodygen.set_icon("clock" if busy else "wand")
+        # Пока идёт сборка, из очереди запускать вторую нечем: поток генератора
+        # один, и вторая пошла бы писать в тот же каталог.
+        self.btn_worklist.setEnabled(not busy)
         self._set_status_line(text)
 
     def set_model_status(self, text: str) -> None:

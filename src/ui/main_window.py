@@ -317,6 +317,8 @@ class MainWindow(QMainWindow):
             self._on_graphics_preset_changed
         )
         self.right_panel.bodyGenRequested.connect(self._on_bodygen_requested)
+        self.right_panel.bodyWorklistRequested.connect(
+            self._on_worklist_requested)
         self.right_panel.modelSetDeleteRequested.connect(
             self._on_model_delete_requested)
         self.right_panel.modelSetUploadRequested.connect(
@@ -3182,7 +3184,62 @@ class MainWindow(QMainWindow):
     # Генератор кузовов (опциональный модуль src/bodygen)
     # ------------------------------------------------------------------
 
-    def _on_bodygen_requested(self) -> None:
+    def _on_worklist_requested(self) -> None:
+        """
+        Очередь на генерацию: что сервер снимает, а геометрии под это нет.
+
+        Диалог только выбирает кузов и качает облако пустого скана; дальше
+        начинается обычная сборка — тот же `BodyGenDialog` с подставленными
+        файлом, именем и прямоугольником. Прямоугольник подставляется не для
+        красоты: кузова нет в справочнике, автоподбор по облаку цепляется за
+        ложный прямоугольник, и обмер с сервера — единственное, что его
+        удерживает (см. подсказку в самом диалоге).
+        """
+        from PyQt6.QtWidgets import QMessageBox
+
+        try:
+            from src.ui.panel_data import active_tls_server
+            from src.ui.worklist_dialog import BodyWorklistDialog
+        except Exception as exc:                          # noqa: BLE001
+            QMessageBox.critical(
+                self, "Кузова к генерации",
+                f"Модуль очереди не загрузился: {exc}\n\n"
+                "Проверьте, что установлен пакет requests "
+                "(pip install requests).")
+            return
+
+        server = active_tls_server()
+        host, port = server if server else ("", 9999)
+        dialog = BodyWorklistDialog(self, host=host, port=port)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        request = dialog.request()
+        if request is None:
+            return
+
+        print(f"[worklist] собираю «{request.need.display_name}» по скану "
+              f"{request.shot.base} ({request.need.shots} снимков ждут)")
+        self._worklist_request = request
+        preset = {
+            "source": "ply",
+            "ply_path": request.ply_path,
+            # Пусто = автоподбор: имени этой модели в справочнике нет по
+            # определению, иначе она не попала бы в очередь.
+            "cloud_model": "",
+            "rect_width": float(request.width or 0.0),
+            "rect_length": float(request.length or 0.0),
+            "name": request.name,
+        }
+        # Колёсная формула почти всегда записана в самом имени модели
+        # («HOWO T5G 6x4 (стандарт)»). Подставить её надёжнее, чем оставить
+        # подбор по длине: он выбирает шасси по кузову, а у «высоких» кузов
+        # длинный при трёх осях. Нет формулы в имени — пусть подбирает.
+        chassis = _chassis_from_name(request.need.display_name)
+        if chassis:
+            preset["chassis"] = chassis
+        self._on_bodygen_requested(preset=preset)
+
+    def _on_bodygen_requested(self, preset: dict | None = None) -> None:
         """Показать диалог параметров и запустить сборку в отдельном потоке."""
         try:
             from src.ui.bodygen_dialog import BodyGenDialog
@@ -3191,8 +3248,14 @@ class MainWindow(QMainWindow):
             self.right_panel.set_bodygen_status(f"диалог недоступен: {exc}")
             return
 
-        dlg = BodyGenDialog(self)
+        if preset is None:
+            # Ручной запуск: прошлый выбор из очереди больше не при чём, и
+            # предлагать загрузку «той» модели после сборки нельзя.
+            self._worklist_request = None
+
+        dlg = BodyGenDialog(self, preset=preset)
         if dlg.exec() != dlg.DialogCode.Accepted:
+            self._worklist_request = None
             return
 
         params = dlg.params()
@@ -3261,6 +3324,7 @@ class MainWindow(QMainWindow):
             print(f"[BodyGen] перезапись не удалась: {'; '.join(failed)}")
             QMessageBox.warning(self, "Перезапись комплекта", text)
             self.right_panel.set_bodygen_status("перезапись не удалась")
+            self._worklist_request = None
             return False
 
         print(f"[BodyGen] прошлый комплект удалён: {len(paths)} объект(ов)")
@@ -3276,6 +3340,7 @@ class MainWindow(QMainWindow):
 
         print(f"[BodyGen] готово за {result.seconds:.1f} с")
         print(result.summary)
+        self._remember_client_model(result)
         self.right_panel.set_bodygen_status(
             f"{result.name}: готово за {result.seconds:.0f} с")
 
@@ -3296,12 +3361,77 @@ class MainWindow(QMainWindow):
 
         if not getattr(self, "_bodygen_select", True):
             return
+        model_key = ""
         try:
             from src.ui.panel_data import GENERATED_MODEL_PREFIX
-            self.right_panel.reload_model_sets(
-                select_key=f"{GENERATED_MODEL_PREFIX}{result.name}")
+            model_key = f"{GENERATED_MODEL_PREFIX}{result.name}"
+            self.right_panel.reload_model_sets(select_key=model_key)
         except Exception as exc:
             print(f"[BodyGen] не удалось обновить список моделей: {exc}")
+            return
+
+        self._offer_worklist_upload(result, model_key)
+
+    def _remember_client_model(self, result) -> None:
+        """
+        Записать в `.set.json` комплекта имя, которым модель зовёт клиент.
+
+        Сервер ищет геометрию по этому имени точным сравнением строк, а
+        комплект на диске называется латинским ключом. Связь между ними
+        известна только сейчас, пока жив запрос из очереди; загрузку же в
+        реестр могут открыть и через неделю. Поэтому имя кладётся рядом с
+        комплектом — диалог загрузки подставит его в поле «Название».
+        """
+        request = getattr(self, "_worklist_request", None)
+        if request is None:
+            return
+        path = os.path.join(result.out_dir, f"{result.name}.set.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["client_model"] = request.need.display_name
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+        except Exception as exc:                          # noqa: BLE001
+            print(f"[worklist] имя модели не записано в {path}: {exc}")
+
+    def _offer_worklist_upload(self, result, model_key: str) -> None:
+        """
+        Замкнуть цепочку очереди: собрано — предложить отправку в реестр.
+
+        Только для сборок, начатых из очереди: там заранее известно, какой
+        модели не хватало на сервере, и отправлять её туда — следующий шаг по
+        смыслу. Ручная сборка этим не беспокоится.
+
+        Предложение, а не автоматика: загруженная модель сразу идёт в работу
+        и пересчитывает чужие снимки (`model_webhook_listener` на сервере
+        запускает rerun_by_model.sh), так что кузов сначала надо посмотреть в
+        сцене. Поэтому кнопка по умолчанию — «Позже».
+        """
+        request = getattr(self, "_worklist_request", None)
+        self._worklist_request = None
+        if request is None or not model_key:
+            return
+
+        from PyQt6.QtWidgets import QMessageBox
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Кузов собран")
+        box.setText(
+            f"«{result.name}» собран за {result.seconds:.0f} с и выбран в "
+            f"сцене.\n\nЭто кузов «{request.need.display_name}» — его ждут "
+            f"{request.need.shots} снимков на сервере. Отправить в реестр?")
+        box.setInformativeText(
+            "Сначала посмотрите модель в сцене: после загрузки сервер "
+            "пересчитает по ней все снимки с этим именем.")
+        send = box.addButton("Отправить в реестр…",
+                             QMessageBox.ButtonRole.AcceptRole)
+        later = box.addButton("Позже", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(later)
+        box.exec()
+        if box.clickedButton() is send:
+            self._on_model_upload_requested(model_key)
 
     def _on_model_upload_requested(self, model_key: str) -> None:
         """
@@ -3529,6 +3659,27 @@ class _CallInThread(QThread):
             traceback.print_exc()
             result = exc
         self.finishedWith.emit(result)
+
+
+def _chassis_from_name(display_name: str) -> str:
+    """
+    Колёсная формула из имени модели: «6x4», «8x4» или "" — не нашлась.
+
+    Кириллическая «х» в этих обозначениях встречается не реже латинской
+    («Sitrak 8х4 (6.3м)»), поэтому ищутся обе. «4 оси» / «3 оси» тоже
+    считаются: так подписаны модели, у которых марку шасси не опознали.
+    """
+    import re as _re
+
+    low = str(display_name or "").lower()
+    m = _re.search(r"\b([68])\s*[xх]\s*([24])\b", low)
+    if m:
+        return f"{m.group(1)}x{m.group(2)}"
+    if _re.search(r"\b4\s*(оси|ось)\b", low):
+        return "8x4"
+    if _re.search(r"\b3\s*(оси|ось)\b", low):
+        return "6x4"
+    return ""
 
 
 class _BodyGenWorker(QThread):

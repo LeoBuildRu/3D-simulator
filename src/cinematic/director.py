@@ -390,6 +390,10 @@ class Director:
         comp.tonemap = 0.0
         comp.vignette = 0.0
         self.make_hud()
+        # Подпись в левом нижнем углу — держится всю сцену (убирается вместе
+        # с остальным содержимым компоновщика при её завершении).
+        brand = self.hud_text("IQoko", -0.95, -0.9, 0.06, (0.6, 0.85, 1.0, 0.85), "left")
+        brand.set_reveal(1.0)
         # из PBR-мира — в пустоту
         yield tween(0.8, lambda v: setattr(comp, "abstract", v), 0.0, 1.0, E.in_out_cubic)
         # Экран полностью чёрный — здесь вся тяжёлая работа: реконструкция

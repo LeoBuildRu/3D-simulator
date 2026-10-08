@@ -72,7 +72,16 @@ def existing_kit_paths(out_dir: str, name: str) -> list:
 class BodyGenDialog(QDialog):
     """Модальный диалог параметров сборки кузова."""
 
-    def __init__(self, parent=None, default_out: str = DEFAULT_OUT_DIR):
+    def __init__(self, parent=None, default_out: str = DEFAULT_OUT_DIR,
+                 preset: dict | None = None):
+        """
+        `preset` — поля, которые надо подставить ПОВЕРХ прошлой сборки.
+
+        Так открывается диалог из очереди на генерацию: облако, имя комплекта
+        и прямоугольник приходят с сервера, а внешний вид (цвет, износ,
+        рельеф борта) остаётся тем, что пользователь настроил в прошлый раз.
+        Ключи — те же, что в `_state()`.
+        """
         super().__init__(parent)
         apply_theme(self)
         self.setWindowTitle("Генератор кузова")
@@ -105,6 +114,8 @@ class BodyGenDialog(QDialog):
         self._ok_button.setEnabled(bool(self._probe.get("available")))
 
         self._restore_state()
+        if preset:
+            self._apply_state(preset)
 
     # ---- секции ------------------------------------------------------- #
 
@@ -403,14 +414,7 @@ class BodyGenDialog(QDialog):
         }
 
     def _restore_state(self) -> None:
-        """
-        Вернуть поля к прошлой сборке.
-
-        Каждое поле восстанавливается ОТДЕЛЬНО и молча пропускается, если
-        значения больше нет: справочник моделей и каталог шасси приходят
-        снаружи и между запусками меняются, а из-за одной пропавшей записи
-        форма не должна терять остальные.
-        """
+        """Вернуть поля к прошлой сборке."""
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -420,6 +424,19 @@ class BodyGenDialog(QDialog):
             print(f"[BodyGen] {SETTINGS_PATH} не прочитан ({exc}); "
                   f"беру умолчания.")
             return
+        self._apply_state(data)
+
+    def _apply_state(self, data: dict) -> None:
+        """
+        Разложить снимок полей (`_state()`) обратно по форме.
+
+        Каждое поле применяется ОТДЕЛЬНО и молча пропускается, если ключа нет
+        или значение больше не годится: справочник моделей и каталог шасси
+        приходят снаружи и между запусками меняются, а из-за одной пропавшей
+        записи форма не должна терять остальные. Это же свойство позволяет
+        подать сюда частичный пресет из очереди на генерацию — в нём всего
+        несколько ключей, и остальная форма остаётся как была.
+        """
         if not isinstance(data, dict):
             return
 

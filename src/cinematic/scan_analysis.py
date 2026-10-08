@@ -189,7 +189,10 @@ def run_worker(parts: str, ply: str, json_path: str, out: str, *,
                                    for p in inputs if os.path.isfile(p)) \
             and os.path.getmtime(out) >= os.path.getmtime(WORKER):
         try:
-            return Analysis(out)
+            cached = Analysis(out)
+            # результат с ошибками (например, не хватило памяти) не кэшируем
+            if not any("failed" in n for n in cached.notes):
+                return cached
         except Exception:
             pass
     argv: List[str] = ["--parts", parts, "--ply", ply, "--json", json_path, "--out", out]

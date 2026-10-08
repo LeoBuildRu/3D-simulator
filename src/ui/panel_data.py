@@ -207,6 +207,17 @@ def _read_active_tls_server() -> Optional[Tuple[str, int]]:
     return None
 
 
+def active_tls_server() -> Optional[Tuple[str, int]]:
+    """
+    Активный сервер из `tls_config.yaml` — (host, port) или None.
+
+    Публичное имя для того же, что внутри модуля зовётся
+    `_read_active_tls_server`: адрес нужен не только панели, но и диалогам,
+    которые ходят на сервер напрямую (очередь кузовов на генерацию).
+    """
+    return _read_active_tls_server()
+
+
 def _fetch_model_sets_from_server() -> Optional[dict]:
     """
     Try to download `models_geometry_config.json` (i.e. the dict served by

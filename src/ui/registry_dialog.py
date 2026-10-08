@@ -47,6 +47,8 @@ from src.registry.payload import bam_to_obj, build_upload_plan, meta_from_form
 from src.registry.remote_points import RemotePoints, fetch_remote_points
 from src.registry.prefs import load_prefs, save_prefs
 from src.registry.settings import RegistryEndpoint, resolve_registry
+from src.registry.web_textures import BUDGET as WEB_TEXTURE_BUDGET
+from src.registry.web_textures import shrink_web_files
 from src.ui.ui_theme import (COLOR_ACCENT, COLOR_DANGER, COLOR_HAIRLINE,
                              COLOR_TEXT_MUTED, COLOR_WARN, FONT_MONO,
                              apply_theme)
@@ -835,7 +837,15 @@ class ModelUploadDialog(QDialog):
         # Веб-вьюер — штатная часть комплекта генератора, и файлы лёгкие
         # (JPEG-копии карт), поэтому по умолчанию отправляем.
         self.chk_web.setChecked(True)
-        self.lbl_web.setText(f"{len(files)} файл(ов), {_fmt_size(size)}")
+        heavy = sum(1 for _name, path in files
+                    if path.lower().endswith((".jpg", ".jpeg", ".png"))
+                    and os.path.isfile(path)
+                    and os.path.getsize(path) > WEB_TEXTURE_BUDGET)
+        text = f"{len(files)} файл(ов), {_fmt_size(size)}"
+        if heavy:
+            text += (f"; {heavy} карт(ы) тяжелее "
+                     f"{_fmt_size(WEB_TEXTURE_BUDGET)} будут ужаты при отправке")
+        self.lbl_web.setText(text)
         self.lbl_web.setToolTip("\n".join(name for name, _ in files[:40]))
 
     def _sync_textures_label(self) -> None:
@@ -1377,11 +1387,15 @@ class ModelUploadDialog(QDialog):
                 meta["points_3d"] = found.points
                 job.message.emit(f"points_3d сохраняются как есть "
                                  f"({found.source})")
+            # Карты веб-вьюера агрегатор качает при каждом открытии модели:
+            # тяжёлые ужимаются здесь, перед отправкой (копии в кэше, файлы
+            # комплекта не меняются).
+            send_web = shrink_web_files(web_files, say=job.message.emit)
             job.message.emit(
-                f"отправляем {len(files) + len(textures) + len(web_files)} "
+                f"отправляем {len(files) + len(textures) + len(send_web)} "
                 f"файл(ов), режим {mode}…")
             return client.upsert_model(key, meta, files, textures=textures,
-                                       web_files=web_files, mode=mode,
+                                       web_files=send_web, mode=mode,
                                        progress=job.on_progress)
 
         self._begin_progress()

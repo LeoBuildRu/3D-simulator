@@ -279,6 +279,18 @@ def _read_set_json(model_path: str) -> Dict[str, Any]:
         return {}
 
 
+def _client_model_name(model_path: str, key: str) -> str:
+    """Имя модели у клиента для этого комплекта или "" — если неизвестно."""
+    saved = str(_read_set_json(model_path).get("client_model") or "").strip()
+    if saved:
+        return saved
+    try:
+        from src.registry.worklist import client_name_for_key
+        return client_name_for_key(key)
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
 def _guess_points(model_path: str, plan: UploadPlan
                   ) -> Tuple[Optional[List[List[float]]], str, bool]:
     """
@@ -331,9 +343,17 @@ def build_upload_plan(info: Any) -> UploadPlan:
     model_path = str(getattr(info, "path", "") or "") or str(cfg.get("cuzov")
                                                              or "")
     name = str(getattr(info, "name", "") or getattr(info, "key", ""))
+    key = suggest_key(name) or suggest_key(str(getattr(info, "key", "")))
 
-    plan = UploadPlan(key=suggest_key(name) or suggest_key(
-        str(getattr(info, "key", ""))), display_name=name)
+    # Название — не подпись, а то, по чему сервер ИЩЕТ модель: поле `model`
+    # сравнивается с именем из снимка точно (`get_target_model_path`). Имя
+    # комплекта на диске — латинский ключ, и с ним модель легла бы в реестр,
+    # но ни один снимок её бы не нашёл. Поэтому берём имя, которым модель
+    # зовёт клиент: его пишет в .set.json сборка из очереди, а для
+    # комплектов, собранных раньше, оно восстанавливается по кэшу обхода.
+    name = _client_model_name(model_path, key) or name
+
+    plan = UploadPlan(key=key, display_name=name)
 
     plan.roles, plan.textures = detect_role_files(model_path, cfg)
     plan.web_files, plan.web_blocked = detect_web_files(model_path)
