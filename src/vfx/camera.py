@@ -202,6 +202,8 @@ class CinematicCamera:
         self.lens_mix = 0.0               # 1 — объектив станции, 0 — обычный
         self._saved = None
         self._task = None
+        self._offset_task = None
+        self._offset_set = None           # смещение кадра, поставленное в _apply
         self._time = 0.0
 
     # ------------------------------------------------------------------ #
@@ -230,7 +232,15 @@ class CinematicCamera:
             self._saved["fly_frozen"] = fly.is_frozen()
             fly.set_frozen(True)
         self.shot = self.capture_user()
-        self._task = base.taskMgr.add(self._apply, "vfx_camera", sort=45)
+        # Поза и линза — ДО задач RenderPipeline (sort 10–18): RP_UpdateInputs
+        # (sort 18) снимает с камеры матрицы вида/проекции на кадр, и если
+        # линзу поменять позже, AO/SSR/motion blur восстанавливают позиции по
+        # проекции прошлого кадра — при смене FOV на земле чёрные пятна.
+        # Смещение кадра — после SMAA (sort 12): тот ставит свой джиттер
+        # абсолютным значением, наше прибавляется к нему.
+        self._task = base.taskMgr.add(self._apply, "vfx_camera", sort=8)
+        self._offset_task = base.taskMgr.add(self._apply_offset, "vfx_camera_offset",
+                                             sort=13)
 
     def release(self, keep_pose: bool = True) -> None:
         """Вернуть камеру. keep_pose — остаться там, где закончилась сцена."""
@@ -241,6 +251,10 @@ class CinematicCamera:
         if self._task is not None:
             base.taskMgr.remove(self._task)
             self._task = None
+        if self._offset_task is not None:
+            base.taskMgr.remove(self._offset_task)
+            self._offset_task = None
+        self._offset_set = None
         lens = base.camLens
         lens.set_film_offset(s["offset"])
         lens.set_fov(s["fov"])
@@ -364,6 +378,20 @@ class CinematicCamera:
         fov_v = max(1.0, min(170.0, s.fov))
         fov_h = math.degrees(2 * math.atan(math.tan(math.radians(fov_v) / 2) * aspect))
         lens.set_fov(LVecBase2f(fov_h, fov_v))
-        lens.set_film_offset(LVecBase2f(s.offset.x * lens.get_film_size()[1],
-                                        s.offset.y * lens.get_film_size()[1]))
+        off = self._shot_offset(lens)
+        lens.set_film_offset(off)
+        self._offset_set = off
+        return Task.cont
+
+    def _shot_offset(self, lens) -> LVecBase2f:
+        fh = lens.get_film_size()[1]
+        return LVecBase2f(self.shot.offset.x * fh, self.shot.offset.y * fh)
+
+    def _apply_offset(self, task):
+        """После SMAA: его джиттер плюс смещение кадра сцены."""
+        from direct.task.Task import Task
+        lens = self.base.camLens
+        cur = LVecBase2f(lens.get_film_offset())
+        if self._offset_set is not None and cur != self._offset_set:
+            lens.set_film_offset(cur + self._shot_offset(lens))
         return Task.cont

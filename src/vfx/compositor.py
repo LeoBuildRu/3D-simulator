@@ -143,7 +143,7 @@ class Compositor:
         self._composite_root = None
         self._capture = None
         self.enabled = False
-        # после рига кинокамеры (sort 45) и до отрисовки (igLoop, sort 50)
+        # после рига кинокамеры (sort 8/13) и до отрисовки (igLoop, sort 50)
         self._task = base.taskMgr.add(self._update, "vfx_compositor", sort=48)
 
     # ------------------------------------------------------------------ #
@@ -173,7 +173,10 @@ class Compositor:
         buf.set_clear_color_active(True)
         buf.set_clear_color(LColor(0, 0, 0, 0))
         buf.set_clear_depth_active(True)
-        self.camera = self.root.attach_new_node(Camera("vfx_cam", base.camLens))
+        # камера живёт дольше буферов: к ней прицеплены HUD и подписи сцены,
+        # а буферы пересобираются при каждом изменении размера окна
+        if self.camera is None:
+            self.camera = self.root.attach_new_node(Camera("vfx_cam", base.camLens))
         dr = buf.make_display_region(0, 1, 0, 1)
         dr.set_camera(self.camera)
         self._scene_buf = buf
@@ -269,9 +272,6 @@ class Compositor:
             self._scene_buf.clear_render_textures()
             base.graphicsEngine.remove_window(self._scene_buf)
             self._scene_buf = None
-        if getattr(self, "camera", None) is not None:
-            self.camera.remove_node()
-            self.camera = None
         if self._composite_dr is not None:
             base.win.remove_display_region(self._composite_dr)
             self._composite_dr = None
@@ -499,4 +499,7 @@ class Compositor:
             self._capture.destroy(self.base)
             self._capture = None
         self._teardown_buffers()
+        if self.camera is not None:
+            self.camera.remove_node()
+            self.camera = None
         self.root.remove_node()
